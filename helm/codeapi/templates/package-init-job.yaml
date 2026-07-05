@@ -44,6 +44,8 @@ spec:
           env:
             - name: PYTHON_VERSION
               value: {{ .Values.workerSandbox.packages.initJob.pythonVersion | quote }}
+            - name: PYTHON_BUILD_STANDALONE_TAG
+              value: {{ .Values.workerSandbox.packages.initJob.pythonBuildStandaloneTag | quote }}
             - name: NODE_VERSION
               value: {{ .Values.workerSandbox.packages.initJob.nodeVersion | quote }}
             - name: BUN_VERSION
