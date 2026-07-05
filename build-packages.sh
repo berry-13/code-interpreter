@@ -12,11 +12,14 @@
 #   NODE_VERSION=24.15.0     # Node.js version to install
 #   BUN_VERSION=1.3.14       # Bun version to install
 #   BASH_PACKAGE_VERSION=5.2.0 # Bash package registration version (semver-like x.y.z)
+#   JAVA_VERSION=21.0.11     # Temurin JDK version to install
+#   TEMURIN_BUILD=10         # Temurin build number matching JAVA_VERSION
 #   SKIP_PYTHON_PACKAGES=1   # Skip Python pip packages
 #   SKIP_JS_PACKAGES=1       # Skip JavaScript npm packages for Node/Bun
 #   SKIP_NODE=1              # Skip Node.js installation
 #   SKIP_BUN=1               # Skip Bun installation
 #   SKIP_PYTHON=1            # Skip Python installation
+#   SKIP_JAVA=1              # Skip Java installation
 #   FORCE_REBUILD=1          # Delete existing packages first
 #   BUN_PACKAGE_BATCH_SIZE=4 # Positive integer number of direct JS packages per Bun install batch
 #
@@ -29,6 +32,8 @@ cd "$SCRIPT_DIR"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
 NODE_VERSION="${NODE_VERSION:-24.15.0}"
 BUN_VERSION="${BUN_VERSION:-1.3.14}"
+JAVA_VERSION="${JAVA_VERSION:-21.0.11}"
+TEMURIN_BUILD="${TEMURIN_BUILD:-10}"
 PACKAGES_DIR="./data/pkgs"
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
 
@@ -71,8 +76,8 @@ fi
 
 ARCH=$(uname -m)
 case "$ARCH" in
-    x86_64)  BUN_ARCH="x64"; NODE_ARCH="x64"; echo "Detected: amd64 (Linux/WSL)" ;;
-    arm64|aarch64) BUN_ARCH="aarch64"; NODE_ARCH="arm64"; echo "Detected: arm64 (Apple Silicon)" ;;
+    x86_64)  BUN_ARCH="x64"; NODE_ARCH="x64"; JAVA_ARCH="x64"; echo "Detected: amd64 (Linux/WSL)" ;;
+    arm64|aarch64) BUN_ARCH="aarch64"; NODE_ARCH="arm64"; JAVA_ARCH="aarch64"; echo "Detected: arm64 (Apple Silicon)" ;;
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
@@ -437,6 +442,72 @@ install_bun_packages() {
     docker exec "$CONTAINER_NAME" bash -c "cd ${pkg_dest} && BUN_INSTALL=${pkg_dest} ./bun pm ls -g 2>/dev/null | head -40" || true
 }
 
+install_java() {
+    if [ "${SKIP_JAVA:-}" = "1" ]; then
+        echo "Skipping Java (SKIP_JAVA=1)"
+        return 0
+    fi
+
+    local pkg_dest="/pkgs/java/${JAVA_VERSION}"
+    local java_feature="${JAVA_VERSION%%.*}"
+
+    echo "=============================================="
+    echo "  Installing Java ${JAVA_VERSION}"
+    echo "=============================================="
+
+    docker exec "$CONTAINER_NAME" bash -c "
+        set -e
+        mkdir -p ${pkg_dest}
+        rm -f ${pkg_dest}/.package-installed
+        cd /tmp
+        curl -fsSL -o java.tar.gz https://github.com/adoptium/temurin${java_feature}-binaries/releases/download/jdk-${JAVA_VERSION}%2B${TEMURIN_BUILD}/OpenJDK${java_feature}U-jdk_${JAVA_ARCH}_linux_hotspot_${JAVA_VERSION}_${TEMURIN_BUILD}.tar.gz
+        tar -xzf java.tar.gz --strip-components=1 -C ${pkg_dest}
+        rm -f java.tar.gz
+    "
+
+    docker exec "$CONTAINER_NAME" bash -c "cat > ${pkg_dest}/pkg-info.json << 'EOF'
+{
+    \"language\": \"java\",
+    \"version\": \"${JAVA_VERSION}\",
+    \"build_platform\": \"docker-debian\",
+    \"aliases\": [\"jdk\", \"openjdk\", \"temurin\"]
+}
+EOF"
+
+    docker exec "$CONTAINER_NAME" bash -c "cat > ${pkg_dest}/compile << 'EOF'
+#!/bin/bash
+SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"
+# The sandbox passes every submitted file; attachments like data.csv are
+# inputs for the program, not compilation units.
+SOURCES=()
+for f in \"\$@\"; do
+    case \"\$f\" in
+        *.java) SOURCES+=(\"\$f\") ;;
+    esac
+done
+exec \"\${SCRIPT_DIR}/bin/javac\" \"\${SOURCES[@]}\"
+EOF
+chmod +x ${pkg_dest}/compile"
+
+    docker exec "$CONTAINER_NAME" bash -c "cat > ${pkg_dest}/run << 'EOF'
+#!/bin/bash
+SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"
+CLASS=\"\$(basename \"\${1%.java}\")\"
+shift
+exec \"\${SCRIPT_DIR}/bin/java\" -XX:+UseSerialGC -cp . \"\$CLASS\" \"\$@\"
+EOF
+chmod +x ${pkg_dest}/run"
+
+    docker exec "$CONTAINER_NAME" bash -c "
+        echo 'PATH=${pkg_dest}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.' > ${pkg_dest}/.env
+        echo 'JAVA_HOME=${pkg_dest}' >> ${pkg_dest}/.env
+        echo '${TEMURIN_BUILD}' > ${pkg_dest}/.temurin-build
+        echo \$(date +%s)000 > ${pkg_dest}/.package-installed
+    "
+
+    echo "Java ${JAVA_VERSION} installed: $(docker exec "$CONTAINER_NAME" "${pkg_dest}/bin/java" --version | head -1)"
+}
+
 install_bash() {
     local bash_package_version
     bash_package_version="${BASH_PACKAGE_VERSION:-5.2.0}"
@@ -519,6 +590,7 @@ main() {
     install_node_packages
     install_bun
     install_bun_packages
+    install_java
     install_bash
 
     echo "Setting permissions..."
