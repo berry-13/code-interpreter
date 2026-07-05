@@ -16,7 +16,9 @@ PYTHON_ALIAS="python${PYTHON_SITE_VERSION}"
 NODE_VERSION="${NODE_VERSION:-24.15.0}"
 BUN_VERSION="${BUN_VERSION:-1.3.14}"
 BASH_PACKAGE_VERSION="${BASH_PACKAGE_VERSION:-5.2.0}"
-CODEAPI_LANGUAGES="${CODEAPI_LANGUAGES:-python,node,bun,bash}"
+JAVA_VERSION="${JAVA_VERSION:-21.0.11}"
+TEMURIN_BUILD="${TEMURIN_BUILD:-10}"
+CODEAPI_LANGUAGES="${CODEAPI_LANGUAGES:-python,node,bun,bash,java}"
 INSTALL_FAILED=false
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
 
@@ -26,19 +28,19 @@ for lang in "${REQUESTED_LANGUAGES[@]}"; do
     lang="$(echo "$lang" | tr -d '[:space:]')"
     [ -n "$lang" ] || continue
     case "$lang" in
-        python|node|bun|bash)
+        python|node|bun|bash|java)
             SELECTED_LANGUAGES+=("$lang")
             ;;
         *)
             echo "ERROR: Unknown language in CODEAPI_LANGUAGES: '${lang}'" >&2
-            echo "Supported languages: python, node, bun, bash" >&2
+            echo "Supported languages: python, node, bun, bash, java" >&2
             exit 1
             ;;
     esac
 done
 if [ "${#SELECTED_LANGUAGES[@]}" -eq 0 ]; then
     echo "ERROR: CODEAPI_LANGUAGES does not select any languages (got: '${CODEAPI_LANGUAGES}')" >&2
-    echo "Supported languages: python, node, bun, bash" >&2
+    echo "Supported languages: python, node, bun, bash, java" >&2
     exit 1
 fi
 SELECTED_LANGUAGES_CSV="$(IFS=','; echo "${SELECTED_LANGUAGES[*]}")"
@@ -138,11 +140,16 @@ bash_ready() {
     [ -f "/pkgs/bash/${BASH_PACKAGE_VERSION}/.package-installed" ]
 }
 
+java_ready() {
+    [ -f "/pkgs/java/${JAVA_VERSION}/.package-installed" ]
+}
+
 packages_ready() {
     if language_selected python; then python_ready || return 1; fi
     if language_selected node; then node_ready || return 1; fi
     if language_selected bun; then bun_ready || return 1; fi
     if language_selected bash; then bash_ready || return 1; fi
+    if language_selected java; then java_ready || return 1; fi
 }
 
 if [ -f "$MARKER_FILE" ] && [ "$FORCE_REBUILD" != "true" ]; then
@@ -560,6 +567,91 @@ EOF
 fi
 
 # ==============================
+# Install Java
+# ==============================
+if ! language_selected java; then
+    echo ""
+    echo "Skipping Java (not in CODEAPI_LANGUAGES)"
+elif java_ready; then
+    echo ""
+    echo "Java ${JAVA_VERSION} already installed, skipping"
+else
+    echo ""
+    echo "=============================================="
+    echo "  Installing Java ${JAVA_VERSION}"
+    echo "=============================================="
+    echo ""
+
+    JAVA_DEST="/pkgs/java/${JAVA_VERSION}"
+    mkdir -p "$JAVA_DEST"
+    rm -f "$JAVA_DEST/.package-installed"
+    JAVA_INSTALLED=false
+    JAVA_FEATURE="${JAVA_VERSION%%.*}"
+
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) JAVA_ARCH="x64" ;;
+        aarch64|arm64) JAVA_ARCH="aarch64" ;;
+        *)
+            echo "ERROR: Unsupported architecture for Java: $ARCH"
+            JAVA_ARCH=""
+            INSTALL_FAILED=true
+            ;;
+    esac
+
+    if [ -n "$JAVA_ARCH" ]; then
+        JAVA_URL="https://github.com/adoptium/temurin${JAVA_FEATURE}-binaries/releases/download/jdk-${JAVA_VERSION}%2B${TEMURIN_BUILD}/OpenJDK${JAVA_FEATURE}U-jdk_${JAVA_ARCH}_linux_hotspot_${JAVA_VERSION}_${TEMURIN_BUILD}.tar.gz"
+        cd /tmp
+        if curl -fsSL "$JAVA_URL" -o java.tar.gz; then
+            if tar -xzf java.tar.gz --strip-components=1 -C "$JAVA_DEST"; then
+                rm -f java.tar.gz
+
+                cat > "$JAVA_DEST/pkg-info.json" << EOF
+{
+    "language": "java",
+    "version": "${JAVA_VERSION}",
+    "build_platform": "docker-debian",
+    "aliases": ["jdk", "openjdk", "temurin"]
+}
+EOF
+
+                cat > "$JAVA_DEST/compile" << 'EOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${SCRIPT_DIR}/bin/javac" "$@"
+EOF
+                chmod +x "$JAVA_DEST/compile"
+
+                cat > "$JAVA_DEST/run" << 'EOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLASS="$(basename "${1%.java}")"
+shift
+exec "${SCRIPT_DIR}/bin/java" -XX:+UseSerialGC -cp . "$CLASS" "$@"
+EOF
+                chmod +x "$JAVA_DEST/run"
+
+                {
+                    echo "PATH=${JAVA_DEST}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:."
+                    echo "JAVA_HOME=${JAVA_DEST}"
+                } > "$JAVA_DEST/.env"
+
+                JAVA_INSTALLED=true
+                echo "$(date +%s)000" > "$JAVA_DEST/.package-installed"
+                echo "Java ${JAVA_VERSION} installed: $($JAVA_DEST/bin/java --version | head -1)"
+            else
+                echo "ERROR: Failed to extract Java archive"
+                rm -f java.tar.gz
+                INSTALL_FAILED=true
+            fi
+        else
+            echo "ERROR: Failed to download Java from $JAVA_URL"
+            INSTALL_FAILED=true
+        fi
+    fi
+fi
+
+# ==============================
 # Register Bash
 # ==============================
 if ! language_selected bash; then
@@ -635,6 +727,7 @@ languages=${SELECTED_LANGUAGES_CSV}
 python_version=${PYTHON_VERSION}
 node_version=${NODE_VERSION}
 bun_version=${BUN_VERSION}
+java_version=${JAVA_VERSION}
 packages=$(ls /pkgs/ 2>/dev/null | tr '\n' ',')
 MARKER
 

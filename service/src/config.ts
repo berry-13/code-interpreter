@@ -6,6 +6,7 @@ import { Languages } from './enum';
 
 export const languageConfig: Record<Languages | string, t.LanguageConfig | undefined> = {
   [Languages.bash]: { language: 'bash', version: '5.2.0', fileName: 'script.sh' },
+  [Languages.java]: { language: 'java', version: '21.0.11', fileName: 'Main.java' },
   [Languages.js]: { language: 'bun-js', version: '1.3.14', fileName: 'index.js' },
   [Languages.node]: { language: 'node', version: '24.15.0', fileName: 'index.js' },
   [Languages.py]: { language: 'python', version: '3.14.4', fileName: 'main.py' },
@@ -38,6 +39,11 @@ const languageAliases: Record<string, Languages> = {
   // Bash
   bash: Languages.bash,
   sh: Languages.bash,
+
+  // Java (Temurin JDK)
+  java: Languages.java,
+  jdk: Languages.java,
+  openjdk: Languages.java,
 };
 
 export function resolveLanguage(lang: string): Languages | undefined {

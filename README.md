@@ -61,7 +61,7 @@ runtimes into `./data/pkgs` (override with `SANDBOX_PACKAGES_PATH`), so no
 runtimes need to be installed on the host. The volume is reused on later
 starts; already-installed runtimes are skipped. To install only a subset of
 languages, set `CODEAPI_LANGUAGES` (comma-separated list of `python`, `node`,
-`bun`, `bash`; default all):
+`bun`, `bash`, `java`; default all):
 
 ```bash
 CODEAPI_LANGUAGES=python docker-compose up --build

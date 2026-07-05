@@ -9,6 +9,7 @@ export enum Queues {
 
 export enum Languages {
   bash = 'bash',
+  java = 'java',
   js = 'js',
   node = 'node',
   py = 'py',

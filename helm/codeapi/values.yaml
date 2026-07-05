@@ -266,7 +266,9 @@ workerSandbox:
       nodeVersion: "24.15.0"
       bunVersion: "1.3.14"
       bashPackageVersion: "5.2.0"
-      # Comma-separated subset of python,node,bun,bash; empty installs all
+      javaVersion: "21.0.11"
+      temurinBuild: "10"
+      # Comma-separated subset of python,node,bun,bash,java; empty installs all
       languages: ""
       backoffLimit: 2
       ttlSecondsAfterFinished: 3600
