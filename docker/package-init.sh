@@ -183,15 +183,31 @@ else
     mkdir -p "$PKG_DEST"
     rm -f "$PKG_DEST/.package-installed"
 
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) PYTHON_ARCH="x86_64" ;;
+        aarch64|arm64) PYTHON_ARCH="aarch64" ;;
+        *)
+            echo "ERROR: Unsupported architecture for Python: $ARCH" >&2
+            exit 1
+            ;;
+    esac
+
+    # Prebuilt CPython from astral-sh/python-build-standalone: installs in
+    # seconds instead of the 15+ minutes a from-source PGO build takes. The
+    # release tag is pinned because python-build-standalone drops older point
+    # releases from newer tags; override both together to change versions.
+    PYTHON_BUILD_STANDALONE_TAG="${PYTHON_BUILD_STANDALONE_TAG:-20260414}"
+    PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_STANDALONE_TAG}/cpython-${PYTHON_VERSION}+${PYTHON_BUILD_STANDALONE_TAG}-${PYTHON_ARCH}-unknown-linux-gnu-install_only.tar.gz"
     cd /tmp
-    wget -q "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz"
-    tar xf "Python-${PYTHON_VERSION}.tar.xz"
-    cd "Python-${PYTHON_VERSION}"
-    ./configure --prefix="$PKG_DEST" --enable-optimizations 2>/dev/null
-    make -j$(nproc)
-    make install
-    cd /tmp
-    rm -rf /tmp/Python-${PYTHON_VERSION}*
+    if ! curl -fsSL "$PYTHON_URL" -o python.tar.gz; then
+        echo "ERROR: Failed to download prebuilt Python from $PYTHON_URL" >&2
+        echo "Check that release ${PYTHON_BUILD_STANDALONE_TAG} provides cpython ${PYTHON_VERSION}" >&2
+        echo "(set PYTHON_BUILD_STANDALONE_TAG and PYTHON_VERSION together to change versions)" >&2
+        exit 1
+    fi
+    tar -xzf python.tar.gz --strip-components=1 -C "$PKG_DEST"
+    rm -f python.tar.gz
 
     cat > "$PKG_DEST/pkg-info.json" << EOF
 {

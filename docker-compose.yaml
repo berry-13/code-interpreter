@@ -129,6 +129,7 @@ services:
         environment:
             - CODEAPI_LANGUAGES=${CODEAPI_LANGUAGES:-}
             - PYTHON_VERSION=${PYTHON_VERSION:-}
+            - PYTHON_BUILD_STANDALONE_TAG=${PYTHON_BUILD_STANDALONE_TAG:-}
             - NODE_VERSION=${NODE_VERSION:-}
             - BUN_VERSION=${BUN_VERSION:-}
             - BASH_PACKAGE_VERSION=${BASH_PACKAGE_VERSION:-}

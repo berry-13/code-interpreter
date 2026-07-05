@@ -254,7 +254,7 @@ workerSandbox:
 
     # Init job to populate packages on first install
     # Runs as a Helm pre-install/pre-upgrade hook
-    # Compiles Python from source and downloads Node/Bun binaries
+    # Downloads prebuilt Python/Node/Bun binaries
     initJob:
       enabled: true
       forceRebuild: false
