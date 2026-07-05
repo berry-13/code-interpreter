@@ -141,7 +141,8 @@ bash_ready() {
 }
 
 java_ready() {
-    [ -f "/pkgs/java/${JAVA_VERSION}/.package-installed" ]
+    [ -f "/pkgs/java/${JAVA_VERSION}/.package-installed" ] &&
+    [ "$(cat "/pkgs/java/${JAVA_VERSION}/.temurin-build" 2>/dev/null)" = "$TEMURIN_BUILD" ]
 }
 
 packages_ready() {
@@ -645,6 +646,7 @@ EOF
                 } > "$JAVA_DEST/.env"
 
                 JAVA_INSTALLED=true
+                echo "$TEMURIN_BUILD" > "$JAVA_DEST/.temurin-build"
                 echo "$(date +%s)000" > "$JAVA_DEST/.package-installed"
                 echo "Java ${JAVA_VERSION} installed: $($JAVA_DEST/bin/java --version | head -1)"
             else
