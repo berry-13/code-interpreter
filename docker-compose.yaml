@@ -120,6 +120,22 @@ services:
         depends_on:
             - redis
 
+    package_init:
+        build:
+            context: .
+            dockerfile: docker/Dockerfile.package-init
+        container_name: package_init
+        restart: "no"
+        environment:
+            - CODEAPI_LANGUAGES=${CODEAPI_LANGUAGES:-}
+            - PYTHON_VERSION=${PYTHON_VERSION:-}
+            - NODE_VERSION=${NODE_VERSION:-}
+            - BUN_VERSION=${BUN_VERSION:-}
+            - BASH_PACKAGE_VERSION=${BASH_PACKAGE_VERSION:-}
+            - FORCE_REBUILD=${FORCE_REBUILD:-}
+        volumes:
+            - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/pkgs
+
     sandbox-runner:
         build:
           context: .
@@ -160,6 +176,8 @@ services:
         depends_on:
             egress_gateway:
                 condition: service_healthy
+            package_init:
+                condition: service_completed_successfully
         healthcheck:
             test: ["CMD-SHELL", "curl -fsS http://localhost:2000/api/v2/runtimes >/dev/null || exit 1"]
             interval: 5s

@@ -56,6 +56,21 @@ public issue (see [CONTRIBUTING](CONTRIBUTING.md)).
 docker-compose up --build
 ```
 
+On first start the one-shot `package_init` service downloads the language
+runtimes into `./data/pkgs` (override with `SANDBOX_PACKAGES_PATH`), so no
+runtimes need to be installed on the host. The volume is reused on later
+starts; already-installed runtimes are skipped. To install only a subset of
+languages, set `CODEAPI_LANGUAGES` (comma-separated list of `python`, `node`,
+`bun`, `bash`; default all):
+
+```bash
+CODEAPI_LANGUAGES=python docker-compose up --build
+```
+
+Adding a language later (e.g. `CODEAPI_LANGUAGES=python,bun`) installs only
+the missing runtime into the existing volume. Set `FORCE_REBUILD=true` to
+wipe and rebuild the volume from scratch.
+
 Local Docker Compose files set `CODEAPI_INTERNAL_SERVICE_TOKEN` to a shared
 development value by default. Production deployments must override it with a
 strong secret; when it is unset, file object routes and Tool Call Server
