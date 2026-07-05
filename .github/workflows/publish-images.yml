@@ -1,0 +1,96 @@
+# Publishes every codeapi container image to GHCR so self-hosters can pull
+# prebuilt images instead of building from source (see docker-compose.prebuilt.yml).
+# Runs on pushes to main (tagged `latest`) and on version tags `v*` (tagged with
+# the git tag). Every image also carries the commit SHA for traceability.
+#
+# The build matrix covers all eight images produced from this repo's Dockerfiles;
+# each entry mirrors the context/dockerfile/target combination used by
+# docker-compose.yaml (context is always the repo root).
+name: Publish Images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# Minimal default token; the publish job elevates to packages: write at job
+# level only, so the checkout/metadata steps never hold write scope.
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-images-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Build and push (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: codeapi-api
+            dockerfile: service/Dockerfile
+            target: api
+          - image: codeapi-worker
+            dockerfile: service/Dockerfile
+            target: worker
+          - image: codeapi-file-server
+            dockerfile: service/Dockerfile
+            target: production
+          - image: codeapi-tool-call-server
+            dockerfile: service/Dockerfile.tool-call-server
+            target: production
+          - image: codeapi-egress-gateway
+            dockerfile: service/Dockerfile.egress-gateway
+            target: production
+          - image: codeapi-sandbox-runner
+            dockerfile: api/Dockerfile
+            target: sandbox-runner
+          # docker/Dockerfile.worker-sandbox and docker/Dockerfile.package-init
+          # each have a single final stage, so no target is set for them.
+          - image: codeapi-worker-sandbox
+            dockerfile: docker/Dockerfile.worker-sandbox
+            target: ''
+          - image: codeapi-package-init
+            dockerfile: docker/Dockerfile.package-init
+            target: ''
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ghcr.io/berry-13/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          # amd64 only for now. arm64 is TODO: the sandbox rootfs build under
+          # QEMU emulation is not worth fighting yet.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

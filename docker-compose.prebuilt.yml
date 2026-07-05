@@ -1,0 +1,224 @@
+# Pull-based stack: identical to docker-compose.yaml but every service uses a
+# prebuilt image from GHCR instead of building from source. Nothing is compiled
+# locally.
+#
+# Usage:
+#   docker compose -f docker-compose.prebuilt.yml up
+#
+# Images are published by .github/workflows/publish-images.yml and are
+# linux/amd64 only for now (arm64 is not yet built).
+services:
+    api:
+        image: ghcr.io/berry-13/codeapi-api:latest
+        container_name: api
+        ports:
+            - 3112:3112
+        environment:
+            - LOCAL_MODE=${LOCAL_MODE:-true}
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
+            - CODEAPI_AUTH_PROVIDER=${CODEAPI_AUTH_PROVIDER:-}
+            - CODEAPI_ALLOW_AUTH_PROVIDER_NONE=${CODEAPI_ALLOW_AUTH_PROVIDER_NONE:-}
+            - CODEAPI_JWT_ISSUER=${CODEAPI_JWT_ISSUER:-}
+            - CODEAPI_JWT_AUDIENCE=${CODEAPI_JWT_AUDIENCE:-}
+            - CODEAPI_JWT_ALLOWED_ALGS=${CODEAPI_JWT_ALLOWED_ALGS:-}
+            - CODEAPI_JWT_CLOCK_SKEW_SECONDS=${CODEAPI_JWT_CLOCK_SKEW_SECONDS:-}
+            - CODEAPI_JWT_MAX_TTL_SECONDS=${CODEAPI_JWT_MAX_TTL_SECONDS:-}
+            - CODEAPI_JWT_KEY_CACHE_TTL_SECONDS=${CODEAPI_JWT_KEY_CACHE_TTL_SECONDS:-}
+            - CODEAPI_JWT_JWKS_JSON=${CODEAPI_JWT_JWKS_JSON:-}
+            - CODEAPI_JWT_PUBLIC_KEYS_DIR=${CODEAPI_JWT_PUBLIC_KEYS_DIR:-}
+            - CODEAPI_JWT_PUBLIC_KEY=${CODEAPI_JWT_PUBLIC_KEY:-}
+            - CODEAPI_JWT_KID=${CODEAPI_JWT_KID:-}
+            - CODEAPI_JWT_KEY_ID=${CODEAPI_JWT_KEY_ID:-}
+            - CODEAPI_JWT_HS256_KID=${CODEAPI_JWT_HS256_KID:-}
+            - CODEAPI_JWT_HS256_SECRET=${CODEAPI_JWT_HS256_SECRET:-}
+            - CODEAPI_JWT_SINGLE_TENANT_ID=${CODEAPI_JWT_SINGLE_TENANT_ID:-}
+            - CODEAPI_TENANT_ISOLATION_STRICT=${CODEAPI_TENANT_ISOLATION_STRICT:-}
+            - EXECUTION_MANIFEST_TTL_SECONDS=${EXECUTION_MANIFEST_TTL_SECONDS:-}
+            - EXECUTION_MANIFEST_MAX_UPLOAD_BYTES=${EXECUTION_MANIFEST_MAX_UPLOAD_BYTES:-}
+            - EXECUTION_MANIFEST_MAX_OUTPUT_FILES=${EXECUTION_MANIFEST_MAX_OUTPUT_FILES:-}
+            - EXECUTION_MANIFEST_MAX_REQUESTS=${EXECUTION_MANIFEST_MAX_REQUESTS:-}
+            - CODEAPI_HTTP_JSON_LIMIT=${CODEAPI_HTTP_JSON_LIMIT:-50mb}
+            - SERVICE_PORT=3112
+            - SANDBOX_ENDPOINT=http://sandbox-runner:2000/api/v2
+            - EGRESS_GATEWAY_URL=http://egress_gateway:3190
+            - FILE_SERVER_URL=http://file_server:3000
+            - TOOL_CALL_SERVER_URL=http://tool_call_server:3033
+            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - REDIS_PASSWORD=localdev
+        depends_on:
+            - redis
+            - tool_call_server
+
+    service-worker:
+        image: ghcr.io/berry-13/codeapi-worker:latest
+        container_name: service-worker
+        environment:
+            - LOCAL_MODE=${LOCAL_MODE:-true}
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
+            - CODEAPI_AUTH_PROVIDER=${CODEAPI_AUTH_PROVIDER:-}
+            - CODEAPI_JWT_SINGLE_TENANT_ID=${CODEAPI_JWT_SINGLE_TENANT_ID:-}
+            - CODEAPI_TENANT_ISOLATION_STRICT=${CODEAPI_TENANT_ISOLATION_STRICT:-}
+            - CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY=${CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY:-MC4CAQAwBQYDK2VwBCIEIBoxzSJjQ5jTVyuohHtlD+uDGqv/tZ6hQS2CmxuOg2Wn}
+            - EXECUTION_MANIFEST_TTL_SECONDS=${EXECUTION_MANIFEST_TTL_SECONDS:-}
+            - EXECUTION_MANIFEST_MAX_UPLOAD_BYTES=${EXECUTION_MANIFEST_MAX_UPLOAD_BYTES:-}
+            - EXECUTION_MANIFEST_MAX_OUTPUT_FILES=${EXECUTION_MANIFEST_MAX_OUTPUT_FILES:-}
+            - EXECUTION_MANIFEST_MAX_REQUESTS=${EXECUTION_MANIFEST_MAX_REQUESTS:-}
+            - SANDBOX_ENDPOINT=http://sandbox-runner:2000/api/v2
+            - EGRESS_GATEWAY_URL=http://egress_gateway:3190
+            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - REDIS_PASSWORD=localdev
+            - PYTHON_CONCURRENCY=${PYTHON_CONCURRENCY:-1}
+            - OTHER_CONCURRENCY=${OTHER_CONCURRENCY:-8}
+            - WORKER_HEALTH_PORT=3113
+        depends_on:
+            redis:
+                condition: service_started
+            sandbox-runner:
+                condition: service_healthy
+
+    egress_gateway:
+        image: ghcr.io/berry-13/codeapi-egress-gateway:latest
+        container_name: egress_gateway
+        ports:
+            - 3190:3190
+        environment:
+            - SERVICE_NAME=egress-gateway
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
+            - CODEAPI_EGRESS_LEDGER_REQUIRED=${CODEAPI_EGRESS_LEDGER_REQUIRED:-true}
+            - EGRESS_GATEWAY_PORT=3190
+            - EGRESS_GATEWAY_FILE_SERVER_URL=http://file_server:3000
+            - EGRESS_GATEWAY_TOOL_CALL_SERVER_URL=http://tool_call_server:3033
+            - EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES=1048576
+            - CODEAPI_EGRESS_GRANT_SECRET=${CODEAPI_EGRESS_GRANT_SECRET:-localdev-egress-grant-secret-change-me-32b}
+            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - REDIS_PASSWORD=localdev
+        depends_on:
+            - file_server
+            - tool_call_server
+            - redis
+
+    tool_call_server:
+        image: ghcr.io/berry-13/codeapi-tool-call-server:latest
+        container_name: tool_call_server
+        environment:
+            - TOOL_CALL_SERVER_PORT=3033
+            - TOOL_CALL_REQUEST_TIMEOUT=300000
+            - TOOL_CALL_SESSION_EXPIRY=600
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - REDIS_PASSWORD=localdev
+            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+        depends_on:
+            - redis
+
+    package_init:
+        image: ghcr.io/berry-13/codeapi-package-init:latest
+        container_name: package_init
+        restart: "no"
+        environment:
+            - CODEAPI_LANGUAGES=${CODEAPI_LANGUAGES:-}
+            - PYTHON_VERSION=${PYTHON_VERSION:-}
+            - PYTHON_BUILD_STANDALONE_TAG=${PYTHON_BUILD_STANDALONE_TAG:-}
+            - NODE_VERSION=${NODE_VERSION:-}
+            - BUN_VERSION=${BUN_VERSION:-}
+            - BASH_PACKAGE_VERSION=${BASH_PACKAGE_VERSION:-}
+            - FORCE_REBUILD=${FORCE_REBUILD:-}
+        volumes:
+            - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/pkgs
+
+    sandbox-runner:
+        image: ghcr.io/berry-13/codeapi-sandbox-runner:latest
+        container_name: sandbox-runner
+        restart: always
+        privileged: false
+        devices:
+            - ${KVM_DEVICE_PATH:-/dev/kvm}:/dev/kvm
+        ports:
+            - 2000:2000
+        volumes:
+            - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
+        environment:
+            - KVM_ENABLED=${KVM_ENABLED:-true}
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
+            - EGRESS_GATEWAY_URL=http://egress_gateway:3190
+            - SANDBOX_EXECUTE_BODY_LIMIT=${SANDBOX_EXECUTE_BODY_LIMIT:-50mb}
+            - SANDBOX_PACKAGES_DIRECTORY=/pkgs
+            - SANDBOX_LOG_LEVEL=DEBUG
+            - SANDBOX_OUTPUT_MAX_SIZE=65536
+            - SANDBOX_MAX_CONCURRENT_JOBS=${SANDBOX_MAX_CONCURRENT_JOBS:-8}
+            - SANDBOX_PER_JOB_UIDS=${SANDBOX_PER_JOB_UIDS:-true}
+            - SANDBOX_JOB_UID_BASE=${SANDBOX_JOB_UID_BASE:-200000}
+            - SANDBOX_JOB_GID_BASE=${SANDBOX_JOB_GID_BASE:-200000}
+            - SANDBOX_JOB_UID_COUNT=${SANDBOX_JOB_UID_COUNT:-}
+            - SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS=${SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS:-3600}
+            - SANDBOX_RUN_TIMEOUT=300000
+            - SANDBOX_RUN_CPU_TIME=300000
+            - SANDBOX_COMPILE_TIMEOUT=30000
+            - LAUNCHER_VCPUS=2
+            - LAUNCHER_RAM_MIB=2048
+            - LAUNCHER_LOG_LEVEL=3
+            - SANDBOX_ALLOWED_LOCAL_NETWORK_PORT=3190
+            - SANDBOX_FORWARD_TARGET=egress_gateway:3190
+            - SANDBOX_REQUIRE_EGRESS_MANIFEST=${SANDBOX_REQUIRE_EGRESS_MANIFEST:-true}
+            - SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY=${SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY:-MCowBQYDK2VwAyEAeY3PRoTS3adfU6E3gQUB5hSZdrdMSw6OrKkH4UhYh0U=}
+        depends_on:
+            egress_gateway:
+                condition: service_healthy
+            package_init:
+                condition: service_completed_successfully
+        healthcheck:
+            test: ["CMD-SHELL", "curl -fsS http://localhost:2000/api/v2/runtimes >/dev/null || exit 1"]
+            interval: 5s
+            timeout: 3s
+            retries: 60
+            start_period: 20s
+
+    file_server:
+        image: ghcr.io/berry-13/codeapi-file-server:latest
+        container_name: file_server
+        ports:
+            - ${CODEAPI_FILE_SERVER_PORT:-13000}:3000
+        environment:
+            - MINIO_BUCKET=test-bucket
+            - MINIO_ENDPOINT=minio
+            - MINIO_PORT=9000
+            - MINIO_USE_SSL=false
+            - MINIO_ACCESS_KEY=minioadmin
+            - MINIO_SECRET_KEY=minioadmin
+            - FILE_SERVER_PORT=3000
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - REDIS_PASSWORD=localdev
+            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+        depends_on:
+            - minio
+            - redis
+
+    redis:
+        image: redis:7-alpine
+        container_name: redis
+        command: redis-server --requirepass localdev
+        ports:
+            - ${CODEAPI_REDIS_PORT:-16379}:6379
+
+    minio:
+        image: quay.io/minio/minio
+        container_name: minio
+        ports:
+            - ${CODEAPI_MINIO_PORT:-19000}:9000
+            - ${CODEAPI_MINIO_CONSOLE_PORT:-19001}:9001
+        volumes:
+            - minio_data:/data
+        environment:
+            - MINIO_ROOT_USER=minioadmin
+            - MINIO_ROOT_PASSWORD=minioadmin
+        command: server /data --console-address ":9001"
+
+volumes:
+    minio_data:

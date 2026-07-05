@@ -71,6 +71,22 @@ Adding a language later (e.g. `CODEAPI_LANGUAGES=python,bun`) installs only
 the missing runtime into the existing volume. Set `FORCE_REBUILD=true` to
 wipe and rebuild the volume from scratch.
 
+### Prebuilt images
+
+To skip building from source, use the pull-based compose file. It mirrors the
+default stack but pulls every image from GHCR (`ghcr.io/berry-13/codeapi-*`),
+published by the `publish-images` workflow on each push to `main` and on
+version tags:
+
+```bash
+docker compose -f docker-compose.prebuilt.yml up
+```
+
+The `package_init` service still populates `./data/pkgs` on first start, so the
+same `CODEAPI_LANGUAGES` and `SANDBOX_PACKAGES_PATH` options apply. Prebuilt
+images are `linux/amd64` only for now; on other architectures, build from source
+with the default compose file instead.
+
 Local Docker Compose files set `CODEAPI_INTERNAL_SERVICE_TOKEN` to a shared
 development value by default. Production deployments must override it with a
 strong secret; when it is unset, file object routes and Tool Call Server
