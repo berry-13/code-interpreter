@@ -618,7 +618,15 @@ EOF
                 cat > "$JAVA_DEST/compile" << 'EOF'
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${SCRIPT_DIR}/bin/javac" "$@"
+# The sandbox passes every submitted file; attachments like data.csv are
+# inputs for the program, not compilation units.
+SOURCES=()
+for f in "$@"; do
+    case "$f" in
+        *.java) SOURCES+=("$f") ;;
+    esac
+done
+exec "${SCRIPT_DIR}/bin/javac" "${SOURCES[@]}"
 EOF
                 chmod +x "$JAVA_DEST/compile"
 
