@@ -29,13 +29,16 @@ services:
             - KVM_ENABLED=false
             - SANDBOX_USE_CGROUPV2=${SANDBOX_USE_CGROUPV2:-true}
         devices: !reset []
-        # Health probes exec into the sandbox rootfs userland, which has bun
-        # but no curl (same reason docker-compose.mac.yml overrides this).
+        # Health probes exec into PID 1's mount namespace. start-direct-sandbox
+        # execs unshare --mount, so that is the sandbox rootfs userland (bun,
+        # no curl) rather than the runner image (curl, no bun). Try both so the
+        # probe works regardless of which userland it lands in.
         healthcheck:
             test:
                 - CMD-SHELL
                 - >-
-                    bun -e "fetch('http://localhost:2000/api/v2/runtimes').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+                    curl -fsS http://localhost:2000/api/v2/runtimes >/dev/null 2>&1
+                    || bun -e "fetch('http://localhost:2000/api/v2/runtimes').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
         # Direct NsJail needs namespace/mount syscalls the default Docker
         # profile blocks. The custom seccomp profile whitelists exactly what
         # NsJail requires (see seccomp/README.md); the capabilities mirror
