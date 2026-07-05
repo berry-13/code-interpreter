@@ -115,6 +115,119 @@ isolation than the default microVM mode. It is appropriate for local
 development and trusted use, not for executing untrusted code from people you
 don't trust; see the [Security disclaimer](#security-disclaimer) above.
 
+## LibreChat integration
+
+LibreChat talks to this service over HTTP. Point it at the **API** component,
+which listens on port `3112` and serves every route under the `/v1` prefix
+(for example `GET /v1/health`, `POST /v1/exec`). Set `LIBRECHAT_CODE_BASEURL`
+on the LibreChat side to that base URL, including the `/v1` suffix:
+
+```bash
+# LibreChat .env
+LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1
+```
+
+Use the internal service name (for example `http://api:3112/v1`) when
+LibreChat and this service share a Docker network.
+
+Authentication has two supported modes: unauthenticated (local/dev only) and
+LibreChat JWT (EdDSA), controlled by `CODEAPI_AUTH_PROVIDER` on this service.
+The legacy `X-API-Key` header is no longer accepted; outside local mode the
+API requires a `Bearer` JWT.
+
+### Unauthenticated mode (local/dev only)
+
+The default Docker Compose files run with `LOCAL_MODE=true`, which bypasses
+authentication entirely and stamps every request with a fixed local
+principal. In this mode LibreChat needs only `LIBRECHAT_CODE_BASEURL`; leave
+its `CODEAPI_JWT_*` variables unset. Nothing else is required on either side.
+
+If you run with `LOCAL_MODE=false` but still want no authentication, set both
+of these on the service instead:
+
+```bash
+# codeapi service .env
+LOCAL_MODE=false
+CODEAPI_AUTH_PROVIDER=none
+CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true
+```
+
+With `CODEAPI_AUTH_PROVIDER=none` the service takes the user id from the
+`User-Id` request header (falling back to the request body `user_id`, then
+`anonymous`). It refuses to start in this mode unless
+`CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true` is also set.
+
+Warning: unauthenticated mode lets any caller execute arbitrary code. Never
+expose it on a public network or shared host. Use it only on a loopback or a
+trusted private network, and switch to JWT mode for anything else.
+
+### JWT (EdDSA) mode
+
+In JWT mode LibreChat signs a short-lived EdDSA (Ed25519) JWT with a private
+key and sends it as `Authorization: Bearer <token>`. This service verifies
+the signature with the matching public key. The private key stays on the
+LibreChat side and never reaches this service.
+
+Generate an Ed25519 keypair:
+
+```bash
+# Private key stays with LibreChat (the signer)
+openssl genpkey -algorithm ed25519 -out jwt-codeapi.key
+
+# Public key goes to this service (the verifier)
+openssl pkey -in jwt-codeapi.key -pubout -out jwt-codeapi.pub
+```
+
+Configure LibreChat to mint tokens with the private key. LibreChat populates
+the required claims (`iss`, `aud`, `sub`, `jti`, `iat`, `nbf`, `exp`,
+`principal_source`, `auth_context_hash`) automatically:
+
+```bash
+# LibreChat .env
+LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1
+CODEAPI_AUTH_PROVIDER=librechat-jwt
+CODEAPI_JWT_ALGORITHM=EdDSA
+CODEAPI_JWT_KID=lc-codeapi-1
+CODEAPI_JWT_ISSUER=librechat
+CODEAPI_JWT_AUDIENCE=codeapi
+# Paste the contents of jwt-codeapi.key (newlines may be escaped as \n)
+CODEAPI_JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+```
+
+Configure this service to verify with the public key. `CODEAPI_JWT_KID` must
+match the `kid` LibreChat signs with, and `CODEAPI_JWT_ISSUER` /
+`CODEAPI_JWT_AUDIENCE` must match the values LibreChat mints:
+
+```bash
+# codeapi service .env
+LOCAL_MODE=false
+CODEAPI_AUTH_PROVIDER=librechat-jwt
+CODEAPI_JWT_ISSUER=librechat
+CODEAPI_JWT_AUDIENCE=codeapi
+CODEAPI_JWT_ALLOWED_ALGS=EdDSA
+CODEAPI_JWT_KID=lc-codeapi-1
+# Paste the contents of jwt-codeapi.pub (newlines may be escaped as \n)
+CODEAPI_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+```
+
+Settings that must match on both sides: the algorithm (`EdDSA`), the key id
+(`CODEAPI_JWT_KID` here equals the signer's `kid`; a token with an unknown
+`kid` is rejected), the issuer (`CODEAPI_JWT_ISSUER`, default `librechat`),
+and the audience (`CODEAPI_JWT_AUDIENCE`, default `codeapi`). Tokens are
+capped at a 300-second lifetime (`CODEAPI_JWT_MAX_TTL_SECONDS`) with 30
+seconds of clock skew tolerance. Because `LOCAL_MODE=true` bypasses auth
+entirely, JWT mode requires `LOCAL_MODE=false`.
+
+For key rotation or multiple verifier keys, this service also accepts
+`CODEAPI_JWT_JWKS_JSON` (an inline JWKS document) or
+`CODEAPI_JWT_PUBLIC_KEYS_DIR` (a directory of PEM files named by `kid`) in
+place of `CODEAPI_JWT_PUBLIC_KEY` + `CODEAPI_JWT_KID`.
+
+### Language runtimes
+
+`CODEAPI_LANGUAGES` selects which runtimes are pre-installed; see the Local
+Development section above.
+
 ## Health Checks
 
 - API: `GET /v1/health`
