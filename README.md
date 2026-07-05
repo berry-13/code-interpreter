@@ -76,6 +76,29 @@ development value by default. Production deployments must override it with a
 strong secret; when it is unset, file object routes and Tool Call Server
 session-management routes stay unauthenticated for backwards compatibility.
 
+### Running without KVM
+
+The default stack boots the sandbox inside a libkrun microVM and maps
+`/dev/kvm` into the sandbox container. On hosts without a usable `/dev/kvm`
+(cheap VPSes, LXC containers, nested virtualization without KVM passthrough)
+Docker fails to start that container. Layer the NsJail-only override to run
+without KVM:
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.nokvm.yml up
+```
+
+For the scalable stack, use its companion override:
+
+```bash
+docker compose -f docker-compose.scalable.yml -f docker-compose.scalable.nokvm.yml up
+```
+
+NsJail-only mode shares the host kernel and provides meaningfully weaker
+isolation than the default microVM mode. It is appropriate for local
+development and trusted use, not for executing untrusted code from people you
+don't trust; see the [Security disclaimer](#security-disclaimer) above.
+
 ## Health Checks
 
 - API: `GET /v1/health`

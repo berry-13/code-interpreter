@@ -1,0 +1,51 @@
+# =============================================================================
+# NsJail-only override for the scalable stack (no KVM / no microVM)
+#
+# WARNING: NsJail-only mode shares the host kernel. It provides meaningfully
+# weaker isolation than the default microVM mode (KVM_ENABLED=true), where
+# sandboxed code runs under a separate guest kernel. It is appropriate for
+# local development and trusted use, NOT for executing untrusted code from
+# people you don't trust. See the "Security disclaimer" section in README.md.
+#
+# Companion to docker-compose.nokvm.yml. That file overrides sandbox-runner
+# (from docker-compose.yaml); this one overrides worker-sandbox (from
+# docker-compose.scalable.yml). They are kept separate because Compose rejects
+# an override that names a service absent from the base file it is layered on.
+#
+# Use on hosts without a usable /dev/kvm (cheap VPSes, LXC containers, nested
+# virtualization without KVM passthrough):
+#
+#   docker compose -f docker-compose.scalable.yml -f docker-compose.scalable.nokvm.yml up
+#
+# It disables the microVM launcher (KVM_ENABLED=false) and removes the
+# ${KVM_DEVICE_PATH:-/dev/kvm} device mapping that would otherwise make Docker
+# fail to start the container on a KVM-less host.
+# =============================================================================
+services:
+  worker-sandbox:
+    environment:
+      - KVM_ENABLED=false
+    devices: !reset []
+    # Direct NsJail needs namespace/mount syscalls the default Docker profile
+    # blocks. The custom seccomp profile whitelists exactly what NsJail
+    # requires (see seccomp/README.md); docker-default AppArmor denies the
+    # mount propagation changes, so it is disabled. The capabilities mirror
+    # docker-compose.mac.yml, the long-standing direct-NsJail setup.
+    security_opt:
+      - seccomp=./seccomp/nsjail.json
+      - apparmor=unconfined
+    cap_add:
+      - SYS_ADMIN
+      - SYS_CHROOT
+      - SYS_PTRACE
+      - SETUID
+      - SETGID
+      - NET_ADMIN
+      - DAC_OVERRIDE
+      - DAC_READ_SEARCH
+      - CHOWN
+      - FOWNER
+      - FSETID
+      - KILL
+      - SETFCAP
+      - MKNOD
