@@ -1,0 +1,63 @@
+# =============================================================================
+# NsJail-only override (no KVM / no microVM)
+#
+# WARNING: NsJail-only mode shares the host kernel. It provides meaningfully
+# weaker isolation than the default microVM mode (KVM_ENABLED=true), where
+# sandboxed code runs under a separate guest kernel. It is appropriate for
+# local development and trusted use, NOT for executing untrusted code from
+# people you don't trust. See the "Security disclaimer" section in README.md.
+#
+# Use this override on hosts without a usable /dev/kvm (cheap VPSes, LXC
+# containers, nested virtualization without KVM passthrough):
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.nokvm.yml up
+#
+# It disables the microVM launcher (KVM_ENABLED=false) and removes the
+# ${KVM_DEVICE_PATH:-/dev/kvm} device mapping that would otherwise make Docker
+# fail to start the container on a KVM-less host.
+#
+# Scalable stack: the same trade-off and mechanism apply to the worker-sandbox
+# service in docker-compose.scalable.yml. That service is not present in
+# docker-compose.yaml, so it is overridden in a dedicated companion file to
+# avoid Compose rejecting an underspecified service. Run it with:
+#
+#   docker compose -f docker-compose.scalable.yml -f docker-compose.scalable.nokvm.yml up
+# =============================================================================
+services:
+    sandbox-runner:
+        environment:
+            - KVM_ENABLED=false
+            - SANDBOX_USE_CGROUPV2=${SANDBOX_USE_CGROUPV2:-true}
+        devices: !reset []
+        # Health probes exec into the sandbox rootfs userland, which has bun
+        # but no curl (same reason docker-compose.mac.yml overrides this).
+        healthcheck:
+            test:
+                - CMD-SHELL
+                - >-
+                    bun -e "fetch('http://localhost:2000/api/v2/runtimes').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+        # Direct NsJail needs namespace/mount syscalls the default Docker
+        # profile blocks. The custom seccomp profile whitelists exactly what
+        # NsJail requires (see seccomp/README.md); the capabilities mirror
+        # docker-compose.mac.yml, the long-standing direct-NsJail setup.
+        security_opt:
+            - seccomp=./seccomp/nsjail.json
+            # docker-default AppArmor denies the mount propagation changes
+            # NsJail needs. Load apparmor/sandbox-nsjail on the host and use
+            # apparmor=sandbox-nsjail instead for a stricter setup.
+            - apparmor=unconfined
+        cap_add:
+            - SYS_ADMIN
+            - SYS_CHROOT
+            - SYS_PTRACE
+            - SETUID
+            - SETGID
+            - NET_ADMIN
+            - DAC_OVERRIDE
+            - DAC_READ_SEARCH
+            - CHOWN
+            - FOWNER
+            - FSETID
+            - KILL
+            - SETFCAP
+            - MKNOD

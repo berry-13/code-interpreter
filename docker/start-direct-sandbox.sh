@@ -48,6 +48,13 @@ export SANDBOX_ROOTFS="$ROOTFS"
 exec unshare --mount bash -c '
     ROOTFS="${SANDBOX_ROOTFS:-/sandbox-rootfs}"
 
+    if [ -L /usr/sbin ]; then
+        # Merged-usr base images (Fedora 42+) make /usr/sbin a symlink into
+        # /usr/bin; mounting the rootfs sbin over it would land on /usr/bin
+        # and take mount(8) with it. Give sbin a real directory first.
+        rm /usr/sbin
+        mkdir /usr/sbin
+    fi
     mount -o bind,ro "$ROOTFS/usr/sbin"     /usr/sbin    || { echo "FATAL: cannot bind /usr/sbin"; exit 1; }
     mount -o bind,ro "$ROOTFS/usr/lib"      /usr/lib     || { echo "FATAL: cannot bind /usr/lib"; exit 1; }
 

@@ -12,7 +12,7 @@ The `nsjail.json` profile uses a whitelist approach - only explicitly allowed sy
 
 2. **NsJail namespace operations** - `clone`, `clone3`, `setns`, `unshare`, `sethostname`, `setdomainname`
 
-3. **NsJail mount operations** - `mount`, `umount`, `umount2`, `pivot_root`
+3. **NsJail mount operations** - `mount`, `umount`, `umount2`, `pivot_root`, plus the new mount API (`fsopen`, `fsconfig`, `fsmount`, `fspick`, `open_tree`, `move_mount`, `mount_setattr`) that util-linux 2.39+ issues instead of `mount(2)`
 
 4. **NsJail chroot** - `chroot`
 

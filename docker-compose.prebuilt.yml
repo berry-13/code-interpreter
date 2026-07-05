@@ -1,9 +1,15 @@
+# Pull-based stack: identical to docker-compose.yaml but every service uses a
+# prebuilt image from GHCR instead of building from source. Nothing is compiled
+# locally.
+#
+# Usage:
+#   docker compose -f docker-compose.prebuilt.yml up
+#
+# Images are published by .github/workflows/publish-images.yml and are
+# linux/amd64 only for now (arm64 is not yet built).
 services:
     api:
-        build:
-            context: .
-            dockerfile: service/Dockerfile
-            target: api
+        image: ghcr.io/berry-13/codeapi-api:latest
         container_name: api
         ports:
             - 3112:3112
@@ -46,10 +52,7 @@ services:
             - tool_call_server
 
     service-worker:
-        build:
-            context: .
-            dockerfile: service/Dockerfile
-            target: worker
+        image: ghcr.io/berry-13/codeapi-worker:latest
         container_name: service-worker
         environment:
             - LOCAL_MODE=${LOCAL_MODE:-true}
@@ -78,10 +81,7 @@ services:
                 condition: service_healthy
 
     egress_gateway:
-        build:
-            context: .
-            dockerfile: service/Dockerfile.egress-gateway
-            target: production
+        image: ghcr.io/berry-13/codeapi-egress-gateway:latest
         container_name: egress_gateway
         ports:
             - 3190:3190
@@ -104,10 +104,7 @@ services:
             - redis
 
     tool_call_server:
-        build:
-            context: .
-            dockerfile: service/Dockerfile.tool-call-server
-            target: production
+        image: ghcr.io/berry-13/codeapi-tool-call-server:latest
         container_name: tool_call_server
         environment:
             - TOOL_CALL_SERVER_PORT=3033
@@ -121,9 +118,7 @@ services:
             - redis
 
     package_init:
-        build:
-            context: .
-            dockerfile: docker/Dockerfile.package-init
+        image: ghcr.io/berry-13/codeapi-package-init:latest
         container_name: package_init
         restart: "no"
         environment:
@@ -140,9 +135,7 @@ services:
             - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/pkgs
 
     sandbox-runner:
-        build:
-          context: .
-          dockerfile: api/Dockerfile
+        image: ghcr.io/berry-13/codeapi-sandbox-runner:latest
         container_name: sandbox-runner
         restart: always
         privileged: false
@@ -189,10 +182,7 @@ services:
             start_period: 20s
 
     file_server:
-        build:
-            context: .
-            dockerfile: service/Dockerfile
-            target: production
+        image: ghcr.io/berry-13/codeapi-file-server:latest
         container_name: file_server
         ports:
             - ${CODEAPI_FILE_SERVER_PORT:-13000}:3000

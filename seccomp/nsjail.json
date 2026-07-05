@@ -365,6 +365,19 @@
 			"action": "SCMP_ACT_ALLOW"
 		},
 		{
+			"comment": "New mount API (util-linux 2.39+ libmount uses these instead of mount(2)) - requires CAP_SYS_ADMIN like the classic calls above",
+			"names": [
+				"fsopen",
+				"fsconfig",
+				"fsmount",
+				"fspick",
+				"open_tree",
+				"move_mount",
+				"mount_setattr"
+			],
+			"action": "SCMP_ACT_ALLOW"
+		},
+		{
 			"comment": "NsJail chroot - requires CAP_SYS_CHROOT",
 			"names": [
 				"chroot"

@@ -160,6 +160,26 @@ services:
       timeout: 5s
       retries: 3
 
+  # Package Init - One-shot job that populates the shared packages volume
+  # with the selected language runtimes before any sandbox starts.
+  package_init:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.package-init
+    restart: "no"
+    environment:
+      - CODEAPI_LANGUAGES=${CODEAPI_LANGUAGES:-}
+      - PYTHON_VERSION=${PYTHON_VERSION:-}
+      - PYTHON_BUILD_STANDALONE_TAG=${PYTHON_BUILD_STANDALONE_TAG:-}
+      - NODE_VERSION=${NODE_VERSION:-}
+      - BUN_VERSION=${BUN_VERSION:-}
+      - BASH_PACKAGE_VERSION=${BASH_PACKAGE_VERSION:-}
+      - JAVA_VERSION=${JAVA_VERSION:-}
+      - TEMURIN_BUILD=${TEMURIN_BUILD:-}
+      - FORCE_REBUILD=${FORCE_REBUILD:-}
+    volumes:
+      - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/pkgs
+
   # =============================================================================
   # WORKER-SANDBOX PODS (Worker + MicroVM Sandbox as a unit)
   # Scale based on: Queue depth, job wait time
@@ -216,6 +236,8 @@ services:
         condition: service_started
       tool_call_server:
         condition: service_started
+      package_init:
+        condition: service_completed_successfully
     deploy:
       replicas: 3  # Scale based on queue depth
     healthcheck:
