@@ -58,11 +58,14 @@ export function buildExecutionManifestClaims(args: {
 }): ExecutionManifestClaims {
   const now = args.nowSeconds ?? Math.floor(Date.now() / 1000);
   const inputFiles = collectManifestInputFiles(args.payload);
-  // Persistent sessions upload one hidden state object AFTER user outputs. The
-  // egress gateway counts it against these budgets, so reserve a slot/request
-  // for it -- otherwise a run that produces exactly max_output_files visible
-  // outputs would fail the snapshot and leave the pointer on stale state.
-  const persistReserve = args.payload.persist_session ? 1 : 0;
+  // Persistent sessions do hidden gateway I/O the caller's budgets don't see:
+  // always a snapshot PUT (an upload = one output + one request), and on a
+  // continuation run (a prior snapshot exists) also a restore GET (one more
+  // request). Reserve accordingly so a run sized to its visible workload isn't
+  // failed by the persistence traffic (which would strand the pointer on stale
+  // state or drop a legit download/upload).
+  const persistUpload = args.payload.persist_session ? 1 : 0;
+  const persistRestoreGet = args.payload.persist_session?.restore_session_id ? 1 : 0;
   const readSessions = Array.from(new Set(inputFiles.map(file => file.session_id))).sort();
   const ctx = args.req.codeApiAuthContext;
   const identity = buildExecutionIdentity({
@@ -87,8 +90,8 @@ export function buildExecutionManifestClaims(args: {
     read_sessions: readSessions,
     output_session_id: args.outputSessionId,
     max_upload_bytes: env.EXECUTION_MANIFEST_MAX_UPLOAD_BYTES,
-    max_output_files: env.EXECUTION_MANIFEST_MAX_OUTPUT_FILES + persistReserve,
-    max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS + persistReserve,
+    max_output_files: env.EXECUTION_MANIFEST_MAX_OUTPUT_FILES + persistUpload,
+    max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS + persistUpload + persistRestoreGet,
     iat: now,
     exp: now + env.EXECUTION_MANIFEST_TTL_SECONDS,
     tool_call_socket: args.payload.tool_call_socket === true,

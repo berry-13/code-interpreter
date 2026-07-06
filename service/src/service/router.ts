@@ -17,6 +17,7 @@ import { createPayload } from '../payload';
 import {
   SESSION_STATE_FILE_ID,
   SESSION_STATE_TAR_FILENAME,
+  isReservedSessionInputName,
   sessionStatePointerKey,
 } from '../session-persist';
 import { summarizeRequestedFiles } from '../execution-log';
@@ -205,11 +206,14 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      *     file-server or Redis-auth change needed. Done before
      *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
     if (env.PERSIST_SESSIONS) {
-      // The state tar is identified in the sandbox by name only (egress masks
-      // file id/session), so a user input file with this name would be
-      // indistinguishable from the injected snapshot. Reserve the name.
-      if ((authorizedFiles ?? []).some(f => f.name === SESSION_STATE_TAR_FILENAME)) {
-        return res.status(400).json({ error: `File name '${SESSION_STATE_TAR_FILENAME}' is reserved` });
+      // Reserve every persistence artifact name: the state tar (identified in
+      // the sandbox by name only, since egress masks file id/session) and the
+      // namespace snapshot `.session_state.pkl` (+ its tempfile). A user input
+      // with any of these names would shadow restored state or be mistaken for
+      // the injected snapshot.
+      const reservedInput = (authorizedFiles ?? []).find(f => isReservedSessionInputName(f.name));
+      if (reservedInput) {
+        return res.status(400).json({ error: `File name '${reservedInput.name}' is reserved when persistent sessions are enabled` });
       }
       rawPayload.persist_session = {
         file_id: SESSION_STATE_FILE_ID,

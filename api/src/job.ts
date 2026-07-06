@@ -1071,13 +1071,9 @@ export class Job {
 
     const tmpTar = path.join(os.tmpdir(), `sess-restore-${nanoid()}.tar`);
     try {
-      const fetched = await this.downloadObjectToPath(restoreFile, tmpTar);
+      const fetched = await this.downloadObjectToPath(restoreFile, tmpTar, config.session_state_max_bytes);
       if (!fetched) return; // 404 / miss -> treat as no prior state
       const { size } = await fsp.stat(tmpTar);
-      if (size > config.session_state_max_bytes) {
-        this.log.warn({ size, cap: config.session_state_max_bytes }, 'Persisted session tar exceeds cap; skipping restore');
-        return;
-      }
       // GNU tar strips leading `/` and `..` members by default, so extraction
       // stays confined to `-C submissionDir`. `--no-same-owner` keeps the
       // extracted files owned by the runner until we chown them to the job UID.
@@ -1112,6 +1108,12 @@ export class Job {
 
     const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
     try {
+      // Drop read-only inputs (skill/infra files) from the snapshot: persisting
+      // them would re-materialize an authorized-once resource on later runs the
+      // caller may no longer be entitled to, and restore chowns the tree to the
+      // job UID, silently stripping their read-only protection. They are no
+      // longer needed post-run, so removing them here is the precise exclusion.
+      await this.removeReadOnlyInputs();
       // Bound the aggregate size BEFORE archiving so a huge workspace (many
       // small files, or big runtime caches under HOME=/mnt/data) can't make the
       // runner materialize a multi-GB tar in /tmp and fill host disk.
@@ -1145,13 +1147,41 @@ export class Job {
     }
   }
 
-  /** Stream a file-server object to a local path. Returns false on 404. */
-  private async downloadObjectToPath(file: TFile, destPath: string): Promise<boolean> {
+  /**
+   * Stream a file-server object to a local path, capped at `maxBytes`. Returns
+   * false on 404. A snapshot larger than the cap (e.g. after lowering the cap,
+   * or an older oversized snapshot) is rejected up front via Content-Length and,
+   * as a fallback when that header is absent/wrong, aborted mid-stream once the
+   * limit is crossed -- so a giant object can't fill runner disk before the
+   * post-download size check would have skipped it.
+   */
+  private async downloadObjectToPath(file: TFile, destPath: string, maxBytes: number): Promise<boolean> {
     const res = await fetch(this.buildDownloadUrl(file), { headers: this.fileEgressHeaders() });
     if (res.status === 404) return false;
     if (!res.ok) throw new Error(`Session object download HTTP ${res.status}`);
     if (!res.body) throw new Error('Session object download returned empty body');
-    await pipeline(toNodeReadable(res.body), fs.createWriteStream(destPath, { mode: SANDBOX_FILE_MODE }));
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await res.body.cancel().catch(() => { /* release socket */ });
+      throw new Error(`Session object exceeds cap (${declared} > ${maxBytes})`);
+    }
+    let received = 0;
+    const limiter = new Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length;
+        if (received > maxBytes) {
+          cb(new Error(`Session object exceeds cap (> ${maxBytes})`));
+          return;
+        }
+        cb(null, chunk);
+      },
+    });
+    try {
+      await pipeline(toNodeReadable(res.body), limiter, fs.createWriteStream(destPath, { mode: SANDBOX_FILE_MODE }));
+    } catch (err) {
+      await fsp.rm(destPath, { force: true }).catch(() => { /* best effort */ });
+      throw err;
+    }
     return true;
   }
 
@@ -1235,7 +1265,12 @@ export class Job {
     }
   }
 
-  /** Sum of regular-file bytes under `dir`, not following symlinks. */
+  /**
+   * Estimate the on-disk tar size of `dir`, not following symlinks. Counts tar
+   * block overhead -- a 512-byte header per entry plus file content padded to
+   * 512-byte blocks -- so a swarm of empty files/directories (near-zero content
+   * but hundreds of MB of headers) can't slip past the pre-archive size cap.
+   */
   private async dirSizeBytes(dir: string): Promise<number> {
     let entries: fs.Dirent[];
     try {
@@ -1245,17 +1280,48 @@ export class Job {
     }
     let total = 0;
     for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
+      if (entry.isSymbolicLink()) {
+        total += 512; // header only
+        continue;
+      }
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
+        total += 512; // directory header
         total += await this.dirSizeBytes(full);
       } else if (entry.isFile()) {
+        let size = 0;
         try {
-          total += (await fsp.stat(full)).size;
+          size = (await fsp.stat(full)).size;
         } catch { /* vanished mid-walk; ignore */ }
+        total += 512 + Math.ceil(size / 512) * 512;
       }
     }
     return total;
+  }
+
+  /** Remove the current run's read-only input files (tracked in
+   *  `inputFileHashes`) so they are never captured in a session snapshot. */
+  private async removeReadOnlyInputs(): Promise<void> {
+    for (const info of this.inputFileHashes.values()) {
+      if (info.readOnly && info.path) {
+        await fsp.rm(info.path, { force: true }).catch(() => { /* best effort */ });
+      }
+    }
+  }
+
+  /**
+   * If `p` exists but is not a regular file (e.g. a directory a prior persisted
+   * run left where the current source/input must go), remove it so the fresh
+   * write can't fail with EISDIR or clobber through it. No-op when `p` is a
+   * regular file or absent -- so this is safe to call before every input write.
+   */
+  private async clearNonRegularCollision(p: string): Promise<void> {
+    try {
+      const st = await fsp.lstat(p);
+      if (!st.isFile()) {
+        await fsp.rm(p, { recursive: true, force: true });
+      }
+    } catch { /* nothing there; the write will create it */ }
   }
 
   /**
@@ -1278,6 +1344,9 @@ export class Job {
     const fileStream = fs.createWriteStream(tempPath, { mode: SANDBOX_FILE_MODE });
     const reader = toNodeReadable(body);
     await pipeline(reader, hashTransform, fileStream);
+    // A prior persisted run may have left a directory/other node where this
+    // input must land; rename() over it would fail (EISDIR/ENOTEMPTY).
+    await this.clearNonRegularCollision(finalPath);
     await fsp.rename(tempPath, finalPath);
     await this.applySandboxFilePermissions(finalPath);
     return hashStream.digest('hex');
@@ -1291,6 +1360,7 @@ export class Job {
     const parentDir = path.dirname(filePath);
     await fsp.mkdir(parentDir, { recursive: true });
     await this.secureAncestors(parentDir);
+    await this.clearNonRegularCollision(filePath);
     await fsp.writeFile(filePath, content);
     await this.applySandboxFilePermissions(filePath);
 

@@ -65,6 +65,21 @@ export function isReservedSessionFilename(name: string): boolean {
 }
 
 /**
+ * True when a user input file name would collide with any persistence artifact
+ * the sandbox writes into `/mnt/data` -- the workspace tar OR the namespace
+ * snapshot. Basename-based so nested paths are caught too. The router rejects
+ * such inputs when persistence is on: otherwise a user file named
+ * `.session_state.pkl` would overwrite the restored namespace (and be loaded as
+ * pickle state), or one named like the tar would be mistaken for prior state.
+ */
+export function isReservedSessionInputName(name: string): boolean {
+  if (typeof name !== 'string' || name.length === 0) return false;
+  const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
+  if (base === undefined) return false;
+  return base === SESSION_STATE_TAR_FILENAME || SESSION_RESERVED_BASENAMES.has(base);
+}
+
+/**
  * Python bootstrap that restores the prior namespace, arms an `atexit`
  * snapshot, and then runs the user code via `exec(compile(...))` in a
  * dedicated namespace dict.
@@ -101,9 +116,17 @@ try:
 except Exception:
     import pickle as _ca_pk
 
-# Namespace the user code runs in. Presents as __main__ so the "if __name__ ==
-# __main__" guard and the pyplot template behave as they do without persistence.
-_ca_ns = {'__name__': '__main__', '__builtins__': __builtins__, '__file__': '/mnt/data/__CA_ENTRY__'}
+# Run user code in a real module registered as sys.modules['__main__'], not a
+# bare dict, so user-defined classes/functions pickle correctly (pickle resolves
+# them via __main__.<name>) and spawn-style multiprocessing can find them. Our
+# own _ca_* helpers stay in the wrapper module's separate globals, so they never
+# leak into the user namespace. ModuleType('__main__') seeds __name__ for us, so
+# the "if __name__ == __main__" guard and the pyplot template still behave.
+_ca_main = _ca_types.ModuleType('__main__')
+_ca_main.__dict__['__builtins__'] = __builtins__
+_ca_main.__dict__['__file__'] = '/mnt/data/__CA_ENTRY__'
+_ca_sys.modules['__main__'] = _ca_main
+_ca_ns = _ca_main.__dict__
 
 if _ca_os.path.exists(_CA_STATE):
     try:

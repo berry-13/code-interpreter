@@ -4,6 +4,7 @@ import {
   SESSION_STATE_FILE_ID,
   SESSION_STATE_TAR_FILENAME,
   isReservedSessionFilename,
+  isReservedSessionInputName,
   sessionStatePointerKey,
   wrapPythonForSessionPersistence,
 } from './session-persist';
@@ -21,6 +22,21 @@ describe('isReservedSessionFilename', () => {
     expect(isReservedSessionFilename('my_session_state.pkl')).toBe(false);
     expect(isReservedSessionFilename('')).toBe(false);
     expect(isReservedSessionFilename(undefined as unknown as string)).toBe(false);
+  });
+});
+
+describe('isReservedSessionInputName', () => {
+  test('rejects the tar and namespace-snapshot names (by basename)', () => {
+    expect(isReservedSessionInputName(SESSION_STATE_TAR_FILENAME)).toBe(true);
+    expect(isReservedSessionInputName(SESSION_STATE_FILENAME)).toBe(true);
+    expect(isReservedSessionInputName(`${SESSION_STATE_FILENAME}.tmp`)).toBe(true);
+    expect(isReservedSessionInputName(`nested/${SESSION_STATE_TAR_FILENAME}`)).toBe(true);
+    expect(isReservedSessionInputName(`a\\b\\${SESSION_STATE_FILENAME}`)).toBe(true);
+  });
+  test('allows ordinary input names', () => {
+    expect(isReservedSessionInputName('data.csv')).toBe(false);
+    expect(isReservedSessionInputName('workspace.tar')).toBe(false);
+    expect(isReservedSessionInputName('')).toBe(false);
   });
 });
 
