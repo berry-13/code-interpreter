@@ -28,6 +28,7 @@ import {
   fallbackSandboxIdentity,
   retainWorkspaceCleanupUntilRemoved,
   sandboxJobUidPool,
+  SANDBOX_WORKSPACE_MODE,
   type SandboxJobIdentity,
   type SandboxWorkspaceLease,
 } from './workspace-isolation';
@@ -650,6 +651,15 @@ interface InputFileInfo {
    * file) and modifications are not surfaced as artifacts to the client.
    */
   readOnly?: boolean;
+  /**
+   * Set for files materialized by a persistent-session restore (not part of
+   * this request's inputs). Unchanged restored files are skipped by the output
+   * walker -- they are internal session state carried in the snapshot tar, not
+   * user-facing artifacts -- so they never consume a max_output_files slot and
+   * crowd out a genuinely new output. A restored file the run MODIFIES is
+   * treated as a normal generated output.
+   */
+  restored?: boolean;
 }
 
 interface ExecuteResult {
@@ -1113,6 +1123,11 @@ export class Job {
       // legitimate need for symlinks, so we drop them unconditionally.
       await this.stripRestoredSymlinks(this.submissionDir);
       await this.chownTreeToJobUid(this.submissionDir);
+      // The archived `.` member can carry a hostile mode for submissionDir
+      // itself (a prior run could chmod /mnt/data to 000), which extraction
+      // reapplies -- leaving the next job's cwd inaccessible to the job UID and
+      // bricking the session. Reset the workspace dir to its canonical mode.
+      await applySandboxPathPermissions(this.submissionDir, this.sandboxIdentity(), SANDBOX_WORKSPACE_MODE);
       // Record restored files as input baselines so handleSessionFiles treats
       // unchanged carry-overs as inherited, not freshly generated outputs --
       // otherwise a session with many restored files would exhaust
@@ -1167,7 +1182,7 @@ export class Job {
       const rel = path.relative(this.submissionDir, full);
       try {
         const hash = await this.computeFileHash(full);
-        this.inputFileHashes.set(rel, { hash, path: full });
+        this.inputFileHashes.set(rel, { hash, path: full, restored: true });
       } catch { /* unreadable mid-walk; skip */ }
     }
   }
@@ -1906,6 +1921,14 @@ export class Job {
       } catch (err) {
         this.log.debug({ path: relativePath, err }, 'walkDir: failed to hash file');
       }
+    }
+
+    /* Unchanged persistent-session carry-over: internal state that rides in the
+     * snapshot tar, not a user output. Skip it so it neither uploads nor
+     * consumes a max_output_files slot. A modified one falls through and is
+     * emitted as a normal generated output below. */
+    if (inputFileInfo?.restored && !existingFile && !wasModified) {
+      return { collected: false, truncated: false, stopLoop: false };
     }
 
     const echoed = this.tryEchoUnchangedInput({

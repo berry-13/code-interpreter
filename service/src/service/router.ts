@@ -300,24 +300,27 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      * / error) we leave the pointer on the last good snapshot so continuity
      * survives. TTL refresh means an active session never expires. */
     if (env.PERSIST_SESSIONS && (result as t.ExecuteResult)?.session_state_persisted) {
-      await connection.set(
-        sessionStatePointerKey(sessionKey),
-        session_id,
-        'EX',
-        env.SESSION_STATE_TTL_SECONDS,
-      ).catch((error) => {
+      try {
+        await connection.set(
+          sessionStatePointerKey(sessionKey),
+          session_id,
+          'EX',
+          env.SESSION_STATE_TTL_SECONDS,
+        );
+        // ONLY after the pointer has definitely advanced: delete the superseded
+        // snapshot so active sessions don't orphan a (potentially large) tar per
+        // run. If the SET failed, Redis still points at priorSnapshotSession, so
+        // we must NOT delete it -- the next run still needs to restore from it.
+        if (priorSnapshotSession && priorSnapshotSession !== session_id) {
+          axios.delete(
+            `${env.FILE_SERVER_URL}/sessions/${encodeURIComponent(priorSnapshotSession)}/objects/${encodeURIComponent(SESSION_STATE_FILE_ID)}`,
+            { headers: internalServiceHeaders() },
+          ).catch((error) => {
+            logger.warn(`[${INSTANCE_ID}] Failed to delete superseded session snapshot:`, getAxiosErrorDetails(error));
+          });
+        }
+      } catch (error) {
         logger.error(`[${INSTANCE_ID}] Failed to set session-state pointer:`, error);
-      });
-      // Delete the superseded snapshot object so active sessions don't orphan a
-      // (potentially large) tar per run. Best-effort: the pointer already moved,
-      // and a stray object is bounded by the same retention as any output.
-      if (priorSnapshotSession && priorSnapshotSession !== session_id) {
-        axios.delete(
-          `${env.FILE_SERVER_URL}/sessions/${encodeURIComponent(priorSnapshotSession)}/objects/${encodeURIComponent(SESSION_STATE_FILE_ID)}`,
-          { headers: internalServiceHeaders() },
-        ).catch((error) => {
-          logger.warn(`[${INSTANCE_ID}] Failed to delete superseded session snapshot:`, getAxiosErrorDetails(error));
-        });
       }
     }
 
@@ -337,6 +340,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
 
 router.get('/download/:session_id/:fileId', downloadLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
+
+  // The hidden persistent-session snapshot is internal state, not a user file.
+  if (fileId === SESSION_STATE_FILE_ID) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   let exists = 0;
   const uploadKey = `upload:${req.sessionKey}${session_id}${fileId}`;
@@ -816,6 +824,20 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
   }
 });
 
+/** Best-effort extraction of the stored file_id from any file-list detail-level
+ *  item (a bare `<session>/<id>.<ext>` string, `{ name }`, or `{ id }`). */
+function objectFileIdFromListItem(item: unknown): string | undefined {
+  if (item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string') {
+    return (item as { id: string }).id;
+  }
+  const name = typeof item === 'string'
+    ? item
+    : (item && typeof item === 'object' ? (item as { name?: unknown }).name : undefined);
+  if (typeof name !== 'string') return undefined;
+  const base = name.split('/').filter(Boolean).pop() ?? name;
+  return base.replace(/\.[^.]+$/, '');
+}
+
 router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id } = req.params;
   const { detail = 'simple' } = req.query;
@@ -826,7 +848,13 @@ router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.Authen
       headers: internalServiceHeaders({ 'Accept': 'application/json' })
     });
 
-    return res.status(200).json(response.data);
+    // Hide the hidden persistent-session snapshot object: it lives in the same
+    // output session as user artifacts but is internal state, not a downloadable
+    // file. (No-op unless persistence is enabled.)
+    const data = Array.isArray(response.data)
+      ? response.data.filter(item => objectFileIdFromListItem(item) !== SESSION_STATE_FILE_ID)
+      : response.data;
+    return res.status(200).json(data);
   } catch (error) {
     const errorDetails = getAxiosErrorDetails(error);
     logger.error(`[${INSTANCE_ID}] Error fetching file info for session ${session_id}:`, errorDetails);
@@ -852,6 +880,10 @@ router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.Authen
 router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
 
+  if (fileId === SESSION_STATE_FILE_ID) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
   try {
     const response = await axios.get(
       `${env.FILE_SERVER_URL}/sessions/${session_id}/objects/${fileId}/metadata`,
@@ -874,6 +906,11 @@ router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, sessionAuth, a
 
 router.delete('/files/:session_id/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
+
+  // The hidden snapshot object is not client-addressable.
+  if (fileId === SESSION_STATE_FILE_ID) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   try {
     const response = await axios.delete(
