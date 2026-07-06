@@ -58,6 +58,25 @@ const AUTO_LOAD_DIRKEEP_TIMEOUT_MS = 10000;
 
 const execFileP = promisify(execFile);
 
+/* Basenames the persistence layer manages under /mnt/data. MUST stay in sync
+ * with SESSION_STATE_FILENAME / SESSION_STATE_TAR_FILENAME in
+ * service/src/session-persist.ts (separate npm package -- cannot import). */
+const SESSION_STATE_PKL_BASENAME = '.session_state.pkl';
+const SESSION_STATE_TAR_BASENAME = 'session-workspace.tar';
+const RESERVED_SESSION_BASENAMES = new Set([
+  SESSION_STATE_PKL_BASENAME,
+  `${SESSION_STATE_PKL_BASENAME}.tmp`,
+  SESSION_STATE_TAR_BASENAME,
+]);
+/* Top-level runtime cache dirs pruned from a session snapshot (pip/matplotlib
+ * scatter these under HOME=/mnt/data; they are not useful state). */
+const SNAPSHOT_PRUNE_DIRS = ['.cache', '.config', '.npm', `${SESSION_STATE_PKL_BASENAME}.tmp`];
+
+function isReservedSessionBasename(name: string): boolean {
+  const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
+  return base !== undefined && RESERVED_SESSION_BASENAMES.has(base);
+}
+
 /**
  * Bridges a `fetch` response body to a Node-stream Readable. The types at the
  * module boundary (Node's `stream/web` vs. lib.dom) don't overlap cleanly,
@@ -980,8 +999,17 @@ export class Job {
 
         const originalName = resolveOriginalName(response, file);
         validateFilePath(originalName, this.submissionDir);
+        // The router reserves these names by RequestFile.name, but the on-disk
+        // name comes from Content-Disposition here -- so a file sent under a
+        // harmless name could still land on a reserved basename and shadow
+        // restored state. Reject it (the injected state file is already spliced
+        // out before this runs, so this only ever sees user inputs).
+        if (this.persistSession && isReservedSessionBasename(originalName)) {
+          throw new ValidationError(`input resolves to reserved session filename '${originalName}'`);
+        }
         const finalPath = path.join(this.submissionDir, originalName);
         const finalParent = path.dirname(finalPath);
+        await this.clearNonDirectoryAncestors(finalParent);
         await fsp.mkdir(finalParent, { recursive: true });
         await this.secureAncestors(finalParent);
 
@@ -1085,11 +1113,62 @@ export class Job {
       // legitimate need for symlinks, so we drop them unconditionally.
       await this.stripRestoredSymlinks(this.submissionDir);
       await this.chownTreeToJobUid(this.submissionDir);
+      // Record restored files as input baselines so handleSessionFiles treats
+      // unchanged carry-overs as inherited, not freshly generated outputs --
+      // otherwise a session with many restored files would exhaust
+      // max_output_files before a new plot/report and drop it from the response.
+      await this.registerRestoredBaseline(this.submissionDir);
       this.log.info({ size }, 'Restored persisted session workspace');
     } catch (err) {
-      this.log.warn({ err }, 'Session restore failed; continuing without prior state');
+      // Documented contract is "start empty on restore failure". A corrupt or
+      // truncated tar can leave a partial tree, so wipe it rather than run
+      // against a mix of stale-and-missing files.
+      this.log.warn({ err }, 'Session restore failed; starting empty');
+      await this.emptyDirContents(this.submissionDir);
     } finally {
       await fsp.rm(tmpTar, { force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /** Remove everything inside `dir` (but keep `dir` itself). */
+  private async emptyDirContents(dir: string): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await fsp.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      await fsp.rm(path.join(dir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /**
+   * Hash restored files into `inputFileHashes` so the output walker sees them as
+   * pre-existing inputs. Skips reserved session artifacts (never user outputs)
+   * and `.dirkeep` markers. Best-effort per file.
+   */
+  private async registerRestoredBaseline(dir: string): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        await this.registerRestoredBaseline(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (isReservedSessionBasename(entry.name) || isDirkeep(entry.name)) continue;
+      const rel = path.relative(this.submissionDir, full);
+      try {
+        const hash = await this.computeFileHash(full);
+        this.inputFileHashes.set(rel, { hash, path: full });
+      } catch { /* unreadable mid-walk; skip */ }
     }
   }
 
@@ -1108,29 +1187,27 @@ export class Job {
 
     const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
     try {
-      // Drop read-only inputs (skill/infra files) from the snapshot: persisting
-      // them would re-materialize an authorized-once resource on later runs the
-      // caller may no longer be entitled to, and restore chowns the tree to the
-      // job UID, silently stripping their read-only protection. They are no
-      // longer needed post-run, so removing them here is the precise exclusion.
+      // Physically prune everything the snapshot must not carry BEFORE measuring
+      // and archiving, so the pre-archive size check reflects exactly what the
+      // tar will contain (no --exclude divergence):
+      //  - read-only inputs (skill/infra): persisting them would re-materialize
+      //    an authorized-once resource on later runs, and restore chowns the
+      //    tree to the job UID, stripping their read-only protection;
+      //  - runtime cache dirs (pip/matplotlib scatter these under
+      //    HOME=/mnt/data) and the atomic-write tempfile -- not useful state.
+      // The `.session_state.pkl` snapshot is kept so variables carry forward.
       await this.removeReadOnlyInputs();
-      // Bound the aggregate size BEFORE archiving so a huge workspace (many
-      // small files, or big runtime caches under HOME=/mnt/data) can't make the
-      // runner materialize a multi-GB tar in /tmp and fill host disk.
+      for (const name of SNAPSHOT_PRUNE_DIRS) {
+        await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
+      }
+      // Bound the aggregate size so a huge workspace can't make the runner
+      // materialize a multi-GB tar in /tmp and fill host disk.
       const approxBytes = await this.dirSizeBytes(this.submissionDir);
       if (approxBytes > config.session_state_max_bytes) {
         this.log.warn({ approxBytes, cap: config.session_state_max_bytes }, 'Session workspace exceeds cap; skipping persist before archiving');
         return false;
       }
-      // Exclude the atomic-write tempfile and runtime cache dirs (pip/matplotlib
-      // scatter these under HOME=/mnt/data and they are not useful session
-      // state); the `.session_state.pkl` snapshot is intentionally included so
-      // variables carry forward.
-      await execFileP('tar', [
-        '--exclude=./.session_state.pkl.tmp',
-        '--exclude=./.cache', '--exclude=./.config', '--exclude=./.npm',
-        '-cf', tmpTar, '-C', this.submissionDir, '.',
-      ]);
+      await execFileP('tar', ['-cf', tmpTar, '-C', this.submissionDir, '.']);
       const { size } = await fsp.stat(tmpTar);
       if (size > config.session_state_max_bytes) {
         this.log.warn({ size, cap: config.session_state_max_bytes }, 'Session snapshot exceeds cap; skipping persist');
@@ -1325,6 +1402,26 @@ export class Job {
   }
 
   /**
+   * Walk submissionDir -> `dir` and remove any ancestor that a restored session
+   * left as a non-directory (e.g. a regular file where an input now needs a
+   * parent dir), so the subsequent `mkdir(..., { recursive: true })` can't fail
+   * with ENOTDIR. No-op on a fresh workspace.
+   */
+  private async clearNonDirectoryAncestors(dir: string): Promise<void> {
+    const rel = path.relative(this.submissionDir, dir);
+    if (!rel || rel === '..' || rel.startsWith('..' + path.sep)) return;
+    const parts = rel.split(path.sep).filter(Boolean);
+    let cursor = this.submissionDir;
+    for (const part of parts) {
+      cursor = path.join(cursor, part);
+      try {
+        const st = await fsp.lstat(cursor);
+        if (!st.isDirectory()) await fsp.rm(cursor, { recursive: true, force: true });
+      } catch { /* doesn't exist yet; mkdir will create it */ }
+    }
+  }
+
+  /**
    * Streams the response body to `tempPath`, computes its SHA-256 inline,
    * then atomically renames to `finalPath` with sandbox-visible perms.
    * Returns the hex digest.
@@ -1354,10 +1451,14 @@ export class Job {
 
   async writeFile(file: TFile): Promise<void> {
     validateFilePath(file.name, this.submissionDir);
+    if (this.persistSession && isReservedSessionBasename(file.name)) {
+      throw new ValidationError(`input uses reserved session filename '${file.name}'`);
+    }
     const filePath = path.join(this.submissionDir, file.name);
 
     const content = Buffer.from(file.content ?? '', (file.encoding as BufferEncoding) ?? 'utf8');
     const parentDir = path.dirname(filePath);
+    await this.clearNonDirectoryAncestors(parentDir);
     await fsp.mkdir(parentDir, { recursive: true });
     await this.secureAncestors(parentDir);
     await this.clearNonRegularCollision(filePath);

@@ -205,6 +205,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      *     read_sessions + input_files, authorizing the sandbox to fetch it — no
      *     file-server or Redis-auth change needed. Done before
      *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
+    let priorSnapshotSession: string | null = null;
     if (env.PERSIST_SESSIONS) {
       // Reserve every persistence artifact name: the state tar (identified in
       // the sandbox by name only, since egress masks file id/session) and the
@@ -219,12 +220,12 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         file_id: SESSION_STATE_FILE_ID,
         filename: SESSION_STATE_TAR_FILENAME,
       };
-      const priorOutputSession = await connection.get(sessionStatePointerKey(sessionKey));
-      if (priorOutputSession) {
-        rawPayload.persist_session.restore_session_id = priorOutputSession;
+      priorSnapshotSession = await connection.get(sessionStatePointerKey(sessionKey));
+      if (priorSnapshotSession) {
+        rawPayload.persist_session.restore_session_id = priorSnapshotSession;
         rawPayload.files.push({
           id: SESSION_STATE_FILE_ID,
-          storage_session_id: priorOutputSession,
+          storage_session_id: priorSnapshotSession,
           name: SESSION_STATE_TAR_FILENAME,
         });
       }
@@ -307,6 +308,17 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       ).catch((error) => {
         logger.error(`[${INSTANCE_ID}] Failed to set session-state pointer:`, error);
       });
+      // Delete the superseded snapshot object so active sessions don't orphan a
+      // (potentially large) tar per run. Best-effort: the pointer already moved,
+      // and a stray object is bounded by the same retention as any output.
+      if (priorSnapshotSession && priorSnapshotSession !== session_id) {
+        axios.delete(
+          `${env.FILE_SERVER_URL}/sessions/${encodeURIComponent(priorSnapshotSession)}/objects/${encodeURIComponent(SESSION_STATE_FILE_ID)}`,
+          { headers: internalServiceHeaders() },
+        ).catch((error) => {
+          logger.warn(`[${INSTANCE_ID}] Failed to delete superseded session snapshot:`, getAxiosErrorDetails(error));
+        });
+      }
     }
 
     if (!isSyntheticRequest) {

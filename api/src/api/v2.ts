@@ -187,12 +187,23 @@ function getJob(
 
   validateConstraints(body, rt);
 
+  // Rollout flag-skew guard: if the service injected the synthetic state file
+  // but this sandbox has persistence disabled, the marker is dropped below, so
+  // the file would otherwise be downloaded and echoed as an ordinary input.
+  // Strip it here so a hidden state object can never leak to the caller.
+  let effectiveFiles = files;
+  if (body.persist_session && !config.persist_sessions) {
+    effectiveFiles = files.filter(
+      f => !(f.id && f.storage_session_id && f.name === body.persist_session!.filename),
+    );
+  }
+
   return new Job({
     session_id: session_id ?? null,
     runtime: rt,
     args: args ?? [],
     stdin: stdin ?? '',
-    files,
+    files: effectiveFiles,
     timeouts: {
       run: run_timeout ?? rt.timeouts.run,
       compile: compile_timeout ?? rt.timeouts.compile,
