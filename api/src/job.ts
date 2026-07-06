@@ -687,7 +687,7 @@ export class Job {
   private inputFileHashes = new Map<string, InputFileInfo>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
-  private persistSession: { file_id: string; filename: string } | undefined;
+  private persistSession: { file_id: string; filename: string; restore_session_id?: string } | undefined;
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -706,7 +706,7 @@ export class Job {
     egress_grant?: string;
     tool_call_socket_enabled?: boolean;
     is_synthetic?: boolean;
-    persist_session?: { file_id: string; filename: string };
+    persist_session?: { file_id: string; filename: string; restore_session_id?: string };
   }) {
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
@@ -1058,11 +1058,15 @@ export class Job {
    */
   private async restoreSessionWorkspace(): Promise<void> {
     const ps = this.persistSession;
-    if (!ps) return;
-    const idx = this.files.findIndex(
-      f => f.id && f.storage_session_id && f.name === ps.filename,
-    );
-    if (idx < 0) return; // first run for this session: nothing to restore
+    // Only attempt a restore when the service marked one (a prior snapshot
+    // exists). The injected state file is matched by name: the egress layer
+    // masks file id/session into opaque handles before the sandbox sees them,
+    // so name is the only stable field. This is safe because the service
+    // rejects user input files named like the state tar, so the only file with
+    // this name is the one it injected.
+    if (!ps || !ps.restore_session_id) return; // first run: nothing to restore
+    const idx = this.files.findIndex(f => f.id && f.storage_session_id && f.name === ps.filename);
+    if (idx < 0) return; // no matching prior-state object
     const [restoreFile] = this.files.splice(idx, 1);
 
     const tmpTar = path.join(os.tmpdir(), `sess-restore-${nanoid()}.tar`);
@@ -1078,6 +1082,12 @@ export class Job {
       // stays confined to `-C submissionDir`. `--no-same-owner` keeps the
       // extracted files owned by the runner until we chown them to the job UID.
       await execFileP('tar', ['--no-same-owner', '--no-same-permissions', '-xf', tmpTar, '-C', this.submissionDir]);
+      // Strip any symlinks the archive recreated BEFORE prime() stages fresh
+      // source/input files. A prior run could leave e.g. `main.py -> /host/path`;
+      // without this the runner's writeFile() would follow it and write
+      // attacker-controlled content outside the workspace. Restored state has no
+      // legitimate need for symlinks, so we drop them unconditionally.
+      await this.stripRestoredSymlinks(this.submissionDir);
       await this.chownTreeToJobUid(this.submissionDir);
       this.log.info({ size }, 'Restored persisted session workspace');
     } catch (err) {
@@ -1102,9 +1112,23 @@ export class Job {
 
     const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
     try {
-      // Exclude only the atomic-write tempfile; the `.session_state.pkl`
-      // snapshot itself is intentionally included so variables carry forward.
-      await execFileP('tar', ['--exclude=./.session_state.pkl.tmp', '-cf', tmpTar, '-C', this.submissionDir, '.']);
+      // Bound the aggregate size BEFORE archiving so a huge workspace (many
+      // small files, or big runtime caches under HOME=/mnt/data) can't make the
+      // runner materialize a multi-GB tar in /tmp and fill host disk.
+      const approxBytes = await this.dirSizeBytes(this.submissionDir);
+      if (approxBytes > config.session_state_max_bytes) {
+        this.log.warn({ approxBytes, cap: config.session_state_max_bytes }, 'Session workspace exceeds cap; skipping persist before archiving');
+        return false;
+      }
+      // Exclude the atomic-write tempfile and runtime cache dirs (pip/matplotlib
+      // scatter these under HOME=/mnt/data and they are not useful session
+      // state); the `.session_state.pkl` snapshot is intentionally included so
+      // variables carry forward.
+      await execFileP('tar', [
+        '--exclude=./.session_state.pkl.tmp',
+        '--exclude=./.cache', '--exclude=./.config', '--exclude=./.npm',
+        '-cf', tmpTar, '-C', this.submissionDir, '.',
+      ]);
       const { size } = await fsp.stat(tmpTar);
       if (size > config.session_state_max_bytes) {
         this.log.warn({ size, cap: config.session_state_max_bytes }, 'Session snapshot exceeds cap; skipping persist');
@@ -1187,6 +1211,51 @@ export class Job {
     } catch (err) {
       this.log.warn({ err }, 'Failed to chown restored session tree to job UID');
     }
+  }
+
+  /**
+   * Recursively remove symlinks from a restored tree. `readdir(withFileTypes)`
+   * reports the entry's own type (lstat semantics), so symlinks are detected
+   * without being followed and directories are recursed into.
+   */
+  private async stripRestoredSymlinks(dir: string): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) {
+        await fsp.rm(full, { force: true }).catch(() => { /* best effort */ });
+      } else if (entry.isDirectory()) {
+        await this.stripRestoredSymlinks(full);
+      }
+    }
+  }
+
+  /** Sum of regular-file bytes under `dir`, not following symlinks. */
+  private async dirSizeBytes(dir: string): Promise<number> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return 0;
+    }
+    let total = 0;
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        total += await this.dirSizeBytes(full);
+      } else if (entry.isFile()) {
+        try {
+          total += (await fsp.stat(full)).size;
+        } catch { /* vanished mid-walk; ignore */ }
+      }
+    }
+    return total;
   }
 
   /**

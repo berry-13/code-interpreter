@@ -211,6 +211,11 @@ export interface PersistSessionMarker {
   file_id: string;
   /** Basename of the workspace tar inside `/mnt/data` (read + write). */
   filename: string;
+  /** Storage session of the prior snapshot to restore, when one exists. The
+   *  sandbox restores only the input file matching (file_id, this, filename)
+   *  exactly, so a user-supplied file named like the tar is never mistaken for
+   *  state. Absent on a session's first run (nothing to restore). */
+  restore_session_id?: string;
 }
 
 export type ExecuteResult = {

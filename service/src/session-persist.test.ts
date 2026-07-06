@@ -63,8 +63,10 @@ describe('wrapPythonForSessionPersistence', () => {
 });
 
 describe('reserved constants', () => {
-  test('the tar filename carries a .tar extension and the file id is stable', () => {
+  test('the tar filename carries a .tar extension and the file id is upload-valid', () => {
     expect(SESSION_STATE_TAR_FILENAME.endsWith('.tar')).toBe(true);
-    expect(SESSION_STATE_FILE_ID).toBe('codeapi-session-state');
+    // Must be a 21-char nanoid so the file-server/gateway accepts the upload;
+    // restore safety comes from the (id, session, name) tuple match, not the id.
+    expect(/^[A-Za-z0-9_-]{21}$/.test(SESSION_STATE_FILE_ID)).toBe(true);
   });
 });

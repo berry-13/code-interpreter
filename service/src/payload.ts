@@ -24,10 +24,12 @@ export function createPayload({
 
   let finalCode: string;
   if (isPyPlot === true) {
-    const indentedUserCode = userCode.trim().split('\n').map(line => `    ${line}`).join('\n');
+    // 8-space indent: the user block sits inside `try:` within `main()` in the
+    // template (see matplotlib.py). Keep this in sync with that nesting.
+    const indentedUserCode = userCode.trim().split('\n').map(line => `        ${line}`).join('\n');
     finalCode = templateCode.replace(
       /# BEGIN USER CODE\n[\s\S]*?# END USER CODE/,
-      `# BEGIN USER CODE\n${indentedUserCode}\n    # END USER CODE`
+      `# BEGIN USER CODE\n${indentedUserCode}\n        # END USER CODE`
     );
   } else {
     finalCode = userCode;

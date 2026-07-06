@@ -42,7 +42,7 @@ export interface ExecuteRequestBody {
    *  workspace tar found at `/mnt/data/<filename>` and, after the run, snapshots
    *  `/mnt/data` back to `output_session_id/<file_id>`. Covered by the manifest
    *  body hash like every other field. */
-  persist_session?: { file_id: string; filename: string };
+  persist_session?: { file_id: string; filename: string; restore_session_id?: string };
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;
@@ -161,9 +161,10 @@ function getJob(
     if (
       typeof ps !== 'object' || ps === null ||
       typeof ps.file_id !== 'string' || ps.file_id.length === 0 ||
-      typeof ps.filename !== 'string' || ps.filename.length === 0
+      typeof ps.filename !== 'string' || ps.filename.length === 0 ||
+      (ps.restore_session_id !== undefined && typeof ps.restore_session_id !== 'string')
     ) {
-      throw { message: 'persist_session must be { file_id: string, filename: string }' };
+      throw { message: 'persist_session must be { file_id, filename, restore_session_id? }' };
     }
   }
   for (const [i, file] of files.entries()) {

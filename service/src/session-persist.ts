@@ -20,8 +20,12 @@ export const SESSION_STATE_FILENAME = '.session_state.pkl';
 
 /**
  * Object id (under the run's output session) that the workspace snapshot tar is
- * written to, and read back from the previous run's output session. Server-side
- * only, so it need not satisfy the client `isValidId` nanoid shape.
+ * written to, and read back from the previous run's output session. Must stay a
+ * 21-char nanoid so the file-server/gateway upload validation accepts it. The
+ * sandbox does not trust this id alone to identify prior state -- it matches the
+ * full (id, storage_session_id, name) tuple the service injected (the session
+ * id being an unpredictable per-run value), so a user file merely named like
+ * the state tar can never be mistaken for it.
  */
 export const SESSION_STATE_FILE_ID = 'codeapi-session-state';
 
@@ -90,7 +94,7 @@ export function isReservedSessionFilename(name: string): boolean {
  * pyplot-wrapped, if applicable) user code — base64 avoids all source-quoting
  * hazards regardless of what the user code contains.
  */
-const PYTHON_SESSION_WRAPPER = String.raw`import sys as _ca_sys, os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io
+const PYTHON_SESSION_WRAPPER = String.raw`import sys as _ca_sys, os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib
 _CA_STATE = '/mnt/data/.session_state.pkl'
 try:
     import dill as _ca_pk
@@ -104,22 +108,42 @@ _ca_ns = {'__name__': '__main__', '__builtins__': __builtins__, '__file__': '/mn
 if _ca_os.path.exists(_CA_STATE):
     try:
         with open(_CA_STATE, 'rb') as _ca_f:
-            _ca_ns.update(_ca_pk.load(_ca_f))
+            _ca_state = _ca_pk.load(_ca_f)
+        # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
+        # Re-import module aliases by name first (so "import pandas as pd" in one
+        # cell leaves pd bound in the next), then restore the pickled values.
+        if isinstance(_ca_state, dict) and _ca_state.get('__ca_v__') == 1:
+            for _ca_alias, _ca_modname in _ca_state.get('mods', {}).items():
+                try:
+                    _ca_ns[_ca_alias] = _ca_importlib.import_module(_ca_modname)
+                except Exception:
+                    pass
+            _ca_ns.update(_ca_state.get('ns', {}))
+        else:
+            _ca_ns.update(_ca_state)  # legacy raw-dict snapshot
         _ca_ns['__name__'] = '__main__'
     except Exception as _ca_e:
         print('[session] state restore skipped: %r' % (_ca_e,), file=_ca_sys.stderr)
 
 def _ca_snapshot():
     ok = {}
+    mods = {}
     for k, v in list(_ca_ns.items()):
         if k.startswith('_'):
             continue
-        # Skip modules and open file handles. dill CAN pickle a file handle,
-        # but restoring one reopens the path in its original mode -- for a
-        # write handle that TRUNCATES the user's file on the next run. Excluding
-        # io objects keeps a leftover with-block file handle from wiping the
-        # very file it wrote. (Sockets/threads/locks fail dumps below.)
-        if isinstance(v, (_ca_types.ModuleType, _ca_io.IOBase)):
+        # Record module aliases by import name so they can be re-imported on the
+        # next run rather than lost (the advertised "namespace carries across").
+        if isinstance(v, _ca_types.ModuleType):
+            name = getattr(v, '__name__', None)
+            if isinstance(name, str) and name:
+                mods[k] = name
+            continue
+        # Skip open file handles. dill CAN pickle a file handle, but restoring
+        # one reopens the path in its original mode -- for a write handle that
+        # TRUNCATES the user's file on the next run. Excluding io objects keeps a
+        # leftover with-block file handle from wiping the very file it wrote.
+        # (Sockets/threads/locks fail dumps below and are dropped there.)
+        if isinstance(v, _ca_io.IOBase):
             continue
         try:
             _ca_pk.dumps(v)
@@ -129,7 +153,7 @@ def _ca_snapshot():
     try:
         tmp = _CA_STATE + '.tmp'
         with open(tmp, 'wb') as f:
-            _ca_pk.dump(ok, f)
+            _ca_pk.dump({'__ca_v__': 1, 'ns': ok, 'mods': mods}, f)
         _ca_os.replace(tmp, _CA_STATE)
     except Exception as e:
         print('[session] state snapshot skipped: %r' % (e,), file=_ca_sys.stderr)

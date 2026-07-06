@@ -58,6 +58,11 @@ export function buildExecutionManifestClaims(args: {
 }): ExecutionManifestClaims {
   const now = args.nowSeconds ?? Math.floor(Date.now() / 1000);
   const inputFiles = collectManifestInputFiles(args.payload);
+  // Persistent sessions upload one hidden state object AFTER user outputs. The
+  // egress gateway counts it against these budgets, so reserve a slot/request
+  // for it -- otherwise a run that produces exactly max_output_files visible
+  // outputs would fail the snapshot and leave the pointer on stale state.
+  const persistReserve = args.payload.persist_session ? 1 : 0;
   const readSessions = Array.from(new Set(inputFiles.map(file => file.session_id))).sort();
   const ctx = args.req.codeApiAuthContext;
   const identity = buildExecutionIdentity({
@@ -82,8 +87,8 @@ export function buildExecutionManifestClaims(args: {
     read_sessions: readSessions,
     output_session_id: args.outputSessionId,
     max_upload_bytes: env.EXECUTION_MANIFEST_MAX_UPLOAD_BYTES,
-    max_output_files: env.EXECUTION_MANIFEST_MAX_OUTPUT_FILES,
-    max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS,
+    max_output_files: env.EXECUTION_MANIFEST_MAX_OUTPUT_FILES + persistReserve,
+    max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS + persistReserve,
     iat: now,
     exp: now + env.EXECUTION_MANIFEST_TTL_SECONDS,
     tool_call_socket: args.payload.tool_call_socket === true,
