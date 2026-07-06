@@ -193,9 +193,9 @@ function readBaseConfig(): string {
  * embedded backslashes and double-quotes defensively in case future
  * callers pass arbitrary paths in. The cfg syntax is C-like so only those
  * two characters need escaping inside a string literal. */
-export function renderJobConfigOverlay(submissionDir: string): string {
+export function renderJobConfigOverlay(submissionDir: string, depsDir?: string): string {
   const escaped = submissionDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return [
+  const lines = [
     '',
     '# Per-job submission workspace bind. Dynamic because the source path',
     '# rotates every execution. noexec/nosuid/nodev block the audit pattern',
@@ -211,7 +211,28 @@ export function renderJobConfigOverlay(submissionDir: string): string {
     '    nodev: true',
     '}',
     '',
-  ].join('\n');
+  ];
+
+  if (depsDir) {
+    const escapedDeps = depsDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    lines.push(
+      '# Per-job dynamically installed dependencies, mounted READ-ONLY. Unlike',
+      '# /mnt/data this is executable (no noexec) because wheel .so extensions',
+      '# load with PROT_EXEC — same as the read-only /pkgs runtime mount. It is',
+      '# read-only + nosuid + nodev, and user code still has no network.',
+      'mount {',
+      `    src: "${escapedDeps}"`,
+      '    dst: "/mnt/deps"',
+      '    is_bind: true',
+      '    rw: false',
+      '    nosuid: true',
+      '    nodev: true',
+      '}',
+      '',
+    );
+  }
+
+  return lines.join('\n');
 }
 
 interface ExecuteOptions {
@@ -227,6 +248,7 @@ interface ExecuteOptions {
   identity: SandboxJobIdentity;
   enableToolCallSocket?: boolean;
   suppressSuccessLogs?: boolean;
+  depsDir?: string;
 }
 
 export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate = defaultNsJailSetupGate): Promise<NsJailResult> {
@@ -243,12 +265,13 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     identity,
     enableToolCallSocket,
     suppressSuccessLogs,
+    depsDir,
   } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
   const cfgPath = `/tmp/nsjail-${logId}.cfg`;
 
-  fs.writeFileSync(cfgPath, readBaseConfig() + renderJobConfigOverlay(submissionDir), { mode: 0o600 });
+  fs.writeFileSync(cfgPath, readBaseConfig() + renderJobConfigOverlay(submissionDir, depsDir), { mode: 0o600 });
 
   const nsjailArgs = buildArgs({
     logPath,

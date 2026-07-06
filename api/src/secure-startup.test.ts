@@ -113,6 +113,21 @@ describe('hardened sandbox-runner startup config', () => {
     expect(() => validateHardenedSandboxStartup()).toThrow('REDIS_HOST');
   });
 
+  test('allows dynamic-dependency runtime knobs in hardened mode', () => {
+    setValidHardenedConfig();
+    process.env.CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES = 'true';
+    process.env.CODEAPI_DEPENDENCY_INDEX_URL = 'https://pypi.org/simple';
+    process.env.CODEAPI_DEPENDENCY_MAX_COUNT = '50';
+    process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS = '120000';
+    process.env.CODEAPI_DEPENDENCY_MAX_BYTES = '262144000';
+    expect(() => validateHardenedSandboxStartup()).not.toThrow();
+    delete process.env.CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES;
+    delete process.env.CODEAPI_DEPENDENCY_INDEX_URL;
+    delete process.env.CODEAPI_DEPENDENCY_MAX_COUNT;
+    delete process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS;
+    delete process.env.CODEAPI_DEPENDENCY_MAX_BYTES;
+  });
+
   test('rejects missing manifest verifier and wrong forwarding target', () => {
     setValidHardenedConfig();
     config.egress_gateway_url = '';

@@ -404,6 +404,11 @@ fn env_bool(name: &str, default: bool) -> bool {
 
 fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
     const ALLOW_EXACT: &[&str] = &[
+        "CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES",
+        "CODEAPI_DEPENDENCY_INDEX_URL",
+        "CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS",
+        "CODEAPI_DEPENDENCY_MAX_BYTES",
+        "CODEAPI_DEPENDENCY_MAX_COUNT",
         "CODEAPI_HARDENED_SANDBOX_MODE",
         "EGRESS_GATEWAY_URL",
         "HOME",
@@ -640,6 +645,11 @@ mod tests {
         for key in [
             "EGRESS_GATEWAY_URL",
             "CODEAPI_HARDENED_SANDBOX_MODE",
+            "CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES",
+            "CODEAPI_DEPENDENCY_INDEX_URL",
+            "CODEAPI_DEPENDENCY_MAX_COUNT",
+            "CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS",
+            "CODEAPI_DEPENDENCY_MAX_BYTES",
             "SANDBOX_DISABLE_NETWORKING",
             "SANDBOX_ALLOWED_LOCAL_NETWORK_PORT",
             "SANDBOX_FORWARD_TARGET",
