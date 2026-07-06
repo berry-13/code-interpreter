@@ -1,9 +1,12 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { nanoid } from 'nanoid';
 import * as crypto from 'crypto';
 import * as semver from 'semver';
 import * as fsp from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { pipeline } from 'stream/promises';
 import { Readable, Transform } from 'stream';
 import type { Logger } from 'pino';
@@ -52,6 +55,8 @@ export {
 } from './validation';
 
 const AUTO_LOAD_DIRKEEP_TIMEOUT_MS = 10000;
+
+const execFileP = promisify(execFile);
 
 /**
  * Bridges a `fetch` response body to a Node-stream Readable. The types at the
@@ -636,6 +641,8 @@ interface ExecuteResult {
   /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRef[];
+  /** True when a fresh workspace snapshot was written for a persistent session. */
+  session_state_persisted?: boolean;
 }
 
 const jobQueue: Array<() => void> = [];
@@ -680,6 +687,7 @@ export class Job {
   private inputFileHashes = new Map<string, InputFileInfo>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
+  private persistSession: { file_id: string; filename: string } | undefined;
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -698,6 +706,7 @@ export class Job {
     egress_grant?: string;
     tool_call_socket_enabled?: boolean;
     is_synthetic?: boolean;
+    persist_session?: { file_id: string; filename: string };
   }) {
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
@@ -731,6 +740,7 @@ export class Job {
     this.egressGrantToken = opts.egress_grant;
     this.toolCallSocketEnabled = opts.tool_call_socket_enabled === true;
     this.isSynthetic = opts.is_synthetic === true;
+    this.persistSession = opts.persist_session;
   }
 
   async computeFileHash(filePath: string, noFollow = false): Promise<string> {
@@ -806,6 +816,15 @@ export class Job {
         },
         'Priming job',
       );
+    }
+
+    /* Restore a prior persistent-session workspace before any current-run
+     * files are written, so fresh code/inputs overwrite stale copies from the
+     * snapshot. Pulls its synthetic input file out of `this.files` so the
+     * normal download/dirkeep flow below never sees it. Best-effort: a miss or
+     * failure just means the session starts empty. */
+    if (this.persistSession) {
+      await this.restoreSessionWorkspace();
     }
 
     if (this.fileEgressBaseUrl() && this.files.some(f => f.id && f.storage_session_id)) {
@@ -1024,6 +1043,150 @@ export class Job {
    */
   private buildDownloadUrl(file: TFile): string {
     return `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`;
+  }
+
+  /**
+   * Restore a prior persistent-session workspace tar into `submissionDir`.
+   *
+   * The service injects the previous run's snapshot as a synthetic input file
+   * (name === `persist_session.filename`, carrying an id + the previous output
+   * session as `storage_session_id`, so it is authorized by the grant's
+   * `read_sessions`/`input_files`). We fetch it to a scratch tar, size-check it,
+   * extract into `submissionDir`, and chown the tree to the job UID. Every
+   * failure mode is non-fatal — a persistent session that can't restore simply
+   * starts empty, exactly like its first run.
+   */
+  private async restoreSessionWorkspace(): Promise<void> {
+    const ps = this.persistSession;
+    if (!ps) return;
+    const idx = this.files.findIndex(
+      f => f.id && f.storage_session_id && f.name === ps.filename,
+    );
+    if (idx < 0) return; // first run for this session: nothing to restore
+    const [restoreFile] = this.files.splice(idx, 1);
+
+    const tmpTar = path.join(os.tmpdir(), `sess-restore-${nanoid()}.tar`);
+    try {
+      const fetched = await this.downloadObjectToPath(restoreFile, tmpTar);
+      if (!fetched) return; // 404 / miss -> treat as no prior state
+      const { size } = await fsp.stat(tmpTar);
+      if (size > config.session_state_max_bytes) {
+        this.log.warn({ size, cap: config.session_state_max_bytes }, 'Persisted session tar exceeds cap; skipping restore');
+        return;
+      }
+      // GNU tar strips leading `/` and `..` members by default, so extraction
+      // stays confined to `-C submissionDir`. `--no-same-owner` keeps the
+      // extracted files owned by the runner until we chown them to the job UID.
+      await execFileP('tar', ['--no-same-owner', '--no-same-permissions', '-xf', tmpTar, '-C', this.submissionDir]);
+      await this.chownTreeToJobUid(this.submissionDir);
+      this.log.info({ size }, 'Restored persisted session workspace');
+    } catch (err) {
+      this.log.warn({ err }, 'Session restore failed; continuing without prior state');
+    } finally {
+      await fsp.rm(tmpTar, { force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /**
+   * Snapshot `submissionDir` (files + the dill namespace pickle the Python
+   * wrapper wrote) to a tar and upload it to `output_session_id/<file_id>`,
+   * which is the single session the egress grant authorizes for writes. The
+   * service later promotes this into the `sessionstate:<sessionKey>` Redis
+   * pointer. Returns whether a fresh snapshot was actually written; a skip
+   * (oversize / no storage / error) is non-fatal and leaves the prior snapshot
+   * as the session's last good state.
+   */
+  async persistSessionState(): Promise<boolean> {
+    const ps = this.persistSession;
+    if (!ps || !this.submissionDir || !this.fileEgressBaseUrl()) return false;
+
+    const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
+    try {
+      // Exclude only the atomic-write tempfile; the `.session_state.pkl`
+      // snapshot itself is intentionally included so variables carry forward.
+      await execFileP('tar', ['--exclude=./.session_state.pkl.tmp', '-cf', tmpTar, '-C', this.submissionDir, '.']);
+      const { size } = await fsp.stat(tmpTar);
+      if (size > config.session_state_max_bytes) {
+        this.log.warn({ size, cap: config.session_state_max_bytes }, 'Session snapshot exceeds cap; skipping persist');
+        return false;
+      }
+      const ok = await this.uploadObjectFromPath(tmpTar, ps.file_id, ps.filename, 'application/x-tar');
+      if (ok) this.log.info({ size }, 'Persisted session workspace');
+      return ok;
+    } catch (err) {
+      this.log.warn({ err }, 'Session persist failed; continuing');
+      return false;
+    } finally {
+      await fsp.rm(tmpTar, { force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /** Stream a file-server object to a local path. Returns false on 404. */
+  private async downloadObjectToPath(file: TFile, destPath: string): Promise<boolean> {
+    const res = await fetch(this.buildDownloadUrl(file), { headers: this.fileEgressHeaders() });
+    if (res.status === 404) return false;
+    if (!res.ok) throw new Error(`Session object download HTTP ${res.status}`);
+    if (!res.body) throw new Error('Session object download returned empty body');
+    await pipeline(toNodeReadable(res.body), fs.createWriteStream(destPath, { mode: SANDBOX_FILE_MODE }));
+    return true;
+  }
+
+  /** PUT a local file to `output_session_id/<fileId>` via the egress path. */
+  private async uploadObjectFromPath(
+    srcPath: string,
+    fileId: string,
+    filename: string,
+    contentType: string,
+  ): Promise<boolean> {
+    const { size } = await fsp.stat(srcPath);
+    const url = `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(this.outputSessionId)}/objects/${encodeURIComponent(fileId)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    let response: Response | undefined;
+    const stream = fs.createReadStream(srcPath);
+    stream.on('error', (err) => this.log.warn({ err }, 'Session upload stream error'));
+    try {
+      const headers = this.fileEgressHeaders({
+        'X-Original-Filename': encodeURIComponent(filename),
+        'Content-Type': contentType,
+        'Content-Length': String(size),
+      });
+      response = await fetch(url, {
+        method: 'PUT',
+        headers,
+        body: Readable.toWeb(stream) as unknown as BodyInit,
+        // @ts-expect-error — duplex is spec but missing from bundled lib.dom types.
+        duplex: 'half',
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`Session upload HTTP ${response.status}`);
+      return true;
+    } catch (err) {
+      this.log.warn({ err }, 'Session upload failed');
+      return false;
+    } finally {
+      clearTimeout(timeout);
+      stream.destroy();
+      if (response?.body && !response.bodyUsed) {
+        await response.body.cancel().catch(() => { /* socket released either way */ });
+      }
+    }
+  }
+
+  /**
+   * Recursively chown an extracted tree to the per-job UID so the sandboxed
+   * process (running as that UID) can read and modify restored files. Uses
+   * `-h` so symlink ownership, not the target's, is changed. Best-effort:
+   * without the capability (e.g. non-root dev mode) restored files stay
+   * runner-owned but world-readable, so restore-and-read still works.
+   */
+  private async chownTreeToJobUid(dir: string): Promise<void> {
+    const id = this.sandboxIdentity();
+    try {
+      await execFileP('chown', ['-Rh', `${id.uid}:${id.gid}`, dir]);
+    } catch (err) {
+      this.log.warn({ err }, 'Failed to chown restored session tree to job UID');
+    }
   }
 
   /**
@@ -1588,10 +1751,17 @@ export class Job {
      * is asserted-equal in `service/scripts/test-ptc-sentinel.ts` to catch
      * accidental drift in CI. */
     const PTC_HISTORY_FILENAME = '_ptc_history.json';
-    const isPtcReserved = (name: string): boolean => name === PTC_HISTORY_FILENAME;
+    /* Persistent-session artifacts written under /mnt/data: the dill namespace
+     * snapshot and its atomic-write tempfile. They are private runtime plumbing
+     * that rides inside the workspace tar and must never echo back as a session
+     * output. MUST stay in sync with SESSION_STATE_FILENAME in
+     * `service/src/session-persist.ts` (separate npm package — can't import). */
+    const SESSION_STATE_RESERVED = new Set(['.session_state.pkl', '.session_state.pkl.tmp']);
+    const isReservedOutputName = (name: string): boolean =>
+      name === PTC_HISTORY_FILENAME || SESSION_STATE_RESERVED.has(name);
 
     const nonDirkeepCount = entries.reduce(
-      (n, e) => (e.name === DIRKEEP || isPtcReserved(e.name) ? n : n + 1),
+      (n, e) => (e.name === DIRKEEP || isReservedOutputName(e.name) ? n : n + 1),
       0,
     );
 
@@ -1608,7 +1778,7 @@ export class Job {
 
     for (const entry of entries) {
       if (this.isOutputCapFull()) { truncated = true; break; }
-      if (isPtcReserved(entry.name)) continue;
+      if (isReservedOutputName(entry.name)) continue;
 
       const fullPath = path.join(dir, entry.name);
       const relativePath = path.relative(this.submissionDir, fullPath);

@@ -137,6 +137,13 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       result.wall_time = (run as Record<string, unknown>).wall_time as number | null ?? null;
     }
 
+    /* Read straight from the raw sandbox response: the egress-restore reshaping
+     * above only rewrites `files`, and this flag governs whether the router
+     * advances the persistent-session Redis pointer. */
+    if ((response.data as { session_state_persisted?: boolean }).session_state_persisted === true) {
+      result.session_state_persisted = true;
+    }
+
     if (result.message || result.signal) {
       logger.warn('Sandbox execution error metadata', {
         session_id: responseData.session_id,

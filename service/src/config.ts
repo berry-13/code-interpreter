@@ -113,6 +113,20 @@ export const env = {
   FETCH_MAX_REQUESTS: Number(process.env.FETCH_MAX_REQUESTS) || 120, // 120 requests per minute
   // Redis Key Cache Config
   SESSION_CACHE_TTL: Number(process.env.SESSION_CACHE_TTL) || 86400,
+  /* Persistent sessions (opt-in, OFF by default). When enabled, each run's
+   * /mnt/data workspace (including a dill-serialized Python namespace) is
+   * snapshotted to object storage under the caller's own sessionKey and
+   * restored on the next run — so variables and files carry across calls with
+   * no client-side change. Keyed on the auth-derived, manifest-bound sessionKey
+   * (never a client-supplied id). See service/src/preamble.ts (snapshot code)
+   * and api/src/job.ts (workspace round-trip). */
+  PERSIST_SESSIONS: process.env.CODEAPI_PERSIST_SESSIONS === 'true',
+  // Cap on the persisted workspace tar; oversize snapshots are skipped (the run
+  // still succeeds), so a runaway workspace can't balloon object storage.
+  SESSION_STATE_MAX_BYTES: Number(process.env.CODEAPI_SESSION_STATE_MAX_BYTES) || 104_857_600,
+  // Idle expiry for the persisted state object. Refreshed on every run, so an
+  // active session never expires; an abandoned one is collected after this.
+  SESSION_STATE_TTL_SECONDS: Number(process.env.CODEAPI_SESSION_STATE_TTL_SECONDS) || 604_800,
   /** Strict tenant isolation. When true, sessionKey resolution fails closed
    *  (500) on requests whose auth context lacks `tenantId`, instead of
    *  silently falling back to the `'legacy'` tenant prefix. Default OFF in

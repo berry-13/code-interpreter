@@ -14,6 +14,11 @@ import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
 import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
+import {
+  SESSION_STATE_FILE_ID,
+  SESSION_STATE_TAR_FILENAME,
+  sessionStatePointerKey,
+} from '../session-persist';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { isSyntheticPrincipalSource } from '../auth/synthetic';
@@ -189,6 +194,31 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       isPyPlot,
       session_id,
     });
+
+    /* Persistent sessions (opt-in). Rendezvous on the caller's own auth-derived
+     * sessionKey via a Redis pointer to the previous run's output session:
+     *   - Mark the payload so the sandbox snapshots /mnt/data back to THIS run's
+     *     output session (the only session the egress grant lets it write).
+     *   - If a prior snapshot exists, inject it as a synthetic input file. Being
+     *     an input file, its storage_session_id flows into the manifest/grant
+     *     read_sessions + input_files, authorizing the sandbox to fetch it — no
+     *     file-server or Redis-auth change needed. Done before
+     *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
+    if (env.PERSIST_SESSIONS) {
+      rawPayload.persist_session = {
+        file_id: SESSION_STATE_FILE_ID,
+        filename: SESSION_STATE_TAR_FILENAME,
+      };
+      const priorOutputSession = await connection.get(sessionStatePointerKey(sessionKey));
+      if (priorOutputSession) {
+        rawPayload.files.push({
+          id: SESSION_STATE_FILE_ID,
+          storage_session_id: priorOutputSession,
+          name: SESSION_STATE_TAR_FILENAME,
+        });
+      }
+    }
+
     const sandboxSecurity = prepareSandboxJobSecurity({
       req,
       executionId: execution_id,
@@ -252,6 +282,21 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.destination.name': queueName,
       'codeapi.language': language,
     }, () => job.waitUntilFinished(queueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+
+    /* Advance the persistent-session pointer only when the sandbox actually
+     * wrote a fresh snapshot to this run's output session. On a skip (oversize
+     * / error) we leave the pointer on the last good snapshot so continuity
+     * survives. TTL refresh means an active session never expires. */
+    if (env.PERSIST_SESSIONS && (result as t.ExecuteResult)?.session_state_persisted) {
+      await connection.set(
+        sessionStatePointerKey(sessionKey),
+        session_id,
+        'EX',
+        env.SESSION_STATE_TTL_SECONDS,
+      ).catch((error) => {
+        logger.error(`[${INSTANCE_ID}] Failed to set session-state pointer:`, error);
+      });
+    }
 
     if (!isSyntheticRequest) {
       logger.info('Execution completed', { session_id, user_id });

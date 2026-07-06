@@ -84,6 +84,13 @@ def main():
     # BEGIN USER CODE
     # User code will be inserted here
     # END USER CODE
+    # Promote user-defined locals into the module/exec namespace so persistent
+    # sessions can snapshot them (user code here runs inside main(), so its
+    # assignments are function-locals). No-op when persistence is off: the
+    # program exits immediately after, so the extra globals are never observed.
+    # `dict(locals())` is evaluated in main()'s scope (the outermost comprehension
+    # iterable), capturing the user's variables before the underscore filter.
+    globals().update({______k: ______v for ______k, ______v in dict(locals()).items() if not ______k.startswith('_')})
 
 if __name__ == "__main__":
     main()

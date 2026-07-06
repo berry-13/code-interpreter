@@ -228,6 +228,45 @@ place of `CODEAPI_JWT_PUBLIC_KEY` + `CODEAPI_JWT_KID`.
 `CODEAPI_LANGUAGES` selects which runtimes are pre-installed; see the Local
 Development section above.
 
+### Persistent sessions
+
+By default every execution is one-shot: a fresh workspace is created, the code
+runs, and everything is discarded. Set `CODEAPI_PERSIST_SESSIONS=true` to make
+runs continue each other automatically — no client change required:
+
+- **Files.** Anything left under `/mnt/data` carries into the next run.
+- **Variables (Python).** The run's global namespace is serialized (via `dill`)
+  and restored next time, so `df` defined in one call is still live in the next
+  — the notebook experience, without a warm kernel.
+
+**How it works.** At the end of a run the `/mnt/data` workspace is tarred and
+uploaded to object storage under the caller's own `sessionKey` (derived
+server-side from auth, and already bound into the signed execution manifest);
+the next run restores it before user code executes. Continuity is keyed on that
+`sessionKey`, so nothing new is sent by the client and one user can never read
+another's state. State lives in shared object storage, so it survives across a
+horizontally-scaled, affinity-free worker pool. The sandbox network posture is
+unchanged: the snapshot is written and read by the trusted runner, exactly like
+input downloads and output uploads — user code still has no network.
+
+**Limitations (by design).**
+
+- **Per user, not per conversation.** No conversation id flows in the request,
+  so continuity is scoped to the authenticated user/resource. Two concurrent
+  conversations by the same user share one namespace (last write wins).
+- **Variable snapshot is best-effort.** Data (arrays, DataFrames, dicts)
+  restores reliably; open handles, sockets, threads, and some native objects
+  can't be serialized and are dropped with a warning — the rest is preserved.
+  File persistence underneath is not affected.
+- **Not a warm kernel.** The interpreter still cold-starts each call
+  (re-import + re-restore). Non-Python languages get file persistence only.
+
+Tuning: `CODEAPI_SESSION_STATE_MAX_BYTES` caps the snapshot (oversize snapshots
+are skipped, the run still succeeds); `CODEAPI_SESSION_STATE_TTL_SECONDS` is the
+idle expiry (refreshed each run). In hardened mode the snapshot upload is also
+bounded by `EGRESS_GATEWAY_MAX_FILE_BYTES` (default 10 MB) — raise it for large
+workspaces. See `.env.example` for defaults.
+
 ## Health Checks
 
 - API: `GET /v1/health`

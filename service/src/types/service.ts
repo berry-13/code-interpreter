@@ -194,6 +194,23 @@ export interface PayloadBody {
    * use files to avoid the Linux ARG_MAX ceiling.
    */
   env_vars?: Record<string, string>;
+  /**
+   * Persistent-session marker (opt-in; only present when `PERSIST_SESSIONS` is
+   * on). Tells the sandbox to (a) extract a prior workspace tar it finds at
+   * `/mnt/data/<filename>` (delivered as a synthetic input file pointing at the
+   * previous run's output session) before user code runs, and (b) snapshot
+   * `/mnt/data` back to `output_session_id/<file_id>` afterwards. Keyed on the
+   * caller's own auth-derived sessionKey server-side; carries no user input.
+   */
+  persist_session?: PersistSessionMarker;
+}
+
+/** See `PayloadBody.persist_session`. */
+export interface PersistSessionMarker {
+  /** Object id under the current `output_session_id` to write the tar to. */
+  file_id: string;
+  /** Basename of the workspace tar inside `/mnt/data` (read + write). */
+  filename: string;
 }
 
 export type ExecuteResult = {
@@ -207,6 +224,11 @@ export type ExecuteResult = {
   message?: string | null;
   status?: string | null;
   wall_time?: number | null;
+  /** True when the sandbox wrote a fresh workspace snapshot to
+   *  `output_session_id/<persist_session.file_id>`. The worker advances the
+   *  `sessionstate:<sessionKey>` Redis pointer only on true, so a skipped
+   *  snapshot (oversize/error) leaves the last good state pointed-to. */
+  session_state_persisted?: boolean;
 };
 
 export interface LanguageConfig {

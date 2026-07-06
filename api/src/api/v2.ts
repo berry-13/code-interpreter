@@ -38,6 +38,11 @@ export interface ExecuteRequestBody {
   egress_grant?: string;
   execution_manifest?: string;
   tool_call_socket?: boolean;
+  /** Persistent-session marker (opt-in). When present, prime() restores a prior
+   *  workspace tar found at `/mnt/data/<filename>` and, after the run, snapshots
+   *  `/mnt/data` back to `output_session_id/<file_id>`. Covered by the manifest
+   *  body hash like every other field. */
+  persist_session?: { file_id: string; filename: string };
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;
@@ -151,6 +156,16 @@ function getJob(
   if (body.tool_call_socket !== undefined && typeof body.tool_call_socket !== 'boolean') {
     throw { message: 'tool_call_socket must be a boolean if specified' };
   }
+  if (body.persist_session !== undefined) {
+    const ps = body.persist_session;
+    if (
+      typeof ps !== 'object' || ps === null ||
+      typeof ps.file_id !== 'string' || ps.file_id.length === 0 ||
+      typeof ps.filename !== 'string' || ps.filename.length === 0
+    ) {
+      throw { message: 'persist_session must be { file_id: string, filename: string }' };
+    }
+  }
   for (const [i, file] of files.entries()) {
     if (typeof file.content !== 'string' && typeof file.id !== 'string') {
       throw { message: `files[${i}].content is required as a string if no id is provided` };
@@ -194,6 +209,7 @@ function getJob(
     egress_grant: egressGrantToken,
     tool_call_socket_enabled: toolCallSocketEnabled,
     is_synthetic: isSynthetic,
+    persist_session: config.persist_sessions ? body.persist_session : undefined,
   });
 }
 
@@ -383,6 +399,18 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
           );
         }
       }
+
+      /* Persistent sessions: snapshot the workspace (files + dill namespace)
+       * back to the current output session. No-op unless a persist_session
+       * marker is set; always non-fatal. The service advances the
+       * `sessionstate:<sessionKey>` Redis pointer only when this returns true. */
+      result.session_state_persisted = await withSpan('codeapi.sandbox.persist_session', {
+        'codeapi.language': job.runtime.language,
+      }, () => job!.persistSessionState())
+        .catch((err) => {
+          logger.error({ job: job!.uuid, err }, 'Session persist failed');
+          return false;
+        });
 
       metricsOutcome = 'success';
       return res.status(200).json(result);
