@@ -35,6 +35,59 @@ BUN_VERSION="${BUN_VERSION:-1.3.14}"
 JAVA_VERSION="${JAVA_VERSION:-21.0.11}"
 TEMURIN_BUILD="${TEMURIN_BUILD:-10}"
 PACKAGES_DIR="./data/pkgs"
+
+# Pinned SHA-256 for the default runtime versions, per arch. Independent,
+# git-reviewed record so a tampered upstream release is caught even if its own
+# published checksum file is tampered to match. Non-default versions fall back
+# to the upstream checksum file (transit integrity only); override with the
+# matching <ARTIFACT>_SHA256 to pin a custom version. Keep in sync with
+# docker/package-init.sh; update the hash here when bumping a default version.
+pinned_sha256() {
+    # args: artifact identity arch
+    case "$1:$2:$3" in
+        python:3.14.4+20260414:x86_64)   echo "e17275eaf95ceb5877aa6816e209b7733f41fee401d39c3921b88fb73fc4a4ba" ;;
+        python:3.14.4+20260414:aarch64)  echo "5c8db1c21023316adad827a46d917bbbd6a85ae4e39bc3a58febda712c2f963d" ;;
+        # CPython source tarball (this builder compiles from source; python.org
+        # publishes no .sha256 sibling, so the source hash is pinned here).
+        python-src:3.14.4:any)           echo "d923c51303e38e249136fc1bdf3568d56ecb03214efdef48516176d3d7faaef8" ;;
+        node:24.15.0:x64)                echo "472655581fb851559730c48763e0c9d3bc25975c59d518003fc0849d3e4ba0f6" ;;
+        node:24.15.0:arm64)              echo "f3d5a797b5d210ce8e2cb265544c8e482eaedcb8aa409a8b46da7e8595d0dda0" ;;
+        bun:1.3.14:x64)                  echo "951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f" ;;
+        bun:1.3.14:aarch64)              echo "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b" ;;
+        java:21.0.11+10:x64)             echo "4b2220e232a97997b436ca6ab15cbf70171ecff52958a46159dfa5a8c44ca4de" ;;
+        java:21.0.11+10:aarch64)         echo "8d498ec88e1c1989fab95c6784240ab92d011e29c54d20a3f9c324b13476f9ad" ;;
+    esac
+}
+
+# expected_sha256 <artifact> <identity> <arch> <checksum_url> <asset_name> <override>
+# Resolution order: explicit override -> pinned default -> upstream checksum
+# file. Prints the hash, or nothing (a hard failure for the caller).
+expected_sha256() {
+    local artifact="$1" identity="$2" arch="$3" checksum_url="$4" asset="$5" override="$6"
+    if [ -n "$override" ]; then
+        echo "$override"
+        return 0
+    fi
+    local pinned
+    pinned="$(pinned_sha256 "$artifact" "$identity" "$arch")"
+    if [ -n "$pinned" ]; then
+        echo "$pinned"
+        return 0
+    fi
+    curl -fsSL "$checksum_url" 2>/dev/null | awk -v a="$asset" '$2 == a || $2 == "*" a { print $1; exit }'
+}
+
+# require_sha256: resolve the expected hash and fail closed if none is known.
+require_sha256() {
+    local expected
+    expected="$(expected_sha256 "$@")"
+    if [ -z "$expected" ]; then
+        echo "ERROR: no known SHA-256 for $1 $2 ($3); refusing to install an unverified download" >&2
+        echo "  set the matching <ARTIFACT>_SHA256 env var to pin this version" >&2
+        return 1
+    fi
+    echo "$expected"
+}
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
 
 load_js_packages() {
@@ -109,12 +162,16 @@ install_python() {
     echo "  Installing Python ${PYTHON_VERSION}"
     echo "=============================================="
 
-    docker exec "$CONTAINER_NAME" bash -c "
+    local expected
+    expected="$(require_sha256 python-src "$PYTHON_VERSION" any "" "Python-${PYTHON_VERSION}.tar.xz" "${PYTHON_SHA256:-}")" || return 1
+
+    docker exec -e EXPECTED_SHA="$expected" "$CONTAINER_NAME" bash -c "
         set -e
         mkdir -p ${pkg_dest}
         rm -f ${pkg_dest}/.package-installed
         cd /tmp
         wget -q https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz
+        echo \"\$EXPECTED_SHA  Python-${PYTHON_VERSION}.tar.xz\" | sha256sum -c -
         tar xf Python-${PYTHON_VERSION}.tar.xz
         cd Python-${PYTHON_VERSION}
         ./configure --prefix=${pkg_dest} --enable-optimizations 2>/dev/null
@@ -242,12 +299,18 @@ install_node() {
     echo "  Installing Node.js ${NODE_VERSION}"
     echo "=============================================="
 
-    docker exec "$CONTAINER_NAME" bash -c "
+    local expected
+    expected="$(require_sha256 node "$NODE_VERSION" "$NODE_ARCH" \
+        "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" \
+        "node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" "${NODE_SHA256:-}")" || return 1
+
+    docker exec -e EXPECTED_SHA="$expected" "$CONTAINER_NAME" bash -c "
         set -e
         mkdir -p ${pkg_dest}
         rm -f ${pkg_dest}/.package-installed
         cd /tmp
         curl -fsSL -o node.tar.xz https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz
+        echo \"\$EXPECTED_SHA  node.tar.xz\" | sha256sum -c -
         tar -xJf node.tar.xz --strip-components=1 -C ${pkg_dest}
         rm -f node.tar.xz
     "
@@ -339,12 +402,18 @@ install_bun() {
     echo "  Installing Bun ${BUN_VERSION}"
     echo "=============================================="
 
-    docker exec "$CONTAINER_NAME" bash -c "
+    local expected
+    expected="$(require_sha256 bun "$BUN_VERSION" "$BUN_ARCH" \
+        "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/SHASUMS256.txt" \
+        "bun-linux-${BUN_ARCH}.zip" "${BUN_SHA256:-}")" || return 1
+
+    docker exec -e EXPECTED_SHA="$expected" "$CONTAINER_NAME" bash -c "
         set -e
         mkdir -p ${pkg_dest}
         rm -f ${pkg_dest}/.package-installed
         cd /tmp
         curl -fsSL -o bun.zip https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip
+        echo \"\$EXPECTED_SHA  bun.zip\" | sha256sum -c -
         unzip -o bun.zip
         mv bun-linux-${BUN_ARCH}/bun ${pkg_dest}/bun
         chmod +x ${pkg_dest}/bun
@@ -455,12 +524,20 @@ install_java() {
     echo "  Installing Java ${JAVA_VERSION}"
     echo "=============================================="
 
-    docker exec "$CONTAINER_NAME" bash -c "
+    local java_url="https://github.com/adoptium/temurin${java_feature}-binaries/releases/download/jdk-${JAVA_VERSION}%2B${TEMURIN_BUILD}/OpenJDK${java_feature}U-jdk_${JAVA_ARCH}_linux_hotspot_${JAVA_VERSION}_${TEMURIN_BUILD}.tar.gz"
+    local expected
+    expected="$(require_sha256 java "${JAVA_VERSION}+${TEMURIN_BUILD}" "$JAVA_ARCH" \
+        "${java_url}.sha256.txt" \
+        "OpenJDK${java_feature}U-jdk_${JAVA_ARCH}_linux_hotspot_${JAVA_VERSION}_${TEMURIN_BUILD}.tar.gz" \
+        "${JAVA_SHA256:-}")" || return 1
+
+    docker exec -e EXPECTED_SHA="$expected" "$CONTAINER_NAME" bash -c "
         set -e
         mkdir -p ${pkg_dest}
         rm -f ${pkg_dest}/.package-installed
         cd /tmp
-        curl -fsSL -o java.tar.gz https://github.com/adoptium/temurin${java_feature}-binaries/releases/download/jdk-${JAVA_VERSION}%2B${TEMURIN_BUILD}/OpenJDK${java_feature}U-jdk_${JAVA_ARCH}_linux_hotspot_${JAVA_VERSION}_${TEMURIN_BUILD}.tar.gz
+        curl -fsSL -o java.tar.gz ${java_url}
+        echo \"\$EXPECTED_SHA  java.tar.gz\" | sha256sum -c -
         tar -xzf java.tar.gz --strip-components=1 -C ${pkg_dest}
         rm -f java.tar.gz
     "

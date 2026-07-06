@@ -22,6 +22,64 @@ CODEAPI_LANGUAGES="${CODEAPI_LANGUAGES:-python,node,bun,bash,java}"
 INSTALL_FAILED=false
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
 
+# Pinned SHA-256 for the default runtime versions, per arch. This is an
+# independent, git-reviewed record: a tampered upstream release is caught even
+# if its own published checksum file is tampered to match. Non-default versions
+# fall back to the upstream checksum file (transit integrity only, since a
+# fully compromised release could rewrite both); override with the matching
+# <ARTIFACT>_SHA256 to pin a custom version instead. Keep these in sync with
+# build-packages.sh. When bumping a default version, update its hash here.
+pinned_sha256() {
+    # args: artifact identity arch
+    case "$1:$2:$3" in
+        python:3.14.4+20260414:x86_64)   echo "e17275eaf95ceb5877aa6816e209b7733f41fee401d39c3921b88fb73fc4a4ba" ;;
+        python:3.14.4+20260414:aarch64)  echo "5c8db1c21023316adad827a46d917bbbd6a85ae4e39bc3a58febda712c2f963d" ;;
+        node:24.15.0:x64)                echo "472655581fb851559730c48763e0c9d3bc25975c59d518003fc0849d3e4ba0f6" ;;
+        node:24.15.0:arm64)              echo "f3d5a797b5d210ce8e2cb265544c8e482eaedcb8aa409a8b46da7e8595d0dda0" ;;
+        bun:1.3.14:x64)                  echo "951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f" ;;
+        bun:1.3.14:aarch64)              echo "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b" ;;
+        java:21.0.11+10:x64)             echo "4b2220e232a97997b436ca6ab15cbf70171ecff52958a46159dfa5a8c44ca4de" ;;
+        java:21.0.11+10:aarch64)         echo "8d498ec88e1c1989fab95c6784240ab92d011e29c54d20a3f9c324b13476f9ad" ;;
+    esac
+}
+
+# expected_sha256 <artifact> <identity> <arch> <checksum_url> <asset_name> <override>
+# Resolution order: explicit <ARTIFACT>_SHA256 override -> pinned default ->
+# the upstream checksum file. Prints the hash, or nothing if none could be
+# resolved (which verify_sha256 treats as a hard failure).
+expected_sha256() {
+    local artifact="$1" identity="$2" arch="$3" checksum_url="$4" asset="$5" override="$6"
+    if [ -n "$override" ]; then
+        echo "$override"
+        return 0
+    fi
+    local pinned
+    pinned="$(pinned_sha256 "$artifact" "$identity" "$arch")"
+    if [ -n "$pinned" ]; then
+        echo "$pinned"
+        return 0
+    fi
+    curl -fsSL "$checksum_url" 2>/dev/null | awk -v a="$asset" '$2 == a || $2 == "*" a { print $1; exit }'
+}
+
+# verify_sha256 <file> <expected> <label>; fails closed on empty or mismatch.
+verify_sha256() {
+    local file="$1" expected="$2" label="$3" actual
+    if [ -z "$expected" ]; then
+        echo "ERROR: no known SHA-256 for ${label}; refusing to install an unverified download" >&2
+        echo "  set the matching <ARTIFACT>_SHA256 env var to pin this version" >&2
+        return 1
+    fi
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        echo "ERROR: SHA-256 mismatch for ${label}" >&2
+        echo "  expected ${expected}" >&2
+        echo "  actual   ${actual}" >&2
+        return 1
+    fi
+    echo "Verified ${label} (sha256 ${actual})"
+}
+
 SELECTED_LANGUAGES=()
 IFS=',' read -ra REQUESTED_LANGUAGES <<< "$CODEAPI_LANGUAGES"
 for lang in "${REQUESTED_LANGUAGES[@]}"; do
@@ -218,12 +276,19 @@ else
     # release tag is pinned because python-build-standalone drops older point
     # releases from newer tags; override both together to change versions.
     PYTHON_BUILD_STANDALONE_TAG="${PYTHON_BUILD_STANDALONE_TAG:-20260414}"
-    PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_STANDALONE_TAG}/cpython-${PYTHON_VERSION}+${PYTHON_BUILD_STANDALONE_TAG}-${PYTHON_ARCH}-unknown-linux-gnu-install_only.tar.gz"
+    PYTHON_ASSET="cpython-${PYTHON_VERSION}+${PYTHON_BUILD_STANDALONE_TAG}-${PYTHON_ARCH}-unknown-linux-gnu-install_only.tar.gz"
+    PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_STANDALONE_TAG}/${PYTHON_ASSET}"
     cd /tmp
     if ! curl -fsSL "$PYTHON_URL" -o python.tar.gz; then
         echo "ERROR: Failed to download prebuilt Python from $PYTHON_URL" >&2
         echo "Check that release ${PYTHON_BUILD_STANDALONE_TAG} provides cpython ${PYTHON_VERSION}" >&2
         echo "(set PYTHON_BUILD_STANDALONE_TAG and PYTHON_VERSION together to change versions)" >&2
+        exit 1
+    fi
+    PYTHON_EXPECTED="$(expected_sha256 python "${PYTHON_VERSION}+${PYTHON_BUILD_STANDALONE_TAG}" "$PYTHON_ARCH" \
+        "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_STANDALONE_TAG}/SHA256SUMS" \
+        "$PYTHON_ASSET" "${PYTHON_SHA256:-}")"
+    if ! verify_sha256 python.tar.gz "$PYTHON_EXPECTED" "Python ${PYTHON_VERSION} (${PYTHON_ARCH})"; then
         exit 1
     fi
     tar -xzf python.tar.gz --strip-components=1 -C "$PKG_DEST"
@@ -366,9 +431,17 @@ else
     esac
 
     if [ -n "$NODE_ARCH" ]; then
-        NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+        NODE_ASSET="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+        NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ASSET}"
         cd /tmp
-        if curl -fsSL "$NODE_URL" -o node.tar.xz; then
+        if ! curl -fsSL "$NODE_URL" -o node.tar.xz; then
+            echo "ERROR: Failed to download Node.js"
+            INSTALL_FAILED=true
+        elif ! verify_sha256 node.tar.xz "$(expected_sha256 node "$NODE_VERSION" "$NODE_ARCH" \
+                "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" "$NODE_ASSET" "${NODE_SHA256:-}")" \
+                "Node.js ${NODE_VERSION} (${NODE_ARCH})"; then
+            INSTALL_FAILED=true
+        else
             if tar -xJf node.tar.xz --strip-components=1 -C "$NODE_DEST"; then
                 rm -f node.tar.xz
 
@@ -404,9 +477,6 @@ EOF
                 rm -f node.tar.xz
                 INSTALL_FAILED=true
             fi
-        else
-            echo "ERROR: Failed to download Node.js"
-            INSTALL_FAILED=true
         fi
     fi
 
@@ -482,9 +552,17 @@ else
     esac
 
     if [ -n "$BUN_ARCH" ]; then
-        BUN_URL="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip"
+        BUN_ASSET="bun-linux-${BUN_ARCH}.zip"
+        BUN_URL="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_ASSET}"
         cd /tmp
-        if curl -fsSL "$BUN_URL" -o bun.zip; then
+        if ! curl -fsSL "$BUN_URL" -o bun.zip; then
+            echo "ERROR: Failed to download Bun"
+            INSTALL_FAILED=true
+        elif ! verify_sha256 bun.zip "$(expected_sha256 bun "$BUN_VERSION" "$BUN_ARCH" \
+                "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/SHASUMS256.txt" \
+                "$BUN_ASSET" "${BUN_SHA256:-}")" "Bun ${BUN_VERSION} (${BUN_ARCH})"; then
+            INSTALL_FAILED=true
+        else
             if unzip -o bun.zip && mv bun-linux-${BUN_ARCH}/bun "$BUN_DEST/"; then
                 chmod +x "$BUN_DEST/bun"
                 rm -rf bun.zip bun-linux-${BUN_ARCH}
@@ -524,9 +602,6 @@ EOF
                 rm -rf bun.zip bun-linux-${BUN_ARCH}
                 INSTALL_FAILED=true
             fi
-        else
-            echo "ERROR: Failed to download Bun"
-            INSTALL_FAILED=true
         fi
     fi
 
@@ -613,9 +688,17 @@ else
     esac
 
     if [ -n "$JAVA_ARCH" ]; then
-        JAVA_URL="https://github.com/adoptium/temurin${JAVA_FEATURE}-binaries/releases/download/jdk-${JAVA_VERSION}%2B${TEMURIN_BUILD}/OpenJDK${JAVA_FEATURE}U-jdk_${JAVA_ARCH}_linux_hotspot_${JAVA_VERSION}_${TEMURIN_BUILD}.tar.gz"
+        JAVA_ASSET="OpenJDK${JAVA_FEATURE}U-jdk_${JAVA_ARCH}_linux_hotspot_${JAVA_VERSION}_${TEMURIN_BUILD}.tar.gz"
+        JAVA_URL="https://github.com/adoptium/temurin${JAVA_FEATURE}-binaries/releases/download/jdk-${JAVA_VERSION}%2B${TEMURIN_BUILD}/${JAVA_ASSET}"
         cd /tmp
-        if curl -fsSL "$JAVA_URL" -o java.tar.gz; then
+        if ! curl -fsSL "$JAVA_URL" -o java.tar.gz; then
+            echo "ERROR: Failed to download Java from $JAVA_URL"
+            INSTALL_FAILED=true
+        elif ! verify_sha256 java.tar.gz "$(expected_sha256 java "${JAVA_VERSION}+${TEMURIN_BUILD}" "$JAVA_ARCH" \
+                "${JAVA_URL}.sha256.txt" "$JAVA_ASSET" "${JAVA_SHA256:-}")" \
+                "Java ${JAVA_VERSION} (${JAVA_ARCH})"; then
+            INSTALL_FAILED=true
+        else
             if tar -xzf java.tar.gz --strip-components=1 -C "$JAVA_DEST"; then
                 rm -f java.tar.gz
 
@@ -666,9 +749,6 @@ EOF
                 rm -f java.tar.gz
                 INSTALL_FAILED=true
             fi
-        else
-            echo "ERROR: Failed to download Java from $JAVA_URL"
-            INSTALL_FAILED=true
         fi
     fi
 fi
