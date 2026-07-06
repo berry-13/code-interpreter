@@ -140,8 +140,21 @@ bash_ready() {
     [ -f "/pkgs/bash/${BASH_PACKAGE_VERSION}/.package-installed" ]
 }
 
+java_installed_build() {
+    local dest="/pkgs/java/${JAVA_VERSION}"
+    if [ -f "$dest/.temurin-build" ]; then
+        cat "$dest/.temurin-build"
+    else
+        # Volumes populated before the build marker existed: read the build
+        # from the JDK's own release file (JAVA_RUNTIME_VERSION="21.0.11+10-LTS")
+        # so a matching install is kept instead of re-downloaded.
+        sed -n 's/^JAVA_RUNTIME_VERSION="[^+]*+\([0-9][0-9]*\).*/\1/p' "$dest/release" 2>/dev/null
+    fi
+}
+
 java_ready() {
-    [ -f "/pkgs/java/${JAVA_VERSION}/.package-installed" ]
+    [ -f "/pkgs/java/${JAVA_VERSION}/.package-installed" ] &&
+    [ "$(java_installed_build)" = "$TEMURIN_BUILD" ]
 }
 
 packages_ready() {
@@ -645,6 +658,7 @@ EOF
                 } > "$JAVA_DEST/.env"
 
                 JAVA_INSTALLED=true
+                echo "$TEMURIN_BUILD" > "$JAVA_DEST/.temurin-build"
                 echo "$(date +%s)000" > "$JAVA_DEST/.package-installed"
                 echo "Java ${JAVA_VERSION} installed: $($JAVA_DEST/bin/java --version | head -1)"
             else
