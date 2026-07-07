@@ -12,6 +12,7 @@ import {
   inputsLiveUnder,
   mapWithConcurrency,
   mimeTypeFor,
+  tarLongNameOverheadBytes,
 } from './job';
 import type { Runtime } from './runtime';
 import type { TFile } from './job';
@@ -612,5 +613,39 @@ describe('ensureNodeModulesSymlink', () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('tarLongNameOverheadBytes', () => {
+  it('charges nothing for names that fit the 100-byte tar name field', () => {
+    expect(tarLongNameOverheadBytes('./short.txt')).toBe(0);
+    expect(tarLongNameOverheadBytes('./' + 'a'.repeat(98))).toBe(0); // 100 bytes total
+  });
+
+  it('charges a long-name record once the stored name exceeds 100 bytes', () => {
+    // GNU tar emits an L header (512) + the path (NUL-terminated) padded to 512.
+    // For a ~122-byte name that is one 512 data block: 512 + 512 = 1024.
+    const name = './' + 'a'.repeat(120); // 122 bytes
+    expect(tarLongNameOverheadBytes(name)).toBe(1024);
+  });
+
+  it('counts a directory member trailing slash toward the threshold', () => {
+    // 100 chars + trailing slash = 101 bytes -> needs a long-name record.
+    const dir = './' + 'a'.repeat(98) + '/'; // 101 bytes
+    expect(tarLongNameOverheadBytes(dir)).toBe(1024);
+    expect(tarLongNameOverheadBytes('./' + 'a'.repeat(98))).toBe(0); // 100 without slash
+  });
+
+  it('scales the padded data blocks with the path length', () => {
+    // ~520-byte name spans two 512 data blocks: 512 header + 1024 data = 1536.
+    const name = './' + 'a'.repeat(518); // 520 bytes; +16 margin -> ceil(536/512)=2 blocks
+    expect(tarLongNameOverheadBytes(name)).toBe(512 + 1024);
+  });
+
+  it('measures bytes, not code points, for multibyte names', () => {
+    // 40 * 3-byte chars = 120 bytes > 100 even though only 40 code points.
+    expect(tarLongNameOverheadBytes('あ'.repeat(40))).toBeGreaterThan(0);
+    // 30 * 3-byte chars = 90 bytes <= 100 -> fits.
+    expect(tarLongNameOverheadBytes('あ'.repeat(30))).toBe(0);
   });
 });

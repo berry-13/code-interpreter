@@ -116,14 +116,25 @@ function sendSessionKeyResolutionError(
 
 const router = Router();
 
-/* Atomically advance the session-state pointer only if it still holds the value
- * this run restored from (compare-and-swap). `expected === null` means "first
- * run" and matches only a missing key. Returns whether the swap happened, so a
- * run whose baseline was overtaken by a concurrent run doesn't roll the pointer
- * back to stale state. */
+/* Atomically advance the session-state pointer (compare-and-swap). Advances
+ * when the key still holds the value this run restored from (`cur == ARGV[1]`)
+ * OR when the key is absent (`cur == false`). Returns whether the swap happened,
+ * so a run whose baseline was overtaken by a concurrent run doesn't roll the
+ * pointer back to stale state.
+ *
+ * The `cur == false` arm covers two cases with one rule: a genuine first run
+ * (expected `''`), AND a continuation whose pointer TTL lapsed mid-run -- e.g. a
+ * run that started just before `SESSION_STATE_TTL_SECONDS` elapsed, or a TTL
+ * misconfigured below the max job time. Absent that arm, the expired-pointer run
+ * would treat its own fresh snapshot as stale and (with the finally block) delete
+ * both snapshots, losing all persisted state for an active session. Advancing on
+ * a missing key is safe: the pointer is only ever SET forward or TTL-expired,
+ * never deleted, so `cur == false` means no live pointer exists to clobber, and
+ * any concurrent run that already advanced makes `cur` a non-empty id that
+ * matches neither arm -- so rollback is still prevented. */
 const CAS_ADVANCE_SESSION_POINTER = `
 local cur = redis.call('GET', KEYS[1])
-if (cur == false and ARGV[1] == '') or (cur == ARGV[1]) then
+if cur == false or cur == ARGV[1] then
   redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
   return 1
 end

@@ -460,6 +460,33 @@ export function markerConflictsWithExplicitFile(
   return false;
 }
 
+/**
+ * Extra tar bytes for a member whose stored path forces a long-name record, or
+ * 0 when the path fits the header's name field. GNU tar (default `--format=gnu`,
+ * as shipped) stores the full path in a 100-byte name field with NO ustar
+ * prefix splitting, so any member name over 100 bytes -- INCLUDING the trailing
+ * '/' GNU tar appends to directory members -- gets a preceding
+ * `GNUTYPE_LONGNAME` ('L') record: a 512-byte header plus the path
+ * (NUL-terminated) padded to a 512-byte boundary, right before the member's own
+ * header. The `+16` margin also covers the marginally larger extended header a
+ * POSIX/pax-format tar would emit for the same path (its `path=` record), so the
+ * estimate never undercounts under either format.
+ *
+ * The size estimator MUST add this: a swarm of long-named files (e.g. many empty
+ * files with ~120-byte basenames) or deeply nested paths would otherwise pass
+ * the pre-archive cap while `tar -cf` still materializes a much larger archive
+ * on runner disk before the post-archive size check rejects it.
+ *
+ * `storedName` must be the exact archive member name -- `./<rel>` for files and
+ * symlinks, `./<rel>/` (trailing slash) for directories. Pure; exported for
+ * unit testing.
+ */
+export function tarLongNameOverheadBytes(storedName: string): number {
+  const len = Buffer.byteLength(storedName, 'utf8');
+  if (len <= 100) return 0;
+  return 512 + Math.ceil((len + 16) / 512) * 512;
+}
+
 function mergeDelimitedEnvEntries(
   key: string,
   source: string | undefined,
@@ -1418,6 +1445,9 @@ export class Job {
    * block overhead -- a 512-byte header per entry plus file content padded to
    * 512-byte blocks -- so a swarm of empty files/directories (near-zero content
    * but hundreds of MB of headers) can't slip past the pre-archive size cap.
+   * Also charges each member the long-name record GNU tar prepends when its
+   * stored path (`./<rel>`) overflows the ustar name/prefix fields, so long-
+   * named or deeply nested files can't undercount the estimate either.
    */
   private async dirSizeBytes(dir: string): Promise<number> {
     let entries: fs.Dirent[];
@@ -1428,20 +1458,24 @@ export class Job {
     }
     let total = 0;
     for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      // Stored member name matches `tar -cf ... -C submissionDir .` output:
+      // './' + the POSIX-separated path relative to the workspace root, with a
+      // trailing '/' on directory members (GNU tar counts it toward the name).
+      const rel = './' + path.relative(this.submissionDir, full).split(path.sep).join('/');
       if (entry.isSymbolicLink()) {
-        total += 512; // header only
+        total += 512 + tarLongNameOverheadBytes(rel); // header only
         continue;
       }
-      const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        total += 512; // directory header
+        total += 512 + tarLongNameOverheadBytes(rel + '/'); // directory header
         total += await this.dirSizeBytes(full);
       } else if (entry.isFile()) {
         let size = 0;
         try {
           size = (await fsp.stat(full)).size;
         } catch { /* vanished mid-walk; ignore */ }
-        total += 512 + Math.ceil(size / 512) * 512;
+        total += 512 + Math.ceil(size / 512) * 512 + tarLongNameOverheadBytes(rel);
       }
     }
     return total;
