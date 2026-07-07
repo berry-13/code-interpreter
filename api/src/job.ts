@@ -1178,7 +1178,11 @@ export class Job {
         continue;
       }
       if (!entry.isFile()) continue;
-      if (isReservedSessionBasename(entry.name) || isDirkeep(entry.name)) continue;
+      // Reserved artifacts are never outputs. `.dirkeep` markers ARE baselined
+      // (unlike other skips): a restored empty dir is represented only by its
+      // marker, so without a baseline the output walk would regenerate it as a
+      // fresh file and let carried-over empty dirs crowd out real artifacts.
+      if (isReservedSessionBasename(entry.name)) continue;
       const rel = path.relative(this.submissionDir, full);
       try {
         const hash = await this.computeFileHash(full);
@@ -1660,6 +1664,12 @@ export class Job {
     }
     if (inheritedKeep?.id && inheritedKeep.storage_session_id) {
       return this.handleInheritedDirkeep(keepPath, keepFullPath, inheritedKeep);
+    }
+    // Restored empty-dir marker from a persistent session: it persists in the
+    // snapshot tar, so don't regenerate it as a fresh output (which would
+    // consume a max_output_files slot and crowd out genuinely new artifacts).
+    if (this.inputFileHashes.get(keepPath)?.restored) {
+      return { collected: false, truncated: false };
     }
     return this.createDirkeepMarker(keepPath, keepFullPath);
   }

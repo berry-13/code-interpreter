@@ -4,6 +4,7 @@ import type * as tls from 'tls';
 import { env } from './config';
 import type { EgressGrantClaims } from './egress-grant';
 import { EgressGrantError } from './egress-grant';
+import { SESSION_STATE_FILE_ID } from './session-persist';
 import logger from './logger';
 import { redisKeepAliveOptions } from './redis-options';
 
@@ -287,7 +288,16 @@ export async function reserveEgressUpload(args: {
   bytes: number;
 }): Promise<void> {
   await mutateRecord(args.grant, record => {
-    if (args.bytes > Math.min(record.max_upload_bytes, env.EGRESS_GATEWAY_MAX_FILE_BYTES)) {
+    // The hidden persistent-session snapshot can legitimately reach the
+    // operator's SESSION_STATE_MAX_BYTES (already in the grant's
+    // max_upload_bytes) and is written only by the trusted sandbox, so it uses
+    // the grant cap directly rather than the smaller per-file gateway cap that
+    // otherwise rejects snapshots over ~10 MB. Mirrors the check in
+    // egress-gateway.ts. The aggregate budget below still applies.
+    const perFileLimit = args.fileId === SESSION_STATE_FILE_ID
+      ? record.max_upload_bytes
+      : Math.min(record.max_upload_bytes, env.EGRESS_GATEWAY_MAX_FILE_BYTES);
+    if (args.bytes > perFileLimit) {
       throw new EgressGrantError('scope_mismatch', 'Upload exceeds per-file egress byte limit');
     }
     if (record.output_file_ids.includes(args.fileId)) {

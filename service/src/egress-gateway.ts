@@ -39,6 +39,7 @@ import { metricsHandler } from './metrics';
 import { httpMetricsMiddleware } from './middleware/httpMetrics';
 import { injectTraceHeaders, shutdownTelemetry, traceHttpRequest } from './telemetry';
 import { isValidId } from './utils';
+import { SESSION_STATE_FILE_ID } from './session-persist';
 import logger from './logger';
 import { parseBoundedContentLength } from './http-limits';
 import { validateEgressGatewayHardenedConfig } from './secure-startup';
@@ -649,7 +650,14 @@ app.put('/sessions/:sessionHandle/objects/:fileId', async (req, res) => {
     if (!isValidId(fileId)) {
       return res.status(400).json({ error: 'Invalid output file id' });
     }
-    const uploadByteLimit = Math.min(grant.max_upload_bytes, env.EGRESS_GATEWAY_MAX_FILE_BYTES);
+    // The hidden persistent-session snapshot can legitimately be as large as
+    // the operator's SESSION_STATE_MAX_BYTES (already reflected in the grant's
+    // max_upload_bytes); it is written only by the trusted sandbox, never user
+    // code. Let it use the grant cap directly instead of the smaller per-file
+    // gateway cap, which otherwise silently rejects snapshots over ~10 MB.
+    const uploadByteLimit = fileId === SESSION_STATE_FILE_ID
+      ? grant.max_upload_bytes
+      : Math.min(grant.max_upload_bytes, env.EGRESS_GATEWAY_MAX_FILE_BYTES);
     const parsedLength = parseBoundedContentLength(
       req.header('content-length'),
       uploadByteLimit,

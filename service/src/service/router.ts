@@ -116,6 +116,41 @@ function sendSessionKeyResolutionError(
 
 const router = Router();
 
+/* Atomically advance the session-state pointer only if it still holds the value
+ * this run restored from (compare-and-swap). `expected === null` means "first
+ * run" and matches only a missing key. Returns whether the swap happened, so a
+ * run whose baseline was overtaken by a concurrent run doesn't roll the pointer
+ * back to stale state. */
+const CAS_ADVANCE_SESSION_POINTER = `
+local cur = redis.call('GET', KEYS[1])
+if (cur == false and ARGV[1] == '') or (cur == ARGV[1]) then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0`;
+
+async function casAdvanceSessionPointer(
+  key: string,
+  expected: string | null,
+  next: string,
+  ttlSeconds: number,
+): Promise<boolean> {
+  const result = await connection.eval(
+    CAS_ADVANCE_SESSION_POINTER, 1, key, expected ?? '', next, String(ttlSeconds),
+  );
+  return result === 1;
+}
+
+/** Fire-and-forget delete of a session's hidden snapshot object. */
+function deleteSessionSnapshot(outputSession: string): void {
+  axios.delete(
+    `${env.FILE_SERVER_URL}/sessions/${encodeURIComponent(outputSession)}/objects/${encodeURIComponent(SESSION_STATE_FILE_ID)}`,
+    { headers: internalServiceHeaders() },
+  ).catch((error) => {
+    logger.warn(`[${INSTANCE_ID}] Failed to delete session snapshot:`, getAxiosErrorDetails(error));
+  });
+}
+
 router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
   const principal = getPrincipalOrReject(req, res);
   if (!principal) return;
@@ -301,26 +336,29 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      * survives. TTL refresh means an active session never expires. */
     if (env.PERSIST_SESSIONS && (result as t.ExecuteResult)?.session_state_persisted) {
       try {
-        await connection.set(
+        // Compare-and-swap the pointer: only advance if it still equals what
+        // this run restored from. If two runs for the same session overlap, both
+        // restore the same prior snapshot; without CAS the slower-to-finish run
+        // would advance the pointer to state that omits the other's changes
+        // (a rollback). With CAS, the run whose baseline is now stale simply
+        // does not advance -- its snapshot is discarded, not the newer one.
+        const advanced = await casAdvanceSessionPointer(
           sessionStatePointerKey(sessionKey),
+          priorSnapshotSession,
           session_id,
-          'EX',
           env.SESSION_STATE_TTL_SECONDS,
         );
-        // ONLY after the pointer has definitely advanced: delete the superseded
-        // snapshot so active sessions don't orphan a (potentially large) tar per
-        // run. If the SET failed, Redis still points at priorSnapshotSession, so
-        // we must NOT delete it -- the next run still needs to restore from it.
-        if (priorSnapshotSession && priorSnapshotSession !== session_id) {
-          axios.delete(
-            `${env.FILE_SERVER_URL}/sessions/${encodeURIComponent(priorSnapshotSession)}/objects/${encodeURIComponent(SESSION_STATE_FILE_ID)}`,
-            { headers: internalServiceHeaders() },
-          ).catch((error) => {
-            logger.warn(`[${INSTANCE_ID}] Failed to delete superseded session snapshot:`, getAxiosErrorDetails(error));
-          });
+        if (advanced && priorSnapshotSession && priorSnapshotSession !== session_id) {
+          // Superseded snapshot: delete so active sessions don't orphan a tar/run.
+          deleteSessionSnapshot(priorSnapshotSession);
+        } else if (!advanced) {
+          // A concurrent run already advanced the pointer; this run's snapshot is
+          // now orphaned and stale -- drop it rather than leave it in storage.
+          logger.warn(`[${INSTANCE_ID}] Session pointer moved concurrently; discarding this run's snapshot`);
+          deleteSessionSnapshot(session_id);
         }
       } catch (error) {
-        logger.error(`[${INSTANCE_ID}] Failed to set session-state pointer:`, error);
+        logger.error(`[${INSTANCE_ID}] Failed to advance session-state pointer:`, error);
       }
     }
 
