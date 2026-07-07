@@ -61,7 +61,9 @@ def ______custom_show():
 # Override plt.show and plt.savefig
 plt.show = ______custom_show
 
-original_savefig = plt.savefig
+# `______`-prefixed so persistent-session snapshots exclude it (the snapshot
+# filter drops underscore-prefixed names) and it can't clobber a user variable.
+______original_savefig = plt.savefig
 
 # Maximum DPI to prevent excessive rendering time
 ______MAX_DPI = 200
@@ -75,11 +77,11 @@ def ______custom_savefig(*args, **kwargs):
         ______ns.logger.debug(f"Capping DPI from {kwargs['dpi']} to {______MAX_DPI}")
         kwargs['dpi'] = ______MAX_DPI
     
-    return original_savefig(*args, **kwargs)
+    return ______original_savefig(*args, **kwargs)
 
 plt.savefig = ______custom_savefig
 
-def main():
+def ______main():
     try:
         # BEGIN USER CODE
         # User code will be inserted here
@@ -95,4 +97,4 @@ def main():
         globals().update({______k: ______v for ______k, ______v in dict(locals()).items() if not ______k.startswith('_')})
 
 if __name__ == "__main__":
-    main()
+    ______main()

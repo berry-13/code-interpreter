@@ -211,6 +211,13 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   const execution_id = nanoid();
   await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
 
+  // Persistent-session pointer bookkeeping (used across the injection, advance,
+  // and finally blocks). `snapshotRefKey` refcounts in-flight restores of the
+  // prior snapshot so a concurrent run can't delete it before this run primes.
+  let priorSnapshotSession: string | null = null;
+  let snapshotRefKey: string | null = null;
+  let pointerAdvanced = false;
+
   try {
     if (!isSyntheticRequest) {
       logger.info('Request received', {
@@ -240,7 +247,6 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      *     read_sessions + input_files, authorizing the sandbox to fetch it — no
      *     file-server or Redis-auth change needed. Done before
      *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
-    let priorSnapshotSession: string | null = null;
     if (env.PERSIST_SESSIONS) {
       // Reserve every persistence artifact name: the state tar (identified in
       // the sandbox by name only, since egress masks file id/session) and the
@@ -257,6 +263,15 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       };
       priorSnapshotSession = await connection.get(sessionStatePointerKey(sessionKey));
       if (priorSnapshotSession) {
+        // Hold a ref on the snapshot this run will restore from, so a concurrent
+        // run that supersedes the pointer can't delete it before we prime. TTL
+        // bounds it past the max run + queue wait so a crash can't leak the ref.
+        snapshotRefKey = `snapshotrefs:${priorSnapshotSession}`;
+        await connection.multi()
+          .incr(snapshotRefKey)
+          .expire(snapshotRefKey, Math.ceil(env.JOB_TIMEOUT / 1000) + 60)
+          .exec()
+          .catch(() => { /* best effort; delete path also guards on advance */ });
         rawPayload.persist_session.restore_session_id = priorSnapshotSession;
         rawPayload.files.push({
           id: SESSION_STATE_FILE_ID,
@@ -342,21 +357,21 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         // would advance the pointer to state that omits the other's changes
         // (a rollback). With CAS, the run whose baseline is now stale simply
         // does not advance -- its snapshot is discarded, not the newer one.
-        const advanced = await casAdvanceSessionPointer(
+        pointerAdvanced = await casAdvanceSessionPointer(
           sessionStatePointerKey(sessionKey),
           priorSnapshotSession,
           session_id,
           env.SESSION_STATE_TTL_SECONDS,
         );
-        if (advanced && priorSnapshotSession && priorSnapshotSession !== session_id) {
-          // Superseded snapshot: delete so active sessions don't orphan a tar/run.
-          deleteSessionSnapshot(priorSnapshotSession);
-        } else if (!advanced) {
+        if (!pointerAdvanced) {
           // A concurrent run already advanced the pointer; this run's snapshot is
-          // now orphaned and stale -- drop it rather than leave it in storage.
+          // now orphaned and stale -- drop it (no other run references it).
           logger.warn(`[${INSTANCE_ID}] Session pointer moved concurrently; discarding this run's snapshot`);
           deleteSessionSnapshot(session_id);
         }
+        // Deletion of the SUPERSEDED prior snapshot happens in `finally`, after
+        // this run releases its ref, so a concurrent run that still needs to
+        // restore it isn't left with a 404.
       } catch (error) {
         logger.error(`[${INSTANCE_ID}] Failed to advance session-state pointer:`, error);
       }
@@ -373,6 +388,16 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       return res.status(publicFailure.status).json(publicFailure.body);
     }
     return res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    // Release this run's ref on the prior snapshot and delete it only once the
+    // pointer has advanced past it AND no other in-flight run still holds a ref
+    // (which would otherwise 404 its restore). Runs regardless of success/error.
+    if (snapshotRefKey && priorSnapshotSession) {
+      const remaining = await connection.decr(snapshotRefKey).catch(() => 1);
+      if (pointerAdvanced && remaining <= 0 && priorSnapshotSession !== session_id) {
+        deleteSessionSnapshot(priorSnapshotSession);
+      }
+    }
   }
 });
 

@@ -293,8 +293,11 @@ export async function reserveEgressUpload(args: {
     // max_upload_bytes) and is written only by the trusted sandbox, so it uses
     // the grant cap directly rather than the smaller per-file gateway cap that
     // otherwise rejects snapshots over ~10 MB. Mirrors the check in
-    // egress-gateway.ts. The aggregate budget below still applies.
-    const perFileLimit = args.fileId === SESSION_STATE_FILE_ID
+    // egress-gateway.ts. Its per-file cap already bounds it, and it is excluded
+    // from the visible-file aggregate below (a large snapshot must not eat the
+    // budget sized for user outputs, and vice-versa).
+    const isStateSnapshot = args.fileId === SESSION_STATE_FILE_ID;
+    const perFileLimit = isStateSnapshot
       ? record.max_upload_bytes
       : Math.min(record.max_upload_bytes, env.EGRESS_GATEWAY_MAX_FILE_BYTES);
     if (args.bytes > perFileLimit) {
@@ -306,13 +309,16 @@ export async function reserveEgressUpload(args: {
     if (record.output_file_ids.length >= record.max_output_files) {
       throw new EgressGrantError('scope_mismatch', 'Output file count budget exceeded');
     }
-    const aggregateLimit = Math.min(record.max_upload_bytes, env.EGRESS_GATEWAY_MAX_FILE_BYTES) * record.max_output_files;
-    if (record.uploaded_bytes + args.bytes > aggregateLimit) {
-      throw new EgressGrantError('scope_mismatch', 'Aggregate upload byte budget exceeded');
+    if (!isStateSnapshot) {
+      const aggregateLimit = Math.min(record.max_upload_bytes, env.EGRESS_GATEWAY_MAX_FILE_BYTES) * record.max_output_files;
+      if (record.uploaded_bytes + args.bytes > aggregateLimit) {
+        throw new EgressGrantError('scope_mismatch', 'Aggregate upload byte budget exceeded');
+      }
     }
     record.request_count += 1;
     record.upload_count += 1;
-    record.uploaded_bytes += args.bytes;
+    // Keep the snapshot out of the visible-file aggregate accounting.
+    if (!isStateSnapshot) record.uploaded_bytes += args.bytes;
     record.output_file_ids.push(args.fileId);
   });
 }

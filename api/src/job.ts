@@ -1123,10 +1123,13 @@ export class Job {
       // legitimate need for symlinks, so we drop them unconditionally.
       await this.stripRestoredSymlinks(this.submissionDir);
       await this.chownTreeToJobUid(this.submissionDir);
-      // The archived `.` member can carry a hostile mode for submissionDir
-      // itself (a prior run could chmod /mnt/data to 000), which extraction
-      // reapplies -- leaving the next job's cwd inaccessible to the job UID and
-      // bricking the session. Reset the workspace dir to its canonical mode.
+      // tar --no-same-permissions only umasks archived modes; it never ADDS
+      // access, so a prior run's `chmod 000` on any dir/file survives extraction
+      // and, now owned by the job UID, is still untraversable/unreadable --
+      // bricking restored state. `u+rwX` grants the owner read/write on files
+      // and traverse on dirs (and preserves existing execute bits) across the
+      // whole tree, and the root gets its exact canonical workspace mode.
+      await this.normalizeRestoredModes(this.submissionDir);
       await applySandboxPathPermissions(this.submissionDir, this.sandboxIdentity(), SANDBOX_WORKSPACE_MODE);
       // Record restored files as input baselines so handleSessionFiles treats
       // unchanged carry-overs as inherited, not freshly generated outputs --
@@ -1336,6 +1339,20 @@ export class Job {
       await execFileP('chown', ['-Rh', `${id.uid}:${id.gid}`, dir]);
     } catch (err) {
       this.log.warn({ err }, 'Failed to chown restored session tree to job UID');
+    }
+  }
+
+  /**
+   * Grant the owner (job UID) read/write on files and traverse on directories
+   * across a restored tree, preserving existing execute bits. Repairs hostile
+   * modes (e.g. a prior run's `chmod 000`) that extraction preserves and would
+   * otherwise leave restored files unreadable/untraversable. Best-effort.
+   */
+  private async normalizeRestoredModes(dir: string): Promise<void> {
+    try {
+      await execFileP('chmod', ['-R', 'u+rwX', dir]);
+    } catch (err) {
+      this.log.warn({ err }, 'Failed to normalize restored session tree modes');
     }
   }
 
