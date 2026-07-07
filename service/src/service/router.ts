@@ -394,8 +394,22 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     // (which would otherwise 404 its restore). Runs regardless of success/error.
     if (snapshotRefKey && priorSnapshotSession) {
       const remaining = await connection.decr(snapshotRefKey).catch(() => 1);
-      if (pointerAdvanced && remaining <= 0 && priorSnapshotSession !== session_id) {
-        deleteSessionSnapshot(priorSnapshotSession);
+      if (remaining <= 0 && priorSnapshotSession !== session_id) {
+        // We're the last in-flight referencer. Delete the prior snapshot only if
+        // the pointer no longer references it -- i.e. some run has advanced past
+        // it -- rather than keying on this run advancing. That covers the overlap
+        // where one run advances (but sees refs outstanding, so it skips the
+        // delete) and a later non-advancing run drains the final ref: without the
+        // live check that superseded snapshot would leak. The pointer only ever
+        // moves to fresh session ids and never back, so once it != the prior
+        // snapshot no future run can restore from it or re-take a ref, making the
+        // delete safe. A GET failure stays conservative (keep the snapshot).
+        const currentPointer = await connection
+          .get(sessionStatePointerKey(sessionKey))
+          .catch(() => priorSnapshotSession);
+        if (currentPointer !== priorSnapshotSession) {
+          deleteSessionSnapshot(priorSnapshotSession);
+        }
       }
     }
   }

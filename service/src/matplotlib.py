@@ -39,7 +39,20 @@ matplotlib.rcParams.update({
 
 import matplotlib.pyplot as plt
 
+# Seed the counter past any plot_N.png already in the workspace. With persistent
+# sessions a prior run's plots are restored into the cwd, so starting from 0
+# would make plt.show() rewrite plot_1.png and clobber the earlier figure. When
+# persistence is off the workspace is empty, so this is a no-op (counter stays 0).
+# `______`-prefixed locals are excluded from the persisted namespace snapshot.
 ______ns.plot_counter = 0
+try:
+    for ______name in os.listdir('.'):
+        if ______name.startswith('plot_') and ______name.endswith('.png'):
+            ______stem = ______name[len('plot_'):-len('.png')]
+            if ______stem.isdigit():
+                ______ns.plot_counter = max(______ns.plot_counter, int(______stem))
+except Exception:
+    pass
 ______ns.saved_figures = set()
 
 def ______custom_show():

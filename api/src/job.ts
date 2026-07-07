@@ -1071,7 +1071,30 @@ export class Job {
 
     this.log.error({ fileId: file.id, maxRetries, err: lastError }, 'Failed to download file');
     try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
+    // A persistent-session restore stages carry-over files BEFORE current inputs
+    // download. If this input was meant to replace a restored file at the same
+    // path but the download failed (expired/transient 404), leaving the restored
+    // copy in place would silently run the sandbox against stale bytes. Drop the
+    // stale carry-over + its baseline so user code sees the input as missing.
+    await this.discardStaleRestoredInput(file.name);
     return null;
+  }
+
+  /**
+   * On a failed input download, remove a restored persistent-session file left
+   * at the same path (and its output-walk baseline) so the run doesn't observe
+   * stale bytes in place of the current, unavailable input. No-op unless the
+   * path was a restored carry-over.
+   */
+  private async discardStaleRestoredInput(name: string): Promise<void> {
+    const info = this.inputFileHashes.get(name);
+    if (!info?.restored || !info.path) return;
+    try {
+      await fsp.rm(info.path, { force: true });
+    } catch (err) {
+      this.log.warn({ file: name, err }, 'Failed to remove stale restored input after download failure');
+    }
+    this.inputFileHashes.delete(name);
   }
 
   /**
@@ -1121,7 +1144,7 @@ export class Job {
       // without this the runner's writeFile() would follow it and write
       // attacker-controlled content outside the workspace. Restored state has no
       // legitimate need for symlinks, so we drop them unconditionally.
-      await this.stripRestoredSymlinks(this.submissionDir);
+      await this.stripSymlinks(this.submissionDir);
       await this.chownTreeToJobUid(this.submissionDir);
       // tar --no-same-permissions only umasks archived modes; it never ADDS
       // access, so a prior run's `chmod 000` on any dir/file survives extraction
@@ -1222,6 +1245,14 @@ export class Job {
       for (const name of SNAPSHOT_PRUNE_DIRS) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }
+      // Drop symlinks before sizing AND archiving. A symlink with a long target
+      // or long path makes GNU tar emit extra longlink/PAX blocks the estimator
+      // below can't account for (it charges one 512-byte header per link), so a
+      // user could pass the pre-archive cap yet force a much larger tarball onto
+      // runner disk. Symlinks are also stripped on restore, so they never carry
+      // forward regardless -- excluding them here loses nothing and keeps the
+      // size estimate exact.
+      await this.stripSymlinks(this.submissionDir);
       // Bound the aggregate size so a huge workspace can't make the runner
       // materialize a multi-GB tar in /tmp and fill host disk.
       const approxBytes = await this.dirSizeBytes(this.submissionDir);
@@ -1357,11 +1388,15 @@ export class Job {
   }
 
   /**
-   * Recursively remove symlinks from a restored tree. `readdir(withFileTypes)`
-   * reports the entry's own type (lstat semantics), so symlinks are detected
-   * without being followed and directories are recursed into.
+   * Recursively remove symlinks from a tree. `readdir(withFileTypes)` reports the
+   * entry's own type (lstat semantics), so symlinks are detected without being
+   * followed and directories are recursed into. Used both when restoring (a prior
+   * run must not reintroduce a symlink that writeFile would follow outside the
+   * workspace) and when persisting (a symlink with a long target makes tar emit
+   * GNU longlink/PAX blocks the size estimator can't see, so it must not survive
+   * into the archive -- and symlinks never round-trip through a restore anyway).
    */
-  private async stripRestoredSymlinks(dir: string): Promise<void> {
+  private async stripSymlinks(dir: string): Promise<void> {
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
@@ -1373,7 +1408,7 @@ export class Job {
       if (entry.isSymbolicLink()) {
         await fsp.rm(full, { force: true }).catch(() => { /* best effort */ });
       } else if (entry.isDirectory()) {
-        await this.stripRestoredSymlinks(full);
+        await this.stripSymlinks(full);
       }
     }
   }
