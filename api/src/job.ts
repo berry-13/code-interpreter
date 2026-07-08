@@ -1108,20 +1108,37 @@ export class Job {
   }
 
   /**
-   * On a failed input download, remove a restored persistent-session file left
-   * at the same path (and its output-walk baseline) so the run doesn't observe
-   * stale bytes in place of the current, unavailable input. No-op unless the
-   * path was a restored carry-over.
+   * On a failed input download, remove a restored persistent-session file (or
+   * directory) left at the same path (and its output-walk baseline) so the run
+   * doesn't observe stale bytes in place of the current, unavailable input.
+   * No-op unless the path was a restored carry-over.
    */
   private async discardStaleRestoredInput(name: string): Promise<void> {
     const info = this.inputFileHashes.get(name);
-    if (!info?.restored || !info.path) return;
-    try {
-      await fsp.rm(info.path, { force: true });
-    } catch (err) {
-      this.log.warn({ file: name, err }, 'Failed to remove stale restored input after download failure');
+    if (info?.restored && info.path) {
+      try {
+        await fsp.rm(info.path, { force: true });
+      } catch (err) {
+        this.log.warn({ file: name, err }, 'Failed to remove stale restored input after download failure');
+      }
+      this.inputFileHashes.delete(name);
+      return;
     }
-    this.inputFileHashes.delete(name);
+    // registerRestoredBaseline recurses into restored directories and keys each
+    // leaf file by its relative path -- the directory itself never gets its own
+    // `inputFileHashes` entry. Detect that case via a restored child under
+    // `name/` so a restored directory at this path is also discarded.
+    const prefix = `${name}/`;
+    const hasRestoredChild = [...this.inputFileHashes.keys()].some((key) => key.startsWith(prefix));
+    if (!hasRestoredChild) return;
+    try {
+      await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true });
+    } catch (err) {
+      this.log.warn({ file: name, err }, 'Failed to remove stale restored input directory after download failure');
+    }
+    for (const key of [...this.inputFileHashes.keys()]) {
+      if (key.startsWith(prefix)) this.inputFileHashes.delete(key);
+    }
   }
 
   /**
@@ -1272,13 +1289,16 @@ export class Job {
       for (const name of SNAPSHOT_PRUNE_DIRS) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }
-      // Drop symlinks before sizing AND archiving. A symlink with a long target
-      // or long path makes GNU tar emit extra longlink/PAX blocks the estimator
-      // below can't account for (it charges one 512-byte header per link), so a
-      // user could pass the pre-archive cap yet force a much larger tarball onto
-      // runner disk. Symlinks are also stripped on restore, so they never carry
-      // forward regardless -- excluding them here loses nothing and keeps the
-      // size estimate exact.
+      // Drop symlinks and special files (FIFOs, sockets, device nodes) before
+      // sizing AND archiving. A symlink with a long target or long path makes
+      // GNU tar emit extra longlink/PAX blocks the estimator below can't
+      // account for, and FIFOs/sockets/devices aren't counted by the estimator
+      // at all (it only charges directories, files, and symlinks) despite each
+      // still costing tar a full 512-byte header -- either way a user could
+      // pass the pre-archive cap yet force a larger tarball onto runner disk.
+      // All of these are also stripped on restore, so they never carry forward
+      // regardless -- excluding them here loses nothing and keeps the size
+      // estimate exact.
       await this.stripSymlinks(this.submissionDir);
       // Bound the aggregate size so a huge workspace can't make the runner
       // materialize a multi-GB tar in /tmp and fill host disk.
@@ -1415,13 +1435,17 @@ export class Job {
   }
 
   /**
-   * Recursively remove symlinks from a tree. `readdir(withFileTypes)` reports the
-   * entry's own type (lstat semantics), so symlinks are detected without being
-   * followed and directories are recursed into. Used both when restoring (a prior
-   * run must not reintroduce a symlink that writeFile would follow outside the
-   * workspace) and when persisting (a symlink with a long target makes tar emit
-   * GNU longlink/PAX blocks the size estimator can't see, so it must not survive
-   * into the archive -- and symlinks never round-trip through a restore anyway).
+   * Recursively remove symlinks and special files (FIFOs, sockets, device
+   * nodes) from a tree. `readdir(withFileTypes)` reports the entry's own type
+   * (lstat semantics), so these are detected without following symlinks, and
+   * directories are recursed into. Used both when restoring (a prior run must
+   * not reintroduce a symlink that writeFile would follow outside the
+   * workspace, or a FIFO/device that a later run could hang opening) and when
+   * persisting (any of these makes tar emit header/longlink content the size
+   * estimator below doesn't model -- a symlink with a long target adds extra
+   * longlink/PAX blocks, and a FIFO/socket/device still costs a full 512-byte
+   * header despite carrying no file content -- so they must not survive into
+   * the archive; none of them round-trip through a restore anyway).
    */
   private async stripSymlinks(dir: string): Promise<void> {
     let entries: fs.Dirent[];
@@ -1432,10 +1456,12 @@ export class Job {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) {
-        await fsp.rm(full, { force: true }).catch(() => { /* best effort */ });
-      } else if (entry.isDirectory()) {
+      if (entry.isDirectory()) {
         await this.stripSymlinks(full);
+      } else if (!entry.isFile()) {
+        // Symlink, FIFO, socket, or block/char device -- none are safe or
+        // sized by the estimator; drop them all.
+        await fsp.rm(full, { force: true }).catch(() => { /* best effort */ });
       }
     }
   }

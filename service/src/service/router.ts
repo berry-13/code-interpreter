@@ -414,11 +414,15 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         // live check that superseded snapshot would leak. The pointer only ever
         // moves to fresh session ids and never back, so once it != the prior
         // snapshot no future run can restore from it or re-take a ref, making the
-        // delete safe. A GET failure stays conservative (keep the snapshot).
+        // delete safe. A GET failure, or a missing key (pointer TTL lapsed
+        // without ever being replaced -- e.g. a continuation restored the prior
+        // snapshot and then failed to persist a replacement), both stay
+        // conservative (keep the snapshot): only a live pointer that actually
+        // names a *different* session proves supersession.
         const currentPointer = await connection
           .get(sessionStatePointerKey(sessionKey))
           .catch(() => priorSnapshotSession);
-        if (currentPointer !== priorSnapshotSession) {
+        if (currentPointer && currentPointer !== priorSnapshotSession) {
           deleteSessionSnapshot(priorSnapshotSession);
         }
       }
