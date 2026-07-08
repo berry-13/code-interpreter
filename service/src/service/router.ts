@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid';
 import { Router } from 'express';
 import type { Response } from 'express';
 import type { Readable } from 'stream';
+import type { Job, QueueEvents } from 'bullmq';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
 import { sessionAuth } from '../middleware/auth';
@@ -152,6 +153,12 @@ async function casAdvanceSessionPointer(
   return result === 1;
 }
 
+/* Bound on both the snapshot ref key's own TTL and how long the `finally`
+ * block below will keep waiting for a still-queued job before giving up and
+ * releasing the ref anyway -- past max run time + a generous queue-wait
+ * margin, so neither a crash nor a backed-up queue can hold a ref forever. */
+const SNAPSHOT_REF_TTL_SECONDS = Math.ceil(env.JOB_TIMEOUT / 1000) + 60;
+
 /** Fire-and-forget delete of a session's hidden snapshot object. */
 function deleteSessionSnapshot(outputSession: string): void {
   axios.delete(
@@ -228,6 +235,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   let priorSnapshotSession: string | null = null;
   let snapshotRefKey: string | null = null;
   let pointerAdvanced = false;
+  // Hoisted out of the try block so `finally` can wait on the job's actual
+  // terminal state (not just this request's own wait) before releasing its
+  // snapshot ref -- see the finally block below.
+  let job: Job<t.JobData, t.JobResult, Jobs.execute> | undefined;
+  let queueEvents: QueueEvents | undefined;
 
   try {
     if (!isSyntheticRequest) {
@@ -280,7 +292,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         snapshotRefKey = `snapshotrefs:${priorSnapshotSession}`;
         await connection.multi()
           .incr(snapshotRefKey)
-          .expire(snapshotRefKey, Math.ceil(env.JOB_TIMEOUT / 1000) + 60)
+          .expire(snapshotRefKey, SNAPSHOT_REF_TTL_SECONDS)
           .exec()
           .catch(() => { /* best effort; delete path also guards on advance */ });
         rawPayload.persist_session.restore_session_id = priorSnapshotSession;
@@ -302,10 +314,10 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     });
 
     const queue = language === Languages.py ? pyQueue : otherQueue;
-    const queueEvents = language === Languages.py ? pyQueueEvents : otherQueueEvents;
+    queueEvents = language === Languages.py ? pyQueueEvents : otherQueueEvents;
     const queueName = language === Languages.py ? 'python' : 'other';
 
-    const job = await withSpan('codeapi.job.enqueue', {
+    job = await withSpan('codeapi.job.enqueue', {
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
@@ -340,13 +352,18 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       });
     }, 'PRODUCER');
     jobsSubmitted.inc({ language });
+    // Narrowed local bindings: `job`/`queueEvents` are `let ... | undefined` so
+    // `finally` can use them after any early return, but that means TS can't
+    // narrow them across closures below (they're captured, not re-checked).
+    const currentJob = job;
+    const currentQueueEvents = queueEvents;
 
     req.on('close', async () => {
       try {
-        await job.remove();
-        logger.info(`[${INSTANCE_ID}] Job ${job.id} removed due to client disconnect`);
+        await currentJob.remove();
+        logger.info(`[${INSTANCE_ID}] Job ${currentJob.id} removed due to client disconnect`);
       } catch (error) {
-        logger.error(`[${INSTANCE_ID}] Error removing job ${job.id} on client disconnect:`, error);
+        logger.error(`[${INSTANCE_ID}] Error removing job ${currentJob.id} on client disconnect:`, error);
       }
     });
 
@@ -354,7 +371,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
-    }, () => job.waitUntilFinished(queueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+    }, () => currentJob.waitUntilFinished(currentQueueEvents, env.JOB_TIMEOUT), 'CONSUMER');
 
     /* Advance the persistent-session pointer only when the sandbox actually
      * wrote a fresh snapshot to this run's output session. On a skip (oversize
@@ -426,6 +443,21 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     // pointer has advanced past it AND no other in-flight run still holds a ref
     // (which would otherwise 404 its restore). Runs regardless of success/error.
     if (snapshotRefKey && priorSnapshotSession) {
+      if (job && queueEvents) {
+        // The wait above can reject (or this whole handler can throw) while the
+        // job itself is still queued/active -- e.g. the queue is backed up past
+        // JOB_TIMEOUT, so our own wait times out before the job even starts. If
+        // we released the ref anyway, a concurrent run that had already advanced
+        // the pointer could delete priorSnapshotSession before this still-queued
+        // job restores from it. Confirm the job has actually reached a terminal
+        // state first, waiting a bit longer if not -- safe to do here since the
+        // HTTP response was already sent above. Bounded by the same TTL margin
+        // as the ref key itself, so a stuck job can't hold this open forever.
+        const state = await job.getState().catch(() => 'unknown');
+        if (state !== 'completed' && state !== 'failed') {
+          await job.waitUntilFinished(queueEvents, SNAPSHOT_REF_TTL_SECONDS * 1000).catch(() => { /* released below regardless of outcome */ });
+        }
+      }
       const remaining = await connection.decr(snapshotRefKey).catch(() => 1);
       if (remaining <= 0 && priorSnapshotSession !== session_id) {
         // We're the last in-flight referencer. Delete the prior snapshot only if

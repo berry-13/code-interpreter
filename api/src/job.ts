@@ -1522,13 +1522,51 @@ export class Job {
     return total;
   }
 
-  /** Remove the current run's read-only input files (tracked in
-   *  `inputFileHashes`) so they are never captured in a session snapshot. */
+  /**
+   * Remove the current run's read-only input files (tracked in
+   * `inputFileHashes`) so they are never captured in a session snapshot, then
+   * prune any parent directory (e.g. `skill/`) left empty by that removal.
+   * Read-only inputs are the only thing that lived in those directories --
+   * `registerRestoredBaseline` only baselines leaf files, never the directory
+   * itself, so an empty dir surviving into the tar would come back on the
+   * *next* restore as a fresh, unbaselined empty directory. That run's output
+   * walk would then plant a `.dirkeep` for it (and re-trigger this same
+   * emptying/pruning), regenerating a `.dirkeep` output every run and
+   * crowding out real artifacts under `max_output_files`.
+   */
   private async removeReadOnlyInputs(): Promise<void> {
+    const emptiedDirs = new Set<string>();
     for (const info of this.inputFileHashes.values()) {
       if (info.readOnly && info.path) {
         await fsp.rm(info.path, { force: true }).catch(() => { /* best effort */ });
+        emptiedDirs.add(path.dirname(info.path));
       }
+    }
+    for (const dir of emptiedDirs) {
+      await this.pruneEmptyAncestors(dir);
+    }
+  }
+
+  /**
+   * Remove `dir` and each ancestor up to (but not including) `submissionDir`
+   * as long as each is empty, stopping at the first non-empty one. Best-effort.
+   */
+  private async pruneEmptyAncestors(dir: string): Promise<void> {
+    let cursor = dir;
+    while (cursor !== this.submissionDir && cursor.startsWith(this.submissionDir + path.sep)) {
+      let entries: string[];
+      try {
+        entries = await fsp.readdir(cursor);
+      } catch {
+        return;
+      }
+      if (entries.length > 0) return;
+      try {
+        await fsp.rmdir(cursor);
+      } catch {
+        return;
+      }
+      cursor = path.dirname(cursor);
     }
   }
 

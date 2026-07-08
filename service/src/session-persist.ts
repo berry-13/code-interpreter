@@ -129,9 +129,13 @@ if __name__ == '__mp_main__':
     # guard stays False. Forcing a '__main__' namespace here (as the primary path
     # does) would re-fire the guarded block in every child and multiprocessing
     # would raise the "started a process before bootstrapping is complete"
-    # RuntimeError. No restore/snapshot: the child is a transient worker, not the
-    # run whose namespace we persist, and its atexit could clobber the pickle.
-    exec(compile(_CA_SRC, '<user_code>', 'exec'), globals())
+    # RuntimeError. No atexit snapshot here: the child is a transient worker, not
+    # the run whose namespace we persist, and its atexit could clobber the
+    # pickle. State IS restored below, though: a function/class defined in a
+    # PRIOR run (and only reachable now via the persisted namespace, not this
+    # run's own source) can still be used as a multiprocessing target -- the
+    # child must resolve it via __main__.<name> the same way the parent does.
+    _ca_ns = globals()
 else:
     # Run user code in a real module registered as sys.modules['__main__'], not a
     # bare dict, so user-defined classes/functions pickle correctly (pickle
@@ -146,26 +150,29 @@ else:
     _ca_sys.modules['__main__'] = _ca_main
     _ca_ns = _ca_main.__dict__
 
-    if _ca_os.path.exists(_CA_STATE):
-        try:
-            with open(_CA_STATE, 'rb') as _ca_f:
-                _ca_state = _ca_pk.load(_ca_f)
-            # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
-            # Re-import module aliases by name first (so "import pandas as pd" in
-            # one cell leaves pd bound in the next), then restore pickled values.
-            if isinstance(_ca_state, dict) and _ca_state.get('__ca_v__') == 1:
-                for _ca_alias, _ca_modname in _ca_state.get('mods', {}).items():
-                    try:
-                        _ca_ns[_ca_alias] = _ca_importlib.import_module(_ca_modname)
-                    except Exception:
-                        pass
-                _ca_ns.update(_ca_state.get('ns', {}))
-            else:
-                _ca_ns.update(_ca_state)  # legacy raw-dict snapshot
-            _ca_ns['__name__'] = '__main__'
-        except Exception as _ca_e:
-            print('[session] state restore skipped: %r' % (_ca_e,), file=_ca_sys.stderr)
+if _ca_os.path.exists(_CA_STATE):
+    try:
+        with open(_CA_STATE, 'rb') as _ca_f:
+            _ca_state = _ca_pk.load(_ca_f)
+        # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
+        # Re-import module aliases by name first (so "import pandas as pd" in
+        # one cell leaves pd bound in the next), then restore pickled values.
+        if isinstance(_ca_state, dict) and _ca_state.get('__ca_v__') == 1:
+            for _ca_alias, _ca_modname in _ca_state.get('mods', {}).items():
+                try:
+                    _ca_ns[_ca_alias] = _ca_importlib.import_module(_ca_modname)
+                except Exception:
+                    pass
+            _ca_ns.update(_ca_state.get('ns', {}))
+        else:
+            _ca_ns.update(_ca_state)  # legacy raw-dict snapshot
+        _ca_ns['__name__'] = __name__  # preserve '__mp_main__' in spawn children
+    except Exception as _ca_e:
+        print('[session] state restore skipped: %r' % (_ca_e,), file=_ca_sys.stderr)
 
+if __name__ == '__mp_main__':
+    exec(compile(_CA_SRC, '<user_code>', 'exec'), _ca_ns)
+else:
     def _ca_snapshot():
         ok = {}
         mods = {}
