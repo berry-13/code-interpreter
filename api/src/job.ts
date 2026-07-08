@@ -1474,8 +1474,16 @@ export class Job {
    * Also charges each member the long-name record GNU tar prepends when its
    * stored path (`./<rel>`) overflows the ustar name/prefix fields, so long-
    * named or deeply nested files can't undercount the estimate either.
+   *
+   * `seenInodes` tracks `dev:ino` across the whole recursive walk: GNU tar
+   * (without `--hard-dereference`, not passed here) archives only the first
+   * path to a given inode with its content, and every subsequent hard link to
+   * that inode as a header-only link record (size 0). Without this, a
+   * workspace with multiple hard links to the same large file would be
+   * charged that file's content once per link and could be rejected as
+   * oversize even though the real tar comfortably fits under the cap.
    */
-  private async dirSizeBytes(dir: string): Promise<number> {
+  private async dirSizeBytes(dir: string, seenInodes: Set<string> = new Set()): Promise<number> {
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
@@ -1495,11 +1503,18 @@ export class Job {
       }
       if (entry.isDirectory()) {
         total += 512 + tarLongNameOverheadBytes(rel + '/'); // directory header
-        total += await this.dirSizeBytes(full);
+        total += await this.dirSizeBytes(full, seenInodes);
       } else if (entry.isFile()) {
         let size = 0;
         try {
-          size = (await fsp.stat(full)).size;
+          const st = await fsp.stat(full);
+          size = st.size;
+          const inodeKey = `${st.dev}:${st.ino}`;
+          if (seenInodes.has(inodeKey)) {
+            total += 512 + tarLongNameOverheadBytes(rel); // repeat hard link: header only
+            continue;
+          }
+          seenInodes.add(inodeKey);
         } catch { /* vanished mid-walk; ignore */ }
         total += 512 + Math.ceil(size / 512) * 512 + tarLongNameOverheadBytes(rel);
       }

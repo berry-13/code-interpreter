@@ -386,6 +386,28 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       } catch (error) {
         logger.error(`[${INSTANCE_ID}] Failed to advance session-state pointer:`, error);
       }
+    } else if (env.PERSIST_SESSIONS && priorSnapshotSession) {
+      // This run restored a prior snapshot but didn't write a fresh one (oversize
+      // workspace, upload failure, etc.). The comment above promises an active
+      // session's pointer never expires, but that's only true when a fresh
+      // snapshot advances it -- a session that stays over cap for longer than
+      // SESSION_STATE_TTL_SECONDS across consecutive skipped persists would
+      // otherwise have its pointer lapse and lose the last good snapshot even
+      // though it's still live. Refresh the TTL on the existing pointer instead.
+      // Reusing the CAS advance script with `next == expected == priorSnapshotSession`
+      // rewrites the same value (whether the key is still live or already
+      // expired) without ever clobbering a pointer a concurrent run has since
+      // advanced.
+      try {
+        await casAdvanceSessionPointer(
+          sessionStatePointerKey(sessionKey),
+          priorSnapshotSession,
+          priorSnapshotSession,
+          env.SESSION_STATE_TTL_SECONDS,
+        );
+      } catch (error) {
+        logger.error(`[${INSTANCE_ID}] Failed to refresh session-state pointer TTL:`, error);
+      }
     }
 
     if (!isSyntheticRequest) {
