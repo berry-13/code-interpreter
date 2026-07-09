@@ -254,22 +254,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       });
     }
 
-    const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
-    const rawPayload = createPayload({
-      req,
-      isPyPlot,
-      session_id,
-    });
-
     /* Persistent sessions (opt-in). Rendezvous on the caller's own auth-derived
-     * sessionKey via a Redis pointer to the previous run's output session:
-     *   - Mark the payload so the sandbox snapshots /mnt/data back to THIS run's
-     *     output session (the only session the egress grant lets it write).
-     *   - If a prior snapshot exists, inject it as a synthetic input file. Being
-     *     an input file, its storage_session_id flows into the manifest/grant
-     *     read_sessions + input_files, authorizing the sandbox to fetch it — no
-     *     file-server or Redis-auth change needed. Done before
-     *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
+     * sessionKey via a Redis pointer to the previous run's output session.
+     * The prior-snapshot lookup happens BEFORE isPyPlot/createPayload below
+     * (rather than after, as originally structured) because isPyPlot needs to
+     * know whether this is a continuation. */
     if (env.PERSIST_SESSIONS) {
       // Reserve every persistence artifact name: the state tar (identified in
       // the sandbox by name only, since egress masks file id/session) and the
@@ -280,11 +269,34 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       if (reservedInput) {
         return res.status(400).json({ error: `File name '${reservedInput.name}' is reserved when persistent sessions are enabled` });
       }
+      priorSnapshotSession = await connection.get(sessionStatePointerKey(sessionKey));
+    }
+
+    /* A continuation can reuse a `plt`/pyplot module alias restored from a
+     * prior run's namespace (session-persist.ts re-imports `mods` before user
+     * code runs) without this run's own source containing a literal
+     * `import matplotlib` -- e.g. run 1 imports it, run 2 only calls the
+     * restored `plt.plot(...); plt.show()`. Wrap unconditionally on any
+     * continuation so plt.show() still gets the save-as-PNG hook installed;
+     * the matplotlib.py template re-imports (and re-hooks) the same cached
+     * `sys.modules['matplotlib.pyplot']` object either way, so this is a
+     * no-op for runs that don't end up touching pyplot at all. */
+    const isPyPlot = language === Languages.py && (
+      code.includes('import matplotlib') || code.includes('import seaborn') || priorSnapshotSession !== null
+    );
+    const rawPayload = createPayload({
+      req,
+      isPyPlot,
+      session_id,
+    });
+
+    if (env.PERSIST_SESSIONS) {
+      // Mark the payload so the sandbox snapshots /mnt/data back to THIS run's
+      // output session (the only session the egress grant lets it write).
       rawPayload.persist_session = {
         file_id: SESSION_STATE_FILE_ID,
         filename: SESSION_STATE_TAR_FILENAME,
       };
-      priorSnapshotSession = await connection.get(sessionStatePointerKey(sessionKey));
       if (priorSnapshotSession) {
         // Hold a ref on the snapshot this run will restore from, so a concurrent
         // run that supersedes the pointer can't delete it before we prime. TTL
@@ -295,6 +307,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
           .expire(snapshotRefKey, SNAPSHOT_REF_TTL_SECONDS)
           .exec()
           .catch(() => { /* best effort; delete path also guards on advance */ });
+        // If a prior snapshot exists, inject it as a synthetic input file. Being
+        // an input file, its storage_session_id flows into the manifest/grant
+        // read_sessions + input_files, authorizing the sandbox to fetch it — no
+        // file-server or Redis-auth change needed. Done before
+        // prepareSandboxJobSecurity so it is covered by the signed manifest.
         rawPayload.persist_session.restore_session_id = priorSnapshotSession;
         rawPayload.files.push({
           id: SESSION_STATE_FILE_ID,

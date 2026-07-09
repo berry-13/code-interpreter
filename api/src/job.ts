@@ -1276,9 +1276,28 @@ export class Job {
 
     const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
     try {
-      // Physically prune everything the snapshot must not carry BEFORE measuring
-      // and archiving, so the pre-archive size check reflects exactly what the
-      // tar will contain (no --exclude divergence):
+      // Drop symlinks and special files (FIFOs, sockets, device nodes) FIRST,
+      // before any other pruning touches paths by name. Sandbox code (already
+      // finished running, but its on-disk output is untrusted) could have
+      // swapped a read-only input's directory -- e.g. `skill/` -- for a
+      // symlink pointing outside the workspace; if the read-only/prune-dir
+      // removal below ran first, resolving a path like `skill/foo.py` would
+      // follow that symlink through its intermediate `skill` component and
+      // delete/traverse outside `submissionDir`. Stripping all symlinks first
+      // (nothing else runs concurrently at this point -- the job has already
+      // finished) neutralizes that regardless of what removeReadOnlyInputs or
+      // SNAPSHOT_PRUNE_DIRS touches next. This also keeps the size estimate
+      // below exact: a symlink with a long target or long path makes GNU tar
+      // emit extra longlink/PAX blocks the estimator can't account for, and
+      // FIFOs/sockets/devices aren't counted by it at all despite each still
+      // costing tar a full 512-byte header -- either way a user could pass the
+      // pre-archive cap yet force a larger tarball onto runner disk. All of
+      // these are also stripped on restore, so they never carry forward
+      // regardless -- excluding them here loses nothing.
+      await this.stripSymlinks(this.submissionDir);
+      // Physically prune everything else the snapshot must not carry BEFORE
+      // measuring and archiving, so the pre-archive size check reflects
+      // exactly what the tar will contain (no --exclude divergence):
       //  - read-only inputs (skill/infra): persisting them would re-materialize
       //    an authorized-once resource on later runs, and restore chowns the
       //    tree to the job UID, stripping their read-only protection;
@@ -1289,17 +1308,6 @@ export class Job {
       for (const name of SNAPSHOT_PRUNE_DIRS) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }
-      // Drop symlinks and special files (FIFOs, sockets, device nodes) before
-      // sizing AND archiving. A symlink with a long target or long path makes
-      // GNU tar emit extra longlink/PAX blocks the estimator below can't
-      // account for, and FIFOs/sockets/devices aren't counted by the estimator
-      // at all (it only charges directories, files, and symlinks) despite each
-      // still costing tar a full 512-byte header -- either way a user could
-      // pass the pre-archive cap yet force a larger tarball onto runner disk.
-      // All of these are also stripped on restore, so they never carry forward
-      // regardless -- excluding them here loses nothing and keeps the size
-      // estimate exact.
-      await this.stripSymlinks(this.submissionDir);
       // Bound the aggregate size so a huge workspace can't make the runner
       // materialize a multi-GB tar in /tmp and fill host disk.
       const approxBytes = await this.dirSizeBytes(this.submissionDir);
@@ -1538,7 +1546,14 @@ export class Job {
     const emptiedDirs = new Set<string>();
     for (const info of this.inputFileHashes.values()) {
       if (info.readOnly && info.path) {
-        await fsp.rm(info.path, { force: true }).catch(() => { /* best effort */ });
+        // Recursive: sandbox code could have replaced the read-only path with
+        // a directory (e.g. `rm foo.py; mkdir foo.py`). A non-recursive rm
+        // throws EISDIR on that -- `force` only swallows ENOENT, so it would
+        // otherwise leave that (now user-controlled) directory to persist into
+        // the snapshot under a path meant to be stripped as read-only
+        // infrastructure. stripSymlinks already ran before this, so there's no
+        // symlink left in `info.path` for a recursive removal to follow.
+        await fsp.rm(info.path, { recursive: true, force: true }).catch(() => { /* best effort */ });
         emptiedDirs.add(path.dirname(info.path));
       }
     }
