@@ -37,7 +37,21 @@ export const SESSION_STATE_TAR_FILENAME = 'session-workspace.tar';
  * last run that produced a snapshot. This is the cross-call rendezvous: the
  * next run reads it to authorize + fetch the prior snapshot. Refreshed (with
  * `SESSION_STATE_TTL_SECONDS`) on every successful persist, so an active
- * session never expires and an abandoned one is collected when the key lapses.
+ * session's pointer never expires.
+ *
+ * KNOWN GAP: an abandoned session's pointer key lapsing (TTL expiry) only
+ * removes this Redis key -- it does NOT delete the snapshot object the
+ * pointer referenced. `deleteSessionSnapshot` only ever runs on explicit
+ * supersession (a newer run's CAS-advance draining the last ref on the old
+ * one), which never happens for a session nobody calls again. Every
+ * abandoned session therefore leaves its last snapshot tar in object storage
+ * indefinitely. Closing this needs either an in-process sweep (a companion,
+ * longer-TTL tracker key per session, scanned periodically, comparing
+ * against whether the real pointer still exists -- mirroring the janitor
+ * pattern in service/src/service/programmatic-router.ts +
+ * replay-state.ts's `cleanupStaleExecutions`/`scanKeys`) or an object
+ * lifecycle policy on the underlying bucket/prefix, which is entirely a
+ * file-server/storage deployment concern outside this repo.
  */
 export function sessionStatePointerKey(sessionKey: string): string {
   return `sessionstate:${sessionKey}`;
@@ -133,6 +147,7 @@ const PYTHON_SESSION_WRAPPER = String.raw`import sys as _ca_sys
 # resolving their own /mnt/data modules exactly as before.
 _ca_saved_path = list(_ca_sys.path)
 _ca_sys.path[:] = [_ca_p for _ca_p in _ca_sys.path if _ca_p not in ('', '/mnt/data')]
+_ca_preexisting_mods = set(_ca_sys.modules.keys())
 import os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib
 try:
     import dill as _ca_pk
@@ -141,6 +156,17 @@ except Exception:
     import pickle as _ca_pk
     _ca_using_dill = False
 _ca_sys.path[:] = _ca_saved_path
+# We already hold our own references (_ca_os, _ca_b64, ...), so evict any of
+# THESE SPECIFIC names that this import just newly added to sys.modules
+# (some, like types/io, are typically already cached by CPython's own
+# startup and stay put; others, like base64, typically aren't). Otherwise a
+# later plain "import base64" in user code -- now with /mnt/data restored to
+# sys.path -- would still hit the module WE loaded while the workspace was
+# hidden, rather than performing a fresh lookup that lets a legitimate
+# workspace base64.py shadow it, exactly as it would without persistence.
+for _ca_modname in ('os', 'atexit', 'base64', 'linecache', 'types', 'io', 'importlib', 'dill', 'pickle'):
+    if _ca_modname not in _ca_preexisting_mods:
+        _ca_sys.modules.pop(_ca_modname, None)
 
 _CA_STATE = '/mnt/data/.session_state.pkl'
 _CA_SRC = _ca_b64.b64decode('__USERCODE_B64__').decode('utf-8')
@@ -218,6 +244,27 @@ else:
         def _ca_snapshot():
             ok = {}
             mods = {}
+            # Without dill, dumps() alone can't tell whether a value will
+            # actually survive a restore. Stdlib pickle serializes a
+            # top-level function/class BY REFERENCE (__main__.<name>), and
+            # that reference genuinely resolves right now, mid-run -- but
+            # ALSO serializes anything that transitively contains one (a
+            # class instance, a list of instances, a dict of them, ...) the
+            # same way. On the next run, restore happens BEFORE user code
+            # re-defines those names, so pickle.load() hits a missing
+            # __main__ attribute and raises -- aborting the WHOLE pickle
+            # stream and dropping every other value in the same snapshot,
+            # simple variables included. dill serializes these by value
+            # instead, so it doesn't share the failure mode; only the
+            # plain-pickle fallback needs the extra check. Round-tripping
+            # through a scratch stand-in __main__ (swapped in only for this
+            # probe; nothing else runs while it's briefly in place)
+            # reproduces exactly what the next run's fresh, not-yet-populated
+            # __main__ will see, so it catches every shape of this failure in
+            # one general check instead of enumerating types.
+            _ca_probe_main = None if _ca_using_dill else _ca_types.ModuleType('__main__')
+            if _ca_probe_main is not None:
+                _ca_probe_main.__dict__['__builtins__'] = __builtins__
             for k, v in list(_ca_ns.items()):
                 if k.startswith('_'):
                     continue
@@ -237,22 +284,19 @@ else:
                 # fail dumps below and are dropped there.)
                 if isinstance(v, _ca_io.IOBase):
                     continue
-                # Without dill, a user-defined top-level function/class passes
-                # this dumps() probe (stdlib pickle pickles them BY REFERENCE,
-                # and the reference -- __main__.<name> -- genuinely resolves
-                # right now, mid-run) but fails on restore: the next run's
-                # fake __main__ doesn't have that attribute yet (state is
-                # restored BEFORE user code re-defines it), so pickle.load()
-                # raises partway through and the whole namespace -- simple
-                # variables included -- is dropped by the outer catch below.
-                # dill instead serializes these by value, so it doesn't share
-                # this failure mode; only pickle needs the extra exclusion.
-                if not _ca_using_dill and isinstance(v, (_ca_types.FunctionType, type)):
-                    continue
                 try:
-                    _ca_pk.dumps(v)
+                    _ca_blob = _ca_pk.dumps(v)
                 except Exception:
                     continue
+                if _ca_probe_main is not None:
+                    _ca_real_main = _ca_sys.modules.get('__main__')
+                    _ca_sys.modules['__main__'] = _ca_probe_main
+                    try:
+                        _ca_pk.loads(_ca_blob)
+                    except Exception:
+                        continue
+                    finally:
+                        _ca_sys.modules['__main__'] = _ca_real_main
                 ok[k] = v
             try:
                 tmp = _CA_STATE + '.tmp'
@@ -263,6 +307,21 @@ else:
                 print('[session] state snapshot skipped: %r' % (e,), file=_ca_sys.stderr)
 
         _ca_atexit.register(_ca_snapshot)
+        # A raw os.fork() (unlike multiprocessing's spawn/forkserver, already
+        # handled above) duplicates the WHOLE process, atexit registry
+        # included: the child inherits this exact registration. If the child
+        # later exits normally (not via os._exit/a signal), its own interpreter
+        # shutdown would run _ca_snapshot() too, using its own copy-on-write
+        # _ca_ns -- a snapshot of a DIFFERENT, divergent execution than the
+        # parent's, capable of overwriting the parent's real final state if
+        # the child's write lands after it. Unregister the hook in the child
+        # only, right after the fork -- the parent keeps it untouched, so only
+        # the one process whose namespace this snapshot actually describes
+        # ever persists it.
+        try:
+            _ca_os.register_at_fork(after_in_child=lambda: _ca_atexit.unregister(_ca_snapshot))
+        except (AttributeError, ValueError):
+            pass  # register_at_fork is POSIX-only; not expected to be missing here
 
         exec(compile(_CA_SRC, '<user_code>', 'exec'), _ca_ns)
 `;

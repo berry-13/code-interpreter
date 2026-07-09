@@ -174,6 +174,71 @@ run_as('not_main')
     expect(out).not.toContain('evil base64.py imported!');
     expect(out.trim()).toBe('user code ran');
   });
+
+  test('user code can still shadow a bootstrap stdlib module with its own workspace file', () => {
+    // The bootstrap's own imports run with the workspace hidden from
+    // sys.path (see the fix above), but that must not leave the REAL base64
+    // permanently cached in sys.modules once the workspace is restored --
+    // otherwise a later plain `import base64` in user code would keep
+    // hitting the module the bootstrap loaded, instead of a legitimate
+    // /mnt/data/base64.py the user actually shipped, silently breaking an
+    // import that would have worked fine without persistence enabled.
+    const wrapped = wrapPythonForSessionPersistence(
+      "import base64\nprint('marker:', getattr(base64, 'MARKER', None))\n",
+      'main.py',
+    );
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-session-usershadow-test-'));
+    fs.writeFileSync(path.join(dir, 'base64.py'), "MARKER = 'this is the workspace copy'\n");
+    const wrapperPath = path.join(dir, 'main.py');
+    fs.writeFileSync(wrapperPath, wrapped.replace(/\/mnt\/data/g, dir));
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('python3', [wrapperPath], { encoding: 'utf8', cwd: dir });
+    expect(out.trim()).toBe('marker: this is the workspace copy');
+  });
+
+  test('an orphaned os.fork() child that outlives the parent does not overwrite the parent\'s persisted state', () => {
+    // A raw os.fork() (unlike multiprocessing spawn/forkserver, already
+    // handled separately) duplicates the whole process, atexit registry
+    // included. If the parent exits without waiting for the child, and the
+    // child later diverges its own copy of a variable before exiting
+    // normally, the child's own atexit-triggered snapshot -- landing AFTER
+    // the parent's -- would silently overwrite the parent's correct final
+    // state with the child's stale/divergent one.
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const { execFileSync } = require('child_process');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-session-fork-test-'));
+
+    const run1 = wrapPythonForSessionPersistence(
+      [
+        'import os, sys, time',
+        "x = 'parent-value'",
+        'pid = os.fork()',
+        'if pid == 0:',
+        '    time.sleep(0.3)',
+        "    x = 'CHILD-CORRUPTED-VALUE'",
+        '    sys.exit(0)',
+        'else:',
+        "    print('parent done')",
+      ].join('\n'),
+      'main.py',
+    );
+    fs.writeFileSync(path.join(dir, 'main.py'), run1.replace(/\/mnt\/data/g, dir));
+    execFileSync('python3', [path.join(dir, 'main.py')], { encoding: 'utf8', cwd: dir });
+    // Give the orphaned background child time to wake up, diverge, and exit
+    // (well past its 0.3s sleep) before the next run reads the snapshot.
+    execFileSync('sleep', ['0.6']);
+
+    const run2 = wrapPythonForSessionPersistence("print('restored x =', x)", 'main.py');
+    fs.writeFileSync(path.join(dir, 'main.py'), run2.replace(/\/mnt\/data/g, dir));
+    const out = execFileSync('python3', [path.join(dir, 'main.py')], { encoding: 'utf8', cwd: dir });
+
+    expect(out.trim()).toBe('restored x = parent-value');
+  });
 });
 
 describe('reserved constants', () => {

@@ -266,6 +266,14 @@ input downloads and output uploads — user code still has no network.
   sets `persist_session` or wraps the code for restore/snapshot. With
   `CODEAPI_PERSIST_SESSIONS=true`, calls through those routes still get a cold
   workspace and namespace every time; only the plain `/v1/exec` route persists.
+- **Abandoned sessions leak their last snapshot object.** The Redis pointer
+  that maps a session to its snapshot expires on its own (`SESSION_STATE_TTL_SECONDS`)
+  when nobody calls back, but expiry only removes that Redis key — it does not
+  delete the snapshot tar the pointer referenced in object storage, since
+  deletion today only runs on explicit supersession by a newer run. A session
+  that's never revisited leaves its last snapshot in storage indefinitely.
+  Mitigate with an object lifecycle/expiry policy on the underlying storage
+  bucket/prefix until an in-process cleanup sweep is added.
 
 Tuning: `CODEAPI_SESSION_STATE_MAX_BYTES` caps the snapshot (oversize snapshots
 are skipped, the run still succeeds); `CODEAPI_SESSION_STATE_TTL_SECONDS` is the

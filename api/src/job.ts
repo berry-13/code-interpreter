@@ -1592,10 +1592,17 @@ export class Job {
         total += 512 + tarLongNameOverheadBytes(rel); // header only
         continue;
       }
-      if (entry.isDirectory()) {
+      // classifyDirent falls back to lstat on DT_UNKNOWN (some NFS/FUSE/
+      // overlay mounts), same as stripSymlinks above -- without it, both
+      // isDirectory() and isFile() report false for such an entry, and an
+      // ordinary file/directory would silently contribute 0 to the estimate,
+      // letting an oversized workspace reach the real `tar -cf` invocation
+      // before the post-archive size check catches it.
+      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      if (kind === 'dir') {
         total += 512 + tarLongNameOverheadBytes(rel + '/'); // directory header
         total += await this.dirSizeBytes(full, seenInodes);
-      } else if (entry.isFile()) {
+      } else if (kind === 'file') {
         let size = 0;
         try {
           const st = await fsp.stat(full);

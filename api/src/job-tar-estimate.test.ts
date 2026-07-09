@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -106,5 +107,38 @@ describe('Job.dirSizeBytes hard-link accounting', () => {
     const total = await asDirSizeInternals(job).dirSizeBytes(tmpDir, seenInodes);
 
     expect(total).toBe(512);
+  });
+});
+
+describe('Job.dirSizeBytes DT_UNKNOWN fallback', () => {
+  it('still counts an ordinary file and recurses into an ordinary directory reported as DT_UNKNOWN', async () => {
+    // `fs.Dirent.isDirectory`/`isFile` live on the shared prototype (see
+    // stripSymlinks' equivalent test); patching them for this test forces
+    // every dirent dirSizeBytes' own readdir() returns to report DT_UNKNOWN,
+    // reproducing what some NFS/FUSE/overlay mounts actually return.
+    // Without the classifyDirent lstat fallback, both would silently
+    // contribute 0 to the estimate instead of their real tar overhead.
+    await fsp.writeFile(path.join(tmpDir, 'unknown-file.txt'), 'hello');
+    await fsp.mkdir(path.join(tmpDir, 'unknown-dir'));
+    await fsp.writeFile(path.join(tmpDir, 'unknown-dir', 'inside.bin'), 'x'.repeat(10));
+
+    const origIsDirectory = fs.Dirent.prototype.isDirectory;
+    const origIsFile = fs.Dirent.prototype.isFile;
+    fs.Dirent.prototype.isDirectory = function () { return false; };
+    fs.Dirent.prototype.isFile = function () { return false; };
+    let total: number;
+    try {
+      const job = makeJob();
+      total = await asDirSizeInternals(job).dirSizeBytes(tmpDir);
+    } finally {
+      fs.Dirent.prototype.isDirectory = origIsDirectory;
+      fs.Dirent.prototype.isFile = origIsFile;
+    }
+
+    // unknown-file.txt: header + 1 content block (512, "hello" fits in one
+    // block). unknown-dir/: header only, plus its own recursion for
+    // inside.bin: header + 1 content block.
+    const expected = (512 + 512) + (512 + (512 + 512));
+    expect(total).toBe(expected);
   });
 });

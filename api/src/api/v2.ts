@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import type { Runtime } from '../runtime';
 import type { TFile } from '../job';
+import type { NsJailResult } from '../nsjail';
 import { getLatestRuntimeMatchingLanguageVersion, getRuntimes } from '../runtime';
 import { logger } from '../logger';
 import { config } from '../config';
@@ -257,6 +258,19 @@ function validateConstraints(body: ExecuteRequestBody, rt: Runtime): void {
   }
 }
 
+/**
+ * True when the run step ended via a signal (SIGKILL from a timeout, or any
+ * other signal death) rather than a normal Python exit. The persisted-session
+ * atexit snapshot only runs on normal interpreter shutdown (clean exit OR an
+ * uncaught exception -- both still process atexit); a signal kill bypasses
+ * it entirely, so `.session_state.pkl` on disk is stale (from the prior run,
+ * not this one) even though ordinary file writes this run made before being
+ * killed are not buffered and would still be captured by a persist.
+ */
+export function wasKilledBySignal(run: NsJailResult | undefined): boolean {
+  return Boolean(run?.signal);
+}
+
 function manifestErrorStatus(error: ExecutionManifestError): number {
   if (error.reason === 'missing_secret') return 500;
   if (error.reason === 'missing_header') return 401;
@@ -415,14 +429,32 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       /* Persistent sessions: snapshot the workspace (files + dill namespace)
        * back to the current output session. No-op unless a persist_session
        * marker is set; always non-fatal. The service advances the
-       * `sessionstate:<sessionKey>` Redis pointer only when this returns true. */
-      result.session_state_persisted = await withSpan('codeapi.sandbox.persist_session', {
-        'codeapi.language': job.runtime.language,
-      }, () => job!.persistSessionState())
-        .catch((err) => {
-          logger.error({ job: job!.uuid, err }, 'Session persist failed');
-          return false;
-        });
+       * `sessionstate:<sessionKey>` Redis pointer only when this returns true.
+       *
+       * Skip entirely when the run was killed by a signal (timeout -> SIGKILL,
+       * or any other signal death): the Python wrapper's snapshot runs from
+       * `atexit`, which a signal kill never reaches, so `.session_state.pkl`
+       * on disk is whatever the LAST successful run left there -- stale, not
+       * this run's -- while ordinary file writes this run made before being
+       * killed (including a mid-write, truncated file) are NOT buffered and
+       * WOULD still land in the tar. Persisting that mix would advance the
+       * session pointer to a torn snapshot: files reflecting the killed run,
+       * variables reflecting the run before it. Leaving the pointer on the
+       * last good snapshot (as any other skipped persist already does) is
+       * safer than manufacturing a snapshot no single run ever produced. A
+       * plain nonzero exit (an uncaught exception, or the user's own
+       * `sys.exit(n)`) still runs atexit normally and is not skipped here. */
+      if (wasKilledBySignal(result.run)) {
+        result.session_state_persisted = false;
+      } else {
+        result.session_state_persisted = await withSpan('codeapi.sandbox.persist_session', {
+          'codeapi.language': job.runtime.language,
+        }, () => job!.persistSessionState())
+          .catch((err) => {
+            logger.error({ job: job!.uuid, err }, 'Session persist failed');
+            return false;
+          });
+      }
 
       metricsOutcome = 'success';
       return res.status(200).json(result);
