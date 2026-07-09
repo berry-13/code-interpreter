@@ -153,6 +153,35 @@ async function casAdvanceSessionPointer(
   return result === 1;
 }
 
+/* Reads the session pointer and claims a ref on whatever snapshot it names, in
+ * one Redis round trip. A plain GET followed by a separate INCR (two round
+ * trips) leaves a window where a concurrent run's own finishing sequence --
+ * CAS-advance the pointer past this snapshot, then decrement its ref to zero
+ * and delete it -- can complete entirely in between: this run's GET would
+ * have already returned the now-deleted snapshot id, and its later INCR would
+ * claim a ref on an object that's gone, so its restore 404s and the run
+ * silently starts from an empty workspace. Folding both into one script
+ * closes the window: Redis serializes all commands from all clients, so
+ * either this claim lands before the other run's DECR (which then sees the
+ * live ref and skips the delete) or after its CAS-advance (in which case this
+ * run reads the already-advanced pointer, never claiming the stale id at
+ * all). */
+const CLAIM_PRIOR_SNAPSHOT_REF = `
+local cur = redis.call('GET', KEYS[1])
+if cur then
+  local refKey = 'snapshotrefs:' .. cur
+  redis.call('INCR', refKey)
+  redis.call('EXPIRE', refKey, ARGV[1])
+end
+return cur`;
+
+/** Returns the session pointer's current snapshot id (or null if unset),
+ *  having atomically claimed a ref on it in the same call. */
+async function claimPriorSnapshotRef(pointerKey: string, refTtlSeconds: number): Promise<string | null> {
+  const result = await connection.eval(CLAIM_PRIOR_SNAPSHOT_REF, 1, pointerKey, String(refTtlSeconds));
+  return typeof result === 'string' && result.length > 0 ? result : null;
+}
+
 /* Bound on both the snapshot ref key's own TTL and how long the `finally`
  * block below will keep waiting for a still-queued job before giving up and
  * releasing the ref anyway -- past max run time + a generous queue-wait
@@ -299,17 +328,14 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         file_id: SESSION_STATE_FILE_ID,
         filename: SESSION_STATE_TAR_FILENAME,
       };
-      priorSnapshotSession = await connection.get(sessionStatePointerKey(sessionKey));
+      // Reads the pointer and claims a ref on the snapshot it names in one
+      // atomic call, so a concurrent run's finish sequence can't advance past
+      // and delete that snapshot in the gap between reading and claiming it
+      // (see claimPriorSnapshotRef). TTL bounds the ref past the max run +
+      // queue wait so a crash can't leak it.
+      priorSnapshotSession = await claimPriorSnapshotRef(sessionStatePointerKey(sessionKey), SNAPSHOT_REF_TTL_SECONDS);
       if (priorSnapshotSession) {
-        // Hold a ref on the snapshot this run will restore from, so a concurrent
-        // run that supersedes the pointer can't delete it before we prime. TTL
-        // bounds it past the max run + queue wait so a crash can't leak the ref.
         snapshotRefKey = `snapshotrefs:${priorSnapshotSession}`;
-        await connection.multi()
-          .incr(snapshotRefKey)
-          .expire(snapshotRefKey, SNAPSHOT_REF_TTL_SECONDS)
-          .exec()
-          .catch(() => { /* best effort; delete path also guards on advance */ });
         rawPayload.persist_session.restore_session_id = priorSnapshotSession;
         rawPayload.files.push({
           id: SESSION_STATE_FILE_ID,

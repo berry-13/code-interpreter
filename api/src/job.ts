@@ -1148,6 +1148,26 @@ export class Job {
       this.inputFileHashes.delete(name);
       return;
     }
+    // `name` itself has no restored entry, but a restored FILE at one of its
+    // ancestor path segments would block it just the same (e.g. a prior run
+    // left `data` as a file and this request supplies `data/file.csv`).
+    // registerRestoredBaseline only gives leaf files their own entry -- a
+    // directory never gets one -- so any ancestor segment present in the map
+    // is necessarily a restored non-directory.
+    const segments = name.split('/').filter(Boolean);
+    for (let i = segments.length - 1; i > 0; i--) {
+      const ancestor = segments.slice(0, i).join('/');
+      const ancestorInfo = this.inputFileHashes.get(ancestor);
+      if (ancestorInfo?.restored && ancestorInfo.path) {
+        try {
+          await fsp.rm(ancestorInfo.path, { force: true });
+        } catch (err) {
+          this.log.warn({ file: ancestor, err }, 'Failed to remove stale restored ancestor after download failure');
+        }
+        this.inputFileHashes.delete(ancestor);
+        return;
+      }
+    }
     // registerRestoredBaseline recurses into restored directories and keys each
     // leaf file by its relative path -- the directory itself never gets its own
     // `inputFileHashes` entry. Detect that case via a restored child under
