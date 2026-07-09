@@ -57,11 +57,19 @@ export const SESSION_RESERVED_BASENAMES: ReadonlySet<string> = new Set([
   `${SESSION_STATE_FILENAME}.tmp`,
 ]);
 
-/** True when `name`'s basename is a reserved session-state artifact. */
+/** Every `/`- or `\`-delimited segment of `name`, empty segments dropped. */
+function pathSegments(name: string): string[] {
+  return name.replace(/\\/g, '/').split('/').filter(Boolean);
+}
+
+/** True when any path segment of `name` (not just its basename) is a
+ *  reserved session-state artifact. Checking every segment -- not just
+ *  `.pop()` -- matters because a name like `.session_state.pkl/chunk` would
+ *  otherwise pass validation and stage a directory at the reserved path,
+ *  which the sandbox then can't replace with the actual pickle file. */
 export function isReservedSessionFilename(name: string): boolean {
   if (typeof name !== 'string' || name.length === 0) return false;
-  const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
-  return base !== undefined && SESSION_RESERVED_BASENAMES.has(base);
+  return pathSegments(name).some(segment => SESSION_RESERVED_BASENAMES.has(segment));
 }
 
 /**
@@ -74,9 +82,9 @@ export function isReservedSessionFilename(name: string): boolean {
  */
 export function isReservedSessionInputName(name: string): boolean {
   if (typeof name !== 'string' || name.length === 0) return false;
-  const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
-  if (base === undefined) return false;
-  return base === SESSION_STATE_TAR_FILENAME || SESSION_RESERVED_BASENAMES.has(base);
+  return pathSegments(name).some(
+    segment => segment === SESSION_STATE_TAR_FILENAME || SESSION_RESERVED_BASENAMES.has(segment),
+  );
 }
 
 /**
@@ -119,96 +127,113 @@ except Exception:
 _CA_SRC = _ca_b64.b64decode('__USERCODE_B64__').decode('utf-8')
 _ca_linecache.cache['<user_code>'] = (len(_CA_SRC), None, _CA_SRC.splitlines(True), '<user_code>')
 
-if __name__ == '__mp_main__':
-    # 'spawn'/'forkserver' multiprocessing re-imports this entry module in the
-    # child under the name __mp_main__ to rebuild top-level defs (the target
-    # function/class) WITHOUT re-running the user's "if __name__ == __main__"
-    # block. Run the user code in-place -- globals() is exactly the dict the
-    # bootstrap copies into the __mp_main__ module, so top-level defs land where
-    # multiprocessing resolves them -- and leave __name__ == '__mp_main__' so the
-    # guard stays False. Forcing a '__main__' namespace here (as the primary path
-    # does) would re-fire the guarded block in every child and multiprocessing
-    # would raise the "started a process before bootstrapping is complete"
-    # RuntimeError. No atexit snapshot here: the child is a transient worker, not
-    # the run whose namespace we persist, and its atexit could clobber the
-    # pickle. State IS restored below, though: a function/class defined in a
-    # PRIOR run (and only reachable now via the persisted namespace, not this
-    # run's own source) can still be used as a multiprocessing target -- the
-    # child must resolve it via __main__.<name> the same way the parent does.
-    _ca_ns = globals()
+if __name__ not in ('__main__', '__mp_main__'):
+    # Ordinary import of this wrapped entry file (e.g. user code does
+    # "import main" to reuse a function/class it defined earlier). Run in
+    # this module's own real globals, like any normal import -- no fake
+    # '__main__' namespace, no state restore, no atexit snapshot. Those all
+    # belong to the actual launch ('__main__') or a spawn/forkserver child
+    # ('__mp_main__'); re-arming them here would re-run the user's code a
+    # second time under a synthetic '__main__' identity (firing their
+    # "if __name__ == '__main__'" guard when it shouldn't) and register a
+    # second atexit snapshot that could race the real one.
+    exec(compile(_CA_SRC, '<user_code>', 'exec'), globals())
 else:
-    # Run user code in a real module registered as sys.modules['__main__'], not a
-    # bare dict, so user-defined classes/functions pickle correctly (pickle
-    # resolves them via __main__.<name>) and spawn-style multiprocessing can find
-    # them. Our own _ca_* helpers stay in the wrapper module's separate globals,
-    # so they never leak into the user namespace. ModuleType('__main__') seeds
-    # __name__ for us, so the "if __name__ == __main__" guard and the pyplot
-    # template still behave.
-    _ca_main = _ca_types.ModuleType('__main__')
-    _ca_main.__dict__['__builtins__'] = __builtins__
-    _ca_main.__dict__['__file__'] = '/mnt/data/__CA_ENTRY__'
-    _ca_sys.modules['__main__'] = _ca_main
-    _ca_ns = _ca_main.__dict__
+    if __name__ == '__mp_main__':
+        # 'spawn'/'forkserver' multiprocessing re-imports this entry module in
+        # the child under the name __mp_main__ to rebuild top-level defs (the
+        # target function/class) WITHOUT re-running the user's
+        # "if __name__ == __main__" block. Run the user code in-place --
+        # globals() is exactly the dict the bootstrap copies into the
+        # __mp_main__ module, so top-level defs land where multiprocessing
+        # resolves them -- and leave __name__ == '__mp_main__' so the guard
+        # stays False. Forcing a '__main__' namespace here (as the primary
+        # path does) would re-fire the guarded block in every child and
+        # multiprocessing would raise the "started a process before
+        # bootstrapping is complete" RuntimeError. No atexit snapshot here:
+        # the child is a transient worker, not the run whose namespace we
+        # persist, and its atexit could clobber the pickle. State IS restored
+        # below, though: a function/class defined in a PRIOR run (and only
+        # reachable now via the persisted namespace, not this run's own
+        # source) can still be used as a multiprocessing target -- the child
+        # must resolve it via __main__.<name> the same way the parent does.
+        _ca_ns = globals()
+    else:
+        # Run user code in a real module registered as sys.modules['__main__'],
+        # not a bare dict, so user-defined classes/functions pickle correctly
+        # (pickle resolves them via __main__.<name>) and spawn-style
+        # multiprocessing can find them. Our own _ca_* helpers stay in the
+        # wrapper module's separate globals, so they never leak into the user
+        # namespace. ModuleType('__main__') seeds __name__ for us, so the
+        # "if __name__ == __main__" guard and the pyplot template still behave.
+        _ca_main = _ca_types.ModuleType('__main__')
+        _ca_main.__dict__['__builtins__'] = __builtins__
+        _ca_main.__dict__['__file__'] = '/mnt/data/__CA_ENTRY__'
+        _ca_sys.modules['__main__'] = _ca_main
+        _ca_ns = _ca_main.__dict__
 
-if _ca_os.path.exists(_CA_STATE):
-    try:
-        with open(_CA_STATE, 'rb') as _ca_f:
-            _ca_state = _ca_pk.load(_ca_f)
-        # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
-        # Re-import module aliases by name first (so "import pandas as pd" in
-        # one cell leaves pd bound in the next), then restore pickled values.
-        if isinstance(_ca_state, dict) and _ca_state.get('__ca_v__') == 1:
-            for _ca_alias, _ca_modname in _ca_state.get('mods', {}).items():
-                try:
-                    _ca_ns[_ca_alias] = _ca_importlib.import_module(_ca_modname)
-                except Exception:
-                    pass
-            _ca_ns.update(_ca_state.get('ns', {}))
-        else:
-            _ca_ns.update(_ca_state)  # legacy raw-dict snapshot
-        _ca_ns['__name__'] = __name__  # preserve '__mp_main__' in spawn children
-    except Exception as _ca_e:
-        print('[session] state restore skipped: %r' % (_ca_e,), file=_ca_sys.stderr)
-
-if __name__ == '__mp_main__':
-    exec(compile(_CA_SRC, '<user_code>', 'exec'), _ca_ns)
-else:
-    def _ca_snapshot():
-        ok = {}
-        mods = {}
-        for k, v in list(_ca_ns.items()):
-            if k.startswith('_'):
-                continue
-            # Record module aliases by import name so they can be re-imported on
-            # the next run rather than lost (the advertised "namespace carries").
-            if isinstance(v, _ca_types.ModuleType):
-                name = getattr(v, '__name__', None)
-                if isinstance(name, str) and name:
-                    mods[k] = name
-                continue
-            # Skip open file handles. dill CAN pickle a file handle, but restoring
-            # one reopens the path in its original mode -- for a write handle that
-            # TRUNCATES the user's file on the next run. Excluding io objects keeps
-            # a leftover with-block file handle from wiping the file it wrote.
-            # (Sockets/threads/locks fail dumps below and are dropped there.)
-            if isinstance(v, _ca_io.IOBase):
-                continue
-            try:
-                _ca_pk.dumps(v)
-            except Exception:
-                continue
-            ok[k] = v
+    if _ca_os.path.exists(_CA_STATE):
         try:
-            tmp = _CA_STATE + '.tmp'
-            with open(tmp, 'wb') as f:
-                _ca_pk.dump({'__ca_v__': 1, 'ns': ok, 'mods': mods}, f)
-            _ca_os.replace(tmp, _CA_STATE)
-        except Exception as e:
-            print('[session] state snapshot skipped: %r' % (e,), file=_ca_sys.stderr)
+            with open(_CA_STATE, 'rb') as _ca_f:
+                _ca_state = _ca_pk.load(_ca_f)
+            # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
+            # Re-import module aliases by name first (so "import pandas as pd"
+            # in one cell leaves pd bound in the next), then restore pickled
+            # values.
+            if isinstance(_ca_state, dict) and _ca_state.get('__ca_v__') == 1:
+                for _ca_alias, _ca_modname in _ca_state.get('mods', {}).items():
+                    try:
+                        _ca_ns[_ca_alias] = _ca_importlib.import_module(_ca_modname)
+                    except Exception:
+                        pass
+                _ca_ns.update(_ca_state.get('ns', {}))
+            else:
+                _ca_ns.update(_ca_state)  # legacy raw-dict snapshot
+            _ca_ns['__name__'] = __name__  # preserve '__mp_main__' in spawn children
+        except Exception as _ca_e:
+            print('[session] state restore skipped: %r' % (_ca_e,), file=_ca_sys.stderr)
 
-    _ca_atexit.register(_ca_snapshot)
+    if __name__ == '__mp_main__':
+        exec(compile(_CA_SRC, '<user_code>', 'exec'), _ca_ns)
+    else:
+        def _ca_snapshot():
+            ok = {}
+            mods = {}
+            for k, v in list(_ca_ns.items()):
+                if k.startswith('_'):
+                    continue
+                # Record module aliases by import name so they can be
+                # re-imported on the next run rather than lost (the
+                # advertised "namespace carries").
+                if isinstance(v, _ca_types.ModuleType):
+                    name = getattr(v, '__name__', None)
+                    if isinstance(name, str) and name:
+                        mods[k] = name
+                    continue
+                # Skip open file handles. dill CAN pickle a file handle, but
+                # restoring one reopens the path in its original mode -- for
+                # a write handle that TRUNCATES the user's file on the next
+                # run. Excluding io objects keeps a leftover with-block file
+                # handle from wiping the file it wrote. (Sockets/threads/locks
+                # fail dumps below and are dropped there.)
+                if isinstance(v, _ca_io.IOBase):
+                    continue
+                try:
+                    _ca_pk.dumps(v)
+                except Exception:
+                    continue
+                ok[k] = v
+            try:
+                tmp = _CA_STATE + '.tmp'
+                with open(tmp, 'wb') as f:
+                    _ca_pk.dump({'__ca_v__': 1, 'ns': ok, 'mods': mods}, f)
+                _ca_os.replace(tmp, _CA_STATE)
+            except Exception as e:
+                print('[session] state snapshot skipped: %r' % (e,), file=_ca_sys.stderr)
 
-    exec(compile(_CA_SRC, '<user_code>', 'exec'), _ca_ns)
+        _ca_atexit.register(_ca_snapshot)
+
+        exec(compile(_CA_SRC, '<user_code>', 'exec'), _ca_ns)
 `;
 
 /**

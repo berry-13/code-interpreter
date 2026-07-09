@@ -94,20 +94,16 @@ def ______custom_savefig(*args, **kwargs):
 
 plt.savefig = ______custom_savefig
 
-def ______main():
-    try:
-        # BEGIN USER CODE
-        # User code will be inserted here
-        # END USER CODE
-    finally:
-        # Promote user-defined locals into the module/exec namespace so persistent
-        # sessions can snapshot them (user code here runs inside main(), so its
-        # assignments are function-locals). In `finally` so partial state is kept
-        # even when the user code raises, matching the plain-Python path. No-op
-        # when persistence is off: the program exits immediately after, so the
-        # extra globals are never observed. `dict(locals())` is evaluated in
-        # main()'s scope, capturing the user's variables before the filter.
-        globals().update({______k: ______v for ______k, ______v in dict(locals()).items() if not ______k.startswith('_')})
-
+# User code runs directly at module scope (inside this `if`, not a function
+# body) so it shares the real module globals rather than a nested local scope.
+# A `def main(): ...` wrapper here would make every name the user assigns
+# resolve as a function-local, so a persistent-session continuation like
+# `x += 1` on a restored global raises UnboundLocalError (the read half of
+# the augmented assignment can't see the enclosing global). Running at
+# module scope also means there is nothing to promote afterwards: the
+# snapshot (which reads globals()/the module dict directly) already sees
+# everything the user assigned, with or without persistence enabled.
 if __name__ == "__main__":
-    ______main()
+    # BEGIN USER CODE
+    # User code will be inserted here
+    # END USER CODE

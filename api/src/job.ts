@@ -84,16 +84,22 @@ const RESERVED_SESSION_BASENAMES = new Set([
  * scatter these under HOME=/mnt/data; they are not useful state). */
 const SNAPSHOT_PRUNE_DIRS = ['.cache', '.config', '.npm', `${SESSION_STATE_PKL_BASENAME}.tmp`];
 
+/* Checks every path segment, not just the basename: a name like
+ * `.session_state.pkl/chunk` would otherwise pass as an ordinary input,
+ * staging a directory at the reserved path that the Python wrapper then
+ * can't replace with (or read as) the actual pickle file. */
+function pathSegments(name: string): string[] {
+  return name.replace(/\\/g, '/').split('/').filter(Boolean);
+}
+
 function isReservedSessionBasename(name: string): boolean {
-  const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
-  return base !== undefined && RESERVED_SESSION_BASENAMES.has(base);
+  return pathSegments(name).some(segment => RESERVED_SESSION_BASENAMES.has(segment));
 }
 
 /** True for the internal pickle artifacts only -- never a legitimate restored
  *  user file, unlike SESSION_STATE_TAR_BASENAME (see comment above). */
 function isSessionStateInternalBasename(name: string): boolean {
-  const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
-  return base !== undefined && SESSION_STATE_INTERNAL_BASENAMES.has(base);
+  return pathSegments(name).some(segment => SESSION_STATE_INTERNAL_BASENAMES.has(segment));
 }
 
 /**

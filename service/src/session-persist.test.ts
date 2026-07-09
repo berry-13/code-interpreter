@@ -23,6 +23,14 @@ describe('isReservedSessionFilename', () => {
     expect(isReservedSessionFilename('')).toBe(false);
     expect(isReservedSessionFilename(undefined as unknown as string)).toBe(false);
   });
+
+  test('matches a reserved name used as a directory component, not just the basename', () => {
+    // e.g. `.session_state.pkl/chunk` would otherwise stage a directory at the
+    // reserved path, which the sandbox can never replace with the real pickle.
+    expect(isReservedSessionFilename(`${SESSION_STATE_FILENAME}/chunk`)).toBe(true);
+    expect(isReservedSessionFilename(`a/${SESSION_STATE_FILENAME}.tmp/b`)).toBe(true);
+    expect(isReservedSessionFilename(`a\\${SESSION_STATE_FILENAME}\\b`)).toBe(true);
+  });
 });
 
 describe('isReservedSessionInputName', () => {
@@ -37,6 +45,11 @@ describe('isReservedSessionInputName', () => {
     expect(isReservedSessionInputName('data.csv')).toBe(false);
     expect(isReservedSessionInputName('workspace.tar')).toBe(false);
     expect(isReservedSessionInputName('')).toBe(false);
+  });
+
+  test('rejects a reserved name used as a directory component, not just the basename', () => {
+    expect(isReservedSessionInputName(`${SESSION_STATE_TAR_FILENAME}/chunk`)).toBe(true);
+    expect(isReservedSessionInputName(`a/${SESSION_STATE_FILENAME}/b`)).toBe(true);
   });
 });
 
@@ -75,6 +88,68 @@ describe('wrapPythonForSessionPersistence', () => {
     expect(wrapped).not.toContain('__CA_ENTRY__');
     expect(wrapped).not.toContain('__USERCODE_B64__');
     expect(wrapped).toContain('/mnt/data/we_rd_name.py');
+  });
+
+  test('only restores state / registers the snapshot / fakes __main__ for an actual launch', () => {
+    // An ordinary import (__name__ not in ('__main__', '__mp_main__')) must
+    // run the user code in its own real globals() and return -- it must not
+    // reach the state-restore, atexit-registration, or fake-__main__ setup,
+    // which would replay persistence side effects a second time.
+    const wrapped = wrapPythonForSessionPersistence('pass\n', 'main.py');
+    const guardIdx = wrapped.indexOf("if __name__ not in ('__main__', '__mp_main__'):");
+    const elseIdx = wrapped.indexOf('\nelse:\n', guardIdx);
+    expect(guardIdx).toBeGreaterThan(-1);
+    expect(elseIdx).toBeGreaterThan(guardIdx);
+    const importBranch = wrapped.slice(guardIdx, elseIdx);
+    expect(importBranch).toContain("exec(compile(_CA_SRC, '<user_code>', 'exec'), globals())");
+    expect(importBranch).not.toContain('_ca_atexit.register');
+    expect(importBranch).not.toContain("ModuleType('__main__')");
+    expect(importBranch).not.toContain('_CA_STATE');
+
+    const launchBranch = wrapped.slice(elseIdx);
+    expect(launchBranch).toContain('_ca_atexit.register(_ca_snapshot)');
+    expect(launchBranch).toContain("ModuleType('__main__')");
+    expect(launchBranch).toContain('_ca_os.path.exists(_CA_STATE)');
+  });
+});
+
+describe('PYTHON_SESSION_WRAPPER __name__ handling (executed)', () => {
+  // Exercises the actual generated Python for all three ways this file's
+  // __name__ can be bound, without touching the real /mnt/data path (the
+  // wrapper's own restore/snapshot logic is redirected to a temp file by
+  // monkeypatching _CA_STATE after exec so this stays a pure unit test).
+  test('runs user code once as __main__, in-place for __mp_main__, and without persistence ceremony on import', () => {
+    const wrapped = wrapPythonForSessionPersistence("print('ran:' + __name__)\n", 'main.py');
+    const harness = `
+import sys, types, runpy
+_ca_state_dir = sys.argv[1]
+
+def run_as(name):
+    mod = types.ModuleType(name)
+    mod.__dict__['__name__'] = name
+    mod.__dict__['__builtins__'] = __builtins__
+    code = compile(WRAPPED.replace("'/mnt/data/.session_state.pkl'", repr(_ca_state_dir + '/.session_state.pkl')), 'wrapper.py', 'exec')
+    exec(code, mod.__dict__)
+    return mod
+
+run_as('__main__')
+print('---')
+run_as('__mp_main__')
+print('---')
+run_as('not_main')
+`;
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-session-test-'));
+    const harnessPath = path.join(dir, 'harness.py');
+    fs.writeFileSync(harnessPath, `WRAPPED = ${JSON.stringify(wrapped)}\n` + harness);
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('python3', [harnessPath, dir], { encoding: 'utf8' });
+    const sections = out.trim().split('---\n').map((s: string) => s.trim());
+    expect(sections[0]).toBe('ran:__main__');
+    expect(sections[1]).toBe('ran:__mp_main__');
+    expect(sections[2]).toBe('ran:not_main');
   });
 });
 

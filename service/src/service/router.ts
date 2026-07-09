@@ -258,16 +258,17 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      * that way. It was briefly broadened to also fire on any persistent-
      * session continuation (to catch a restored `plt` alias used without a
      * fresh `import matplotlib`), but createPayload() embeds isPyPlot-true
-     * code inside the matplotlib.py template's `______main()` function body.
-     * Routing EVERY continuation through that broke plain variable
-     * continuation: `x += 1` on a restored global raises UnboundLocalError
-     * inside a function scope (the read half of the augmented assignment
-     * resolves to the not-yet-locally-bound name, not the enclosing global),
-     * and a literal `from __future__ import ...` in the user's own code
-     * becomes a SyntaxError once it's no longer the first statement of its
-     * compilation unit. Reverted; the restored-`plt`-without-reimport gap is
-     * a known, smaller limitation until pyplot hooks can be installed without
-     * moving user code into a function scope. */
+     * code inside the matplotlib.py template. Routing EVERY continuation
+     * through that broke a literal `from __future__ import ...` in the
+     * user's own code: it becomes a SyntaxError once it's no longer the
+     * first statement of its compilation unit (matplotlib.py's own imports
+     * now precede it). That's still true regardless of where in the
+     * template the user code sits, so isPyPlot stays a per-run scan.
+     * Reverted; the restored-`plt`-without-reimport gap is a known, smaller
+     * limitation. (A related bug this broadening also hit -- user code
+     * running inside the template's function scope, so `x += 1` on a
+     * restored global raised UnboundLocalError -- is now fixed: user code
+     * runs at module scope, see matplotlib.py.) */
     const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
     const rawPayload = createPayload({
       req,

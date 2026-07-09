@@ -260,6 +260,12 @@ input downloads and output uploads — user code still has no network.
   File persistence underneath is not affected.
 - **Not a warm kernel.** The interpreter still cold-starts each call
   (re-import + re-restore). Non-Python languages get file persistence only.
+- **Programmatic exec (Tool Call Server) is not covered.** `/v1/exec/programmatic`
+  and its blocking/replay variants build their payload through a separate path
+  (`createProgrammaticPayload`, with its own async pyplot template) that never
+  sets `persist_session` or wraps the code for restore/snapshot. With
+  `CODEAPI_PERSIST_SESSIONS=true`, calls through those routes still get a cold
+  workspace and namespace every time; only the plain `/v1/exec` route persists.
 
 Tuning: `CODEAPI_SESSION_STATE_MAX_BYTES` caps the snapshot (oversize snapshots
 are skipped, the run still succeeds); `CODEAPI_SESSION_STATE_TTL_SECONDS` is the
