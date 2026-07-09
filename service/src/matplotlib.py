@@ -1,33 +1,40 @@
-import os
-import logging
-from types import SimpleNamespace
-import sys
+import os as ______os
+import logging as ______logging
+from types import SimpleNamespace as ______SimpleNamespace
+import sys as ______sys
 
-# Create a namespace for our variables
-______ns = SimpleNamespace()
+# All of this template's own helper imports are `______`-prefixed -- not just
+# for the namespace/functions below -- so persistent-session snapshots (which
+# exclude every `______`-prefixed global) never capture them. Unprefixed names
+# like `os` or `plt` would otherwise be ordinary module-level globals in the
+# same namespace user code runs in: once any plotting run bound them, they'd
+# get snapshotted as module aliases and silently overwrite a user variable of
+# the same name (e.g. a prior run's own `os = ...`) on every later restore,
+# pyplot or not, for the rest of the session.
+______ns = ______SimpleNamespace()
 
 # Set up logging
 try:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    ______ns.logger = logging.getLogger(__name__)
+    ______logging.basicConfig(level=______logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    ______ns.logger = ______logging.getLogger(__name__)
 except Exception as e:
     print(f"Failed to set up logging: {e}")
-    sys.exit(1)
+    ______sys.exit(1)
 
 # Set the environment variables BEFORE importing matplotlib
 try:
-    os.environ['MPLBACKEND'] = 'Agg'
-    os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'  # Required: sandbox has no home dir
+    ______os.environ['MPLBACKEND'] = 'Agg'
+    ______os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'  # Required: sandbox has no home dir
 except Exception as e:
     ______ns.logger.error(f"Failed to set environment variables: {e}")
-    sys.exit(1)
+    ______sys.exit(1)
 
 # Set backend BEFORE importing pyplot (more reliable than env var)
-import matplotlib
-matplotlib.use('Agg')
+import matplotlib as ______matplotlib
+______matplotlib.use('Agg')
 
 # Optimize matplotlib settings BEFORE importing pyplot
-matplotlib.rcParams.update({
+______matplotlib.rcParams.update({
     'figure.dpi': 100,              # Reasonable default (user can override)
     'savefig.dpi': 150,             # Cap savefig DPI for performance
     'figure.max_open_warning': 0,   # Disable warning spam
@@ -37,7 +44,7 @@ matplotlib.rcParams.update({
     'svg.fonttype': 'none',         # Don't embed fonts in SVG
 })
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as ______plt
 
 # Seed the counter past any plot_N.png already in the workspace. With persistent
 # sessions a prior run's plots are restored into the cwd, so starting from 0
@@ -46,7 +53,7 @@ import matplotlib.pyplot as plt
 # `______`-prefixed locals are excluded from the persisted namespace snapshot.
 ______ns.plot_counter = 0
 try:
-    for ______name in os.listdir('.'):
+    for ______name in ______os.listdir('.'):
         if ______name.startswith('plot_') and ______name.endswith('.png'):
             ______stem = ______name[len('plot_'):-len('.png')]
             if ______stem.isdigit():
@@ -58,8 +65,8 @@ ______ns.saved_figures = set()
 def ______custom_show():
     """Custom function to replace plt.show()"""
     global ______ns
-    current_fig = plt.gcf()
-    
+    current_fig = ______plt.gcf()
+
     if current_fig.number not in ______ns.saved_figures:
         ______ns.plot_counter += 1
         filename = f"plot_{______ns.plot_counter}.png"
@@ -68,31 +75,34 @@ def ______custom_show():
         ______ns.saved_figures.add(current_fig.number)
     else:
         ______ns.logger.info(f"Figure {current_fig.number} has already been saved, skipping save operation")
-    
-    plt.close(current_fig)
 
-# Override plt.show and plt.savefig
-plt.show = ______custom_show
+    ______plt.close(current_fig)
+
+# Override plt.show and plt.savefig. Mutating the module object's own
+# attributes (via the `______plt` alias) patches the exact same singleton
+# module the user's own `import matplotlib.pyplot as plt` resolves to, so the
+# patch takes effect under whatever name the user's code uses.
+______plt.show = ______custom_show
 
 # `______`-prefixed so persistent-session snapshots exclude it (the snapshot
 # filter drops underscore-prefixed names) and it can't clobber a user variable.
-______original_savefig = plt.savefig
+______original_savefig = ______plt.savefig
 
 # Maximum DPI to prevent excessive rendering time
 ______MAX_DPI = 200
 
 def ______custom_savefig(*args, **kwargs):
-    current_fig = plt.gcf()
+    current_fig = ______plt.gcf()
     ______ns.saved_figures.add(current_fig.number)
-    
+
     # Cap DPI to prevent performance issues
     if 'dpi' in kwargs and kwargs.get('dpi', 0) > ______MAX_DPI:
         ______ns.logger.debug(f"Capping DPI from {kwargs['dpi']} to {______MAX_DPI}")
         kwargs['dpi'] = ______MAX_DPI
-    
+
     return ______original_savefig(*args, **kwargs)
 
-plt.savefig = ______custom_savefig
+______plt.savefig = ______custom_savefig
 
 # User code runs directly at module scope (inside this `if`, not a function
 # body) so it shares the real module globals rather than a nested local scope.

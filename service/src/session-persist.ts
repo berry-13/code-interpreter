@@ -136,8 +136,10 @@ _ca_sys.path[:] = [_ca_p for _ca_p in _ca_sys.path if _ca_p not in ('', '/mnt/da
 import os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib
 try:
     import dill as _ca_pk
+    _ca_using_dill = True
 except Exception:
     import pickle as _ca_pk
+    _ca_using_dill = False
 _ca_sys.path[:] = _ca_saved_path
 
 _CA_STATE = '/mnt/data/.session_state.pkl'
@@ -234,6 +236,18 @@ else:
                 # handle from wiping the file it wrote. (Sockets/threads/locks
                 # fail dumps below and are dropped there.)
                 if isinstance(v, _ca_io.IOBase):
+                    continue
+                # Without dill, a user-defined top-level function/class passes
+                # this dumps() probe (stdlib pickle pickles them BY REFERENCE,
+                # and the reference -- __main__.<name> -- genuinely resolves
+                # right now, mid-run) but fails on restore: the next run's
+                # fake __main__ doesn't have that attribute yet (state is
+                # restored BEFORE user code re-defines it), so pickle.load()
+                # raises partway through and the whole namespace -- simple
+                # variables included -- is dropped by the outer catch below.
+                # dill instead serializes these by value, so it doesn't share
+                # this failure mode; only pickle needs the extra exclusion.
+                if not _ca_using_dill and isinstance(v, (_ca_types.FunctionType, type)):
                     continue
                 try:
                     _ca_pk.dumps(v)

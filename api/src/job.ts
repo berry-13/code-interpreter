@@ -25,6 +25,7 @@ import {
   applySandboxPathPermissionsNoFollow,
   cleanupSandboxWorkspace,
   createSandboxWorkspace,
+  currentUid,
   fallbackSandboxIdentity,
   retainWorkspaceCleanupUntilRemoved,
   sandboxJobUidPool,
@@ -1233,14 +1234,14 @@ export class Job {
       // attacker-controlled content outside the workspace. Restored state has no
       // legitimate need for symlinks, so we drop them unconditionally.
       await this.stripSymlinks(this.submissionDir);
-      await this.chownTreeToJobUid(this.submissionDir);
+      const chownApplied = await this.chownTreeToJobUid(this.submissionDir);
       // tar --no-same-permissions only umasks archived modes; it never ADDS
       // access, so a prior run's `chmod 000` on any dir/file survives extraction
       // and, now owned by the job UID, is still untraversable/unreadable --
       // bricking restored state. `u+rwX` grants the owner read/write on files
       // and traverse on dirs (and preserves existing execute bits) across the
       // whole tree, and the root gets its exact canonical workspace mode.
-      await this.normalizeRestoredModes(this.submissionDir);
+      await this.normalizeRestoredModes(this.submissionDir, chownApplied);
       await applySandboxPathPermissions(this.submissionDir, this.sandboxIdentity(), SANDBOX_WORKSPACE_MODE);
       // Record restored files as input baselines so handleSessionFiles treats
       // unchanged carry-overs as inherited, not freshly generated outputs --
@@ -1466,16 +1467,23 @@ export class Job {
   /**
    * Recursively chown an extracted tree to the per-job UID so the sandboxed
    * process (running as that UID) can read and modify restored files. Uses
-   * `-h` so symlink ownership, not the target's, is changed. Best-effort:
-   * without the capability (e.g. non-root dev mode) restored files stay
-   * runner-owned but world-readable, so restore-and-read still works.
+   * `-h` so symlink ownership, not the target's, is changed. Mirrors
+   * chownOrThrow's tolerance: a failure is swallowed (returns false so the
+   * caller can widen modes instead) only when per-job UIDs aren't required
+   * and the runner isn't expected to have the capability (root + hardened
+   * mode); otherwise it's rethrown, matching applySandboxPathPermissions.
    */
-  private async chownTreeToJobUid(dir: string): Promise<void> {
+  private async chownTreeToJobUid(dir: string): Promise<boolean> {
     const id = this.sandboxIdentity();
     try {
       await execFileP('chown', ['-Rh', `${id.uid}:${id.gid}`, dir]);
+      return true;
     } catch (err) {
-      this.log.warn({ err }, 'Failed to chown restored session tree to job UID');
+      if (!id.perJobUid && currentUid() !== 0 && !config.hardened_sandbox_mode) {
+        this.log.warn({ err }, 'Failed to chown restored session tree to job UID');
+        return false;
+      }
+      throw err;
     }
   }
 
@@ -1484,10 +1492,20 @@ export class Job {
    * across a restored tree, preserving existing execute bits. Repairs hostile
    * modes (e.g. a prior run's `chmod 000`) that extraction preserves and would
    * otherwise leave restored files unreadable/untraversable. Best-effort.
+   *
+   * When `chownApplied` is false (chownTreeToJobUid's ownership transfer was
+   * tolerated, not actually applied -- non-root/local dev mode), the tree is
+   * still owned by the runner, not the job UID the sandboxed process runs as.
+   * Snapshot members are commonly archived at 0600/0700 (owner-only), so
+   * `u+rwX` alone would grant access to the runner's UID and leave the
+   * sandboxed process locked out. Also widen group/other in that case,
+   * mirroring compatibilityModeForSkippedChown's same owner-bits-copied-down
+   * strategy used elsewhere for the identical no-chown compatibility path.
    */
-  private async normalizeRestoredModes(dir: string): Promise<void> {
+  private async normalizeRestoredModes(dir: string, chownApplied: boolean): Promise<void> {
+    const spec = chownApplied ? 'u+rwX' : 'u+rwX,go+rwX';
     try {
-      await execFileP('chmod', ['-R', 'u+rwX', dir]);
+      await execFileP('chmod', ['-R', spec, dir]);
     } catch (err) {
       this.log.warn({ err }, 'Failed to normalize restored session tree modes');
     }
@@ -1515,11 +1533,16 @@ export class Job {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
+      // classifyDirent falls back to lstat on DT_UNKNOWN (some NFS/FUSE/
+      // overlay mounts). Without it, both isDirectory() and isFile() report
+      // false for such an entry, and treating that as "neither" would delete
+      // an ordinary file or skip recursing into an ordinary directory here.
+      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      if (kind === 'dir') {
         await this.stripSymlinks(full);
-      } else if (!entry.isFile()) {
-        // Symlink, FIFO, socket, or block/char device -- none are safe or
-        // sized by the estimator; drop them all.
+      } else if (kind !== 'file') {
+        // Symlink, FIFO, socket, block/char device, or unclassifiable even
+        // after lstat -- none are safe or sized by the estimator; drop them.
         await fsp.rm(full, { force: true }).catch(() => { /* best effort */ });
       }
     }
