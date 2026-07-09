@@ -64,9 +64,20 @@ const execFileP = promisify(execFile);
  * service/src/session-persist.ts (separate npm package -- cannot import). */
 const SESSION_STATE_PKL_BASENAME = '.session_state.pkl';
 const SESSION_STATE_TAR_BASENAME = 'session-workspace.tar';
-const RESERVED_SESSION_BASENAMES = new Set([
+/* Internal artifacts that never legitimately exist as user content -- the
+ * pickle only ever lives at this exact path and is always excluded before
+ * archiving/output. Deliberately excludes SESSION_STATE_TAR_BASENAME: unlike
+ * the pickle, that name CAN collide with a real user-created file (the
+ * persisted tar object itself is downloaded to a path outside submissionDir
+ * and extracted -- its own filename never becomes a member inside the
+ * archive it produces, so a file with this name in a restored workspace can
+ * only be one the user's own code wrote). */
+const SESSION_STATE_INTERNAL_BASENAMES = new Set([
   SESSION_STATE_PKL_BASENAME,
   `${SESSION_STATE_PKL_BASENAME}.tmp`,
+]);
+const RESERVED_SESSION_BASENAMES = new Set([
+  ...SESSION_STATE_INTERNAL_BASENAMES,
   SESSION_STATE_TAR_BASENAME,
 ]);
 /* Top-level runtime cache dirs pruned from a session snapshot (pip/matplotlib
@@ -76,6 +87,13 @@ const SNAPSHOT_PRUNE_DIRS = ['.cache', '.config', '.npm', `${SESSION_STATE_PKL_B
 function isReservedSessionBasename(name: string): boolean {
   const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
   return base !== undefined && RESERVED_SESSION_BASENAMES.has(base);
+}
+
+/** True for the internal pickle artifacts only -- never a legitimate restored
+ *  user file, unlike SESSION_STATE_TAR_BASENAME (see comment above). */
+function isSessionStateInternalBasename(name: string): boolean {
+  const base = name.replace(/\\/g, '/').split('/').filter(Boolean).pop();
+  return base !== undefined && SESSION_STATE_INTERNAL_BASENAMES.has(base);
 }
 
 /**
@@ -1248,11 +1266,18 @@ export class Job {
         continue;
       }
       if (!entry.isFile()) continue;
-      // Reserved artifacts are never outputs. `.dirkeep` markers ARE baselined
-      // (unlike other skips): a restored empty dir is represented only by its
-      // marker, so without a baseline the output walk would regenerate it as a
-      // fresh file and let carried-over empty dirs crowd out real artifacts.
-      if (isReservedSessionBasename(entry.name)) continue;
+      // Only the internal pickle artifacts are skipped here -- they never
+      // legitimately exist as restored user content. `.dirkeep` markers ARE
+      // baselined (unlike other skips): a restored empty dir is represented
+      // only by its marker, so without a baseline the output walk would
+      // regenerate it as a fresh file and let carried-over empty dirs crowd
+      // out real artifacts. A restored file that happens to be named like the
+      // internal tar (SESSION_STATE_TAR_BASENAME) is baselined too, for the
+      // same reason -- that name can only reach here via the user's own code
+      // (see the constant's comment), so treating it as reserved would starve
+      // it of a baseline and make the output walk re-flag it as "new" (and
+      // consume a max_output_files slot) on every subsequent run forever.
+      if (isSessionStateInternalBasename(entry.name)) continue;
       const rel = path.relative(this.submissionDir, full);
       try {
         const hash = await this.computeFileHash(full);

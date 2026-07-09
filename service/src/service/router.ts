@@ -254,11 +254,36 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       });
     }
 
+    /* isPyPlot is a static scan of THIS run's own source only -- it must stay
+     * that way. It was briefly broadened to also fire on any persistent-
+     * session continuation (to catch a restored `plt` alias used without a
+     * fresh `import matplotlib`), but createPayload() embeds isPyPlot-true
+     * code inside the matplotlib.py template's `______main()` function body.
+     * Routing EVERY continuation through that broke plain variable
+     * continuation: `x += 1` on a restored global raises UnboundLocalError
+     * inside a function scope (the read half of the augmented assignment
+     * resolves to the not-yet-locally-bound name, not the enclosing global),
+     * and a literal `from __future__ import ...` in the user's own code
+     * becomes a SyntaxError once it's no longer the first statement of its
+     * compilation unit. Reverted; the restored-`plt`-without-reimport gap is
+     * a known, smaller limitation until pyplot hooks can be installed without
+     * moving user code into a function scope. */
+    const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
+    const rawPayload = createPayload({
+      req,
+      isPyPlot,
+      session_id,
+    });
+
     /* Persistent sessions (opt-in). Rendezvous on the caller's own auth-derived
-     * sessionKey via a Redis pointer to the previous run's output session.
-     * The prior-snapshot lookup happens BEFORE isPyPlot/createPayload below
-     * (rather than after, as originally structured) because isPyPlot needs to
-     * know whether this is a continuation. */
+     * sessionKey via a Redis pointer to the previous run's output session:
+     *   - Mark the payload so the sandbox snapshots /mnt/data back to THIS run's
+     *     output session (the only session the egress grant lets it write).
+     *   - If a prior snapshot exists, inject it as a synthetic input file. Being
+     *     an input file, its storage_session_id flows into the manifest/grant
+     *     read_sessions + input_files, authorizing the sandbox to fetch it — no
+     *     file-server or Redis-auth change needed. Done before
+     *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
     if (env.PERSIST_SESSIONS) {
       // Reserve every persistence artifact name: the state tar (identified in
       // the sandbox by name only, since egress masks file id/session) and the
@@ -269,34 +294,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       if (reservedInput) {
         return res.status(400).json({ error: `File name '${reservedInput.name}' is reserved when persistent sessions are enabled` });
       }
-      priorSnapshotSession = await connection.get(sessionStatePointerKey(sessionKey));
-    }
-
-    /* A continuation can reuse a `plt`/pyplot module alias restored from a
-     * prior run's namespace (session-persist.ts re-imports `mods` before user
-     * code runs) without this run's own source containing a literal
-     * `import matplotlib` -- e.g. run 1 imports it, run 2 only calls the
-     * restored `plt.plot(...); plt.show()`. Wrap unconditionally on any
-     * continuation so plt.show() still gets the save-as-PNG hook installed;
-     * the matplotlib.py template re-imports (and re-hooks) the same cached
-     * `sys.modules['matplotlib.pyplot']` object either way, so this is a
-     * no-op for runs that don't end up touching pyplot at all. */
-    const isPyPlot = language === Languages.py && (
-      code.includes('import matplotlib') || code.includes('import seaborn') || priorSnapshotSession !== null
-    );
-    const rawPayload = createPayload({
-      req,
-      isPyPlot,
-      session_id,
-    });
-
-    if (env.PERSIST_SESSIONS) {
-      // Mark the payload so the sandbox snapshots /mnt/data back to THIS run's
-      // output session (the only session the egress grant lets it write).
       rawPayload.persist_session = {
         file_id: SESSION_STATE_FILE_ID,
         filename: SESSION_STATE_TAR_FILENAME,
       };
+      priorSnapshotSession = await connection.get(sessionStatePointerKey(sessionKey));
       if (priorSnapshotSession) {
         // Hold a ref on the snapshot this run will restore from, so a concurrent
         // run that supersedes the pointer can't delete it before we prime. TTL
@@ -307,11 +309,6 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
           .expire(snapshotRefKey, SNAPSHOT_REF_TTL_SECONDS)
           .exec()
           .catch(() => { /* best effort; delete path also guards on advance */ });
-        // If a prior snapshot exists, inject it as a synthetic input file. Being
-        // an input file, its storage_session_id flows into the manifest/grant
-        // read_sessions + input_files, authorizing the sandbox to fetch it — no
-        // file-server or Redis-auth change needed. Done before
-        // prepareSandboxJobSecurity so it is covered by the signed manifest.
         rawPayload.persist_session.restore_session_id = priorSnapshotSession;
         rawPayload.files.push({
           id: SESSION_STATE_FILE_ID,
@@ -505,7 +502,7 @@ router.get('/download/:session_id/:fileId', downloadLimiter, sessionAuth, async 
   const { session_id, fileId } = req.params;
 
   // The hidden persistent-session snapshot is internal state, not a user file.
-  if (fileId === SESSION_STATE_FILE_ID) {
+  if (isSessionStateFileId(fileId)) {
     return res.status(404).json({ error: 'File not found' });
   }
 
@@ -1001,6 +998,20 @@ function objectFileIdFromListItem(item: unknown): string | undefined {
   return base.replace(/\.[^.]+$/, '');
 }
 
+/**
+ * True when a route-param `:fileId` refers to the hidden persistent-session
+ * snapshot -- whether given bare (`codeapi-session-state`) or extension-
+ * qualified (`codeapi-session-state.tar`, matching how it's actually stored).
+ * file-server's object GET/DELETE handlers resolve `:fileId` by PREFIX match
+ * against `<session>/<fileId>` (see file-server.ts), so an extension-qualified
+ * id passes straight through a bare `=== SESSION_STATE_FILE_ID` check yet
+ * still resolves to the same hidden object there. Strips any trailing
+ * `.<ext>` before comparing, mirroring `objectFileIdFromListItem` above.
+ */
+function isSessionStateFileId(fileId: string): boolean {
+  return fileId.replace(/\.[^.]+$/, '') === SESSION_STATE_FILE_ID;
+}
+
 router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id } = req.params;
   const { detail = 'simple' } = req.query;
@@ -1043,7 +1054,7 @@ router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.Authen
 router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
 
-  if (fileId === SESSION_STATE_FILE_ID) {
+  if (isSessionStateFileId(fileId)) {
     return res.status(404).json({ error: 'File not found' });
   }
 
@@ -1071,7 +1082,7 @@ router.delete('/files/:session_id/:fileId', fetchLimiter, sessionAuth, async (re
   const { session_id, fileId } = req.params;
 
   // The hidden snapshot object is not client-addressable.
-  if (fileId === SESSION_STATE_FILE_ID) {
+  if (isSessionStateFileId(fileId)) {
     return res.status(404).json({ error: 'File not found' });
   }
 
