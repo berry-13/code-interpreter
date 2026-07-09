@@ -1534,15 +1534,24 @@ export class Job {
    * stored path (`./<rel>`) overflows the ustar name/prefix fields, so long-
    * named or deeply nested files can't undercount the estimate either.
    *
-   * `seenInodes` tracks `dev:ino` across the whole recursive walk: GNU tar
-   * (without `--hard-dereference`, not passed here) archives only the first
-   * path to a given inode with its content, and every subsequent hard link to
-   * that inode as a header-only link record (size 0). Without this, a
-   * workspace with multiple hard links to the same large file would be
-   * charged that file's content once per link and could be rejected as
-   * oversize even though the real tar comfortably fits under the cap.
+   * `seenInodes` maps `dev:ino` to the first archived path for that inode
+   * across the whole recursive walk: GNU tar (without `--hard-dereference`,
+   * not passed here) archives only the first path to a given inode with its
+   * content, and every subsequent hard link to that inode as a header-only
+   * link record (size 0) whose `linkname` is that first path. Without
+   * tracking it, a workspace with multiple hard links to the same large file
+   * would be charged that file's content once per link and could be rejected
+   * as oversize even though the real tar comfortably fits under the cap.
+   * The first path is also charged again on every repeat link: when it's
+   * over 100 bytes, GNU tar must emit a second long-name record for the
+   * `linkname` field (distinct from -- and in addition to -- any long-name
+   * record the repeat entry's own, possibly short, stored name needs).
+   * Verified against a real GNU tar 1.34 archive: a repeat hard link to a
+   * long first-archived path emits a GNUTYPE_LONGLINK ('K') record for the
+   * linkname on top of its own header, on top of an 'L' record if its own
+   * name is also long.
    */
-  private async dirSizeBytes(dir: string, seenInodes: Set<string> = new Set()): Promise<number> {
+  private async dirSizeBytes(dir: string, seenInodes: Map<string, string> = new Map()): Promise<number> {
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
@@ -1569,11 +1578,15 @@ export class Job {
           const st = await fsp.stat(full);
           size = st.size;
           const inodeKey = `${st.dev}:${st.ino}`;
-          if (seenInodes.has(inodeKey)) {
-            total += 512 + tarLongNameOverheadBytes(rel); // repeat hard link: header only
+          const firstRel = seenInodes.get(inodeKey);
+          if (firstRel !== undefined) {
+            // Header + long-name record for this entry's own stored name (if
+            // long) + long-link record for the linkname, which GNU tar sets
+            // to the first-archived path (if THAT is long).
+            total += 512 + tarLongNameOverheadBytes(rel) + tarLongNameOverheadBytes(firstRel);
             continue;
           }
-          seenInodes.add(inodeKey);
+          seenInodes.set(inodeKey, rel);
         } catch { /* vanished mid-walk; ignore */ }
         total += 512 + Math.ceil(size / 512) * 512 + tarLongNameOverheadBytes(rel);
       }

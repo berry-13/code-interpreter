@@ -151,6 +151,29 @@ run_as('not_main')
     expect(sections[1]).toBe('ran:__mp_main__');
     expect(sections[2]).toBe('ran:not_main');
   });
+
+  test('a workspace file shadowing a bootstrap stdlib module does not break the wrapper', () => {
+    // `types` and `io` are already cached in sys.modules before any user code
+    // runs (CPython's own startup needs them), so they're immune regardless
+    // of sys.path order -- but `base64` is not, confirmed empirically (a
+    // fresh `python3 -c` shows 'base64' absent from sys.modules pre-exec).
+    // A restored workspace file named base64.py that doesn't define
+    // b64decode reproduces the real crash this fix addresses: run the
+    // wrapper's own script directory (which is always on sys.path, like any
+    // executed script's directory) with such a file present.
+    const wrapped = wrapPythonForSessionPersistence("print('user code ran')\n", 'main.py');
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-session-shadow-test-'));
+    fs.writeFileSync(path.join(dir, 'base64.py'), 'print("evil base64.py imported!")\n');
+    const wrapperPath = path.join(dir, 'main.py');
+    fs.writeFileSync(wrapperPath, wrapped.replace(/\/mnt\/data/g, dir));
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('python3', [wrapperPath], { encoding: 'utf8', cwd: dir });
+    expect(out).not.toContain('evil base64.py imported!');
+    expect(out.trim()).toBe('user code ran');
+  });
 });
 
 describe('reserved constants', () => {

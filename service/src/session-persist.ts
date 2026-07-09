@@ -117,13 +117,30 @@ export function isReservedSessionInputName(name: string): boolean {
  * pyplot-wrapped, if applicable) user code — base64 avoids all source-quoting
  * hazards regardless of what the user code contains.
  */
-const PYTHON_SESSION_WRAPPER = String.raw`import sys as _ca_sys, os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib
-_CA_STATE = '/mnt/data/.session_state.pkl'
+const PYTHON_SESSION_WRAPPER = String.raw`import sys as _ca_sys
+# Running this file puts its own directory ('/mnt/data', the workspace) on
+# sys.path -- normal Python behavior for the script being executed, and one
+# user code depends on to import its own helper modules. But it also means a
+# workspace file left by a prior run (persisted or restored) and named like
+# one of the stdlib modules this bootstrap itself needs -- e.g. types.py,
+# base64.py, io.py -- would shadow the real module for these imports too,
+# since they run before user code and see the same sys.path. That can brick
+# every future continuation of the session: e.g. a shadowing types.py without
+# ModuleType fails the fake-'__main__' setup below on every run, even ones
+# whose own code never touches matplotlib/multiprocessing/types at all. Strip
+# the workspace out of sys.path for just this bootstrap's own imports, then
+# restore it before compiling/running user code, so user imports keep
+# resolving their own /mnt/data modules exactly as before.
+_ca_saved_path = list(_ca_sys.path)
+_ca_sys.path[:] = [_ca_p for _ca_p in _ca_sys.path if _ca_p not in ('', '/mnt/data')]
+import os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib
 try:
     import dill as _ca_pk
 except Exception:
     import pickle as _ca_pk
+_ca_sys.path[:] = _ca_saved_path
 
+_CA_STATE = '/mnt/data/.session_state.pkl'
 _CA_SRC = _ca_b64.b64decode('__USERCODE_B64__').decode('utf-8')
 _ca_linecache.cache['<user_code>'] = (len(_CA_SRC), None, _CA_SRC.splitlines(True), '<user_code>')
 
