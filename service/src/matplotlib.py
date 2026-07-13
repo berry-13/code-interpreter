@@ -1,7 +1,23 @@
+import sys as ______sys
+# Hide the workspace from this template's OWN imports, mirroring the session
+# bootstrap (see session-persist.ts): with persistence, a prior run can leave
+# e.g. `logging.py` in /mnt/data, and these setup imports would otherwise
+# resolve that carried-over file and brick every later plotting run before
+# user code even starts. sys.path is restored right after the last template
+# import below, so user code resolves its own workspace modules as usual.
+# Unlike the bootstrap there is NO sys.modules eviction afterwards: user
+# imports must get the SAME cached matplotlib whose pyplot module object is
+# patched below (a fresh re-import would lose the show/savefig patches), and
+# matplotlib lazily imports more of itself at gcf()/savefig() time, so its
+# transitive deps must stay cached for the patched helpers to keep working
+# mid-run. The cost -- a workspace module named like one of these deps is
+# shadowed by the real one for pyplot runs -- matches the pre-persistence
+# template, which also imported them before the user block.
+______saved_path = list(______sys.path)
+______sys.path[:] = [______p for ______p in ______sys.path if ______p not in ('', '/mnt/data')]
 import os as ______os
 import logging as ______logging
 from types import SimpleNamespace as ______SimpleNamespace
-import sys as ______sys
 
 # All of this template's own helper imports are `______`-prefixed -- not just
 # for the namespace/functions below -- so persistent-session snapshots (which
@@ -45,6 +61,9 @@ ______matplotlib.rcParams.update({
 })
 
 import matplotlib.pyplot as ______plt
+
+# Last template import done -- give user code back its normal import path.
+______sys.path[:] = ______saved_path
 
 # Seed the counter past any plot_N.png already in the workspace. With persistent
 # sessions a prior run's plots are restored into the cwd, so starting from 0

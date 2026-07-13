@@ -183,24 +183,35 @@ async function claimPriorSnapshotRef(pointerKey: string, refTtlSeconds: number):
 }
 
 /* Releases one ref. A plain DECR on a key that has already EXPIRED would mint
- * a fresh counter at -1 and read as "last ref drained" -- but expiry means the
- * refcount is simply UNKNOWN: a continuation queued longer than
- * SNAPSHOT_REF_TTL_SECONDS (its claim's EXPIRE lapsing before the job ran) may
- * still be about to restore the snapshot this key guards -- including this
- * very handler's own still-queued job, whose finally block gives up waiting
- * after the same TTL. EXISTS+DECR in one script is atomic (Redis serializes
- * scripts), and a missing key reports a positive remainder so the caller stays
- * conservative and keeps the snapshot, the same stance the pointer-read
- * failure path below takes. */
+ * a fresh counter at -1 and read as "last ref drained" -- but a missing key
+ * means the refcount is simply UNKNOWN. EXISTS+DECR in one script is atomic
+ * (Redis serializes scripts), and a missing key reports a positive remainder
+ * so the caller stays conservative and keeps the snapshot, the same stance
+ * the pointer-read failure path below takes. */
 const RELEASE_SNAPSHOT_REF = `
 if redis.call('EXISTS', KEYS[1]) == 0 then return 1 end
 return redis.call('DECR', KEYS[1])`;
 
-/* Bound on both the snapshot ref key's own TTL and how long the `finally`
- * block below will keep waiting for a still-queued job before giving up and
- * releasing the ref anyway -- past max run time + a generous queue-wait
- * margin, so neither a crash nor a backed-up queue can hold a ref forever. */
+/* How long the `finally` block below keeps waiting for its own still-queued
+ * job before giving up and releasing the ref anyway -- past max run time +
+ * a generous queue-wait margin, so neither a crash nor a backed-up queue can
+ * hold a ref forever. */
 const SNAPSHOT_REF_TTL_SECONDS = Math.ceil(env.JOB_TIMEOUT / 1000) + 60;
+
+/* TTL on the `snapshotrefs:<id>` KEY itself -- deliberately LONGER than any
+ * single claim can legitimately be held. A claim is taken before the
+ * request's own JOB_TIMEOUT-bounded wait, and the finally block waits at
+ * most SNAPSHOT_REF_TTL_SECONDS more before releasing unconditionally, so a
+ * live claim spans at most ~(JOB_TIMEOUT + SNAPSHOT_REF_TTL_SECONDS), which
+ * this doubles past. The key outliving every live claim is what makes the
+ * refcount trustworthy: if it merely matched the claim TTL, a long-queued
+ * run's ref could expire while still outstanding, a later run's claim would
+ * recreate the key at a fresh count of 1, and draining that count to zero
+ * would delete a snapshot the still-queued run was about to restore. By the
+ * time this key can actually expire, every earlier claimant has already
+ * released or given up its wait. Each new claim's EXPIRE only ever pushes
+ * the deadline further out, never closer. */
+const SNAPSHOT_REF_KEY_TTL_SECONDS = 2 * SNAPSHOT_REF_TTL_SECONDS;
 
 /** Fire-and-forget delete of a session's hidden snapshot object. */
 function deleteSessionSnapshot(outputSession: string): void {
@@ -345,9 +356,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       // Reads the pointer and claims a ref on the snapshot it names in one
       // atomic call, so a concurrent run's finish sequence can't advance past
       // and delete that snapshot in the gap between reading and claiming it
-      // (see claimPriorSnapshotRef). TTL bounds the ref past the max run +
-      // queue wait so a crash can't leak it.
-      priorSnapshotSession = await claimPriorSnapshotRef(sessionStatePointerKey(sessionKey), SNAPSHOT_REF_TTL_SECONDS);
+      // (see claimPriorSnapshotRef). The key TTL strictly dominates the
+      // longest legitimate hold (see SNAPSHOT_REF_KEY_TTL_SECONDS) so expiry
+      // can't erase an outstanding ref, while still bounding a crashed
+      // handler's leak.
+      priorSnapshotSession = await claimPriorSnapshotRef(sessionStatePointerKey(sessionKey), SNAPSHOT_REF_KEY_TTL_SECONDS);
       if (priorSnapshotSession) {
         snapshotRefKey = `snapshotrefs:${priorSnapshotSession}`;
         rawPayload.persist_session.restore_session_id = priorSnapshotSession;

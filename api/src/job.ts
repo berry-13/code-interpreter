@@ -1051,6 +1051,13 @@ export class Job {
     const tempPath = path.join(this.submissionDir, `.tmp-${nanoid()}`);
 
     let lastError: Error | null = null;
+    // The on-disk name can come from Content-Disposition and differ from
+    // `file.name`. Remember the last one a (possibly failed) attempt
+    // resolved, so the stale-restored-file cleanup below can also discard a
+    // carry-over sitting at THAT path -- discarding only `file.name` would
+    // leave a restored file at the resolved name and silently serve stale
+    // bytes when every attempt fails after headers.
+    let lastResolvedName: string | null = null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -1077,6 +1084,7 @@ export class Job {
         if (this.persistSession && isReservedSessionBasename(originalName)) {
           throw new ValidationError(`input resolves to reserved session filename '${originalName}'`);
         }
+        lastResolvedName = originalName;
         const finalPath = path.join(this.submissionDir, originalName);
         const finalParent = path.dirname(finalPath);
         await this.clearNonDirectoryAncestors(finalParent);
@@ -1135,8 +1143,13 @@ export class Job {
     // download. If this input was meant to replace a restored file at the same
     // path but the download failed (expired/transient 404), leaving the restored
     // copy in place would silently run the sandbox against stale bytes. Drop the
-    // stale carry-over + its baseline so user code sees the input as missing.
+    // stale carry-over + its baseline so user code sees the input as missing --
+    // at the requested name AND at the Content-Disposition-resolved name a
+    // failed attempt got far enough to see.
     await this.discardStaleRestoredInput(file.name);
+    if (lastResolvedName && lastResolvedName !== file.name) {
+      await this.discardStaleRestoredInput(lastResolvedName);
+    }
     return null;
   }
 
