@@ -769,6 +769,10 @@ export class Job {
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
   private persistSession: { file_id: string; filename: string; restore_session_id?: string } | undefined;
+  /** A prior snapshot existed but could not be restored this run; gates
+   *  persistSessionState() so the resulting cold workspace never supersedes
+   *  (and deletes) the session's last good snapshot. */
+  private sessionRestoreFailed = false;
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -1252,7 +1256,13 @@ export class Job {
     } catch (err) {
       // Documented contract is "start empty on restore failure". A corrupt or
       // truncated tar can leave a partial tree, so wipe it rather than run
-      // against a mix of stale-and-missing files.
+      // against a mix of stale-and-missing files. Mark the failure too: this
+      // run now executes against a cold workspace, and letting it persist
+      // would CAS the session pointer forward and delete the last good
+      // snapshot -- one transient fetch/extract blip would permanently reset
+      // the session. Skipping persistence leaves the pointer untouched so
+      // the next run retries the restore.
+      this.sessionRestoreFailed = true;
       this.log.warn({ err }, 'Session restore failed; starting empty');
       await this.emptyDirContents(this.submissionDir);
     } finally {
@@ -1287,12 +1297,17 @@ export class Job {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
+      // classifyDirent falls back to lstat on DT_UNKNOWN (some NFS/FUSE/
+      // overlay mounts). Without it, both isDirectory() and isFile() report
+      // false for such an entry, so nothing would be baselined and every
+      // unchanged carry-over (and .dirkeep marker) would later be walked as
+      // a fresh output, exhausting max_output_files ahead of real artifacts.
+      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      if (kind === 'dir') {
         await this.registerRestoredBaseline(full);
         continue;
       }
-      if (!entry.isFile()) continue;
+      if (kind !== 'file') continue;
       // Only the internal pickle artifacts are skipped here -- they never
       // legitimately exist as restored user content. `.dirkeep` markers ARE
       // baselined (unlike other skips): a restored empty dir is represented
@@ -1319,12 +1334,16 @@ export class Job {
    * which is the single session the egress grant authorizes for writes. The
    * service later promotes this into the `sessionstate:<sessionKey>` Redis
    * pointer. Returns whether a fresh snapshot was actually written; a skip
-   * (oversize / no storage / error) is non-fatal and leaves the prior snapshot
-   * as the session's last good state.
+   * (failed restore / oversize / no storage / error) is non-fatal and leaves
+   * the prior snapshot as the session's last good state.
    */
   async persistSessionState(): Promise<boolean> {
     const ps = this.persistSession;
     if (!ps || !this.submissionDir || !this.fileEgressBaseUrl()) return false;
+    // See restoreSessionWorkspace's catch: a failed restore means this run
+    // saw a cold workspace, and snapshotting it would supersede -- and via
+    // the service's CAS-advance, delete -- the last good snapshot.
+    if (this.sessionRestoreFailed) return false;
 
     const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
     try {

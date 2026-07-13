@@ -305,6 +305,19 @@ else:
                 _ca_os.replace(tmp, _CA_STATE)
             except Exception as e:
                 print('[session] state snapshot skipped: %r' % (e,), file=_ca_sys.stderr)
+                # A continuation restored the PREVIOUS run's pickle and it is
+                # still on disk (restore can't delete it -- spawn/forkserver
+                # children re-read it to resolve __main__ targets). Leaving it
+                # here would tar THIS run's files with the LAST run's
+                # variables -- a mixed snapshot no single run ever produced.
+                # Drop the stale pickle (and any partial tmp) best-effort so a
+                # failed snapshot degrades to "files carry, variables reset",
+                # the same shape as a first run.
+                for stale in (tmp, _CA_STATE):
+                    try:
+                        _ca_os.remove(stale)
+                    except OSError:
+                        pass
 
         _ca_atexit.register(_ca_snapshot)
         # A raw os.fork() (unlike multiprocessing's spawn/forkserver, already
