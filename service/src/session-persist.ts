@@ -148,7 +148,7 @@ const PYTHON_SESSION_WRAPPER = String.raw`import sys as _ca_sys
 _ca_saved_path = list(_ca_sys.path)
 _ca_sys.path[:] = [_ca_p for _ca_p in _ca_sys.path if _ca_p not in ('', '/mnt/data')]
 _ca_preexisting_mods = set(_ca_sys.modules.keys())
-import os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib
+import os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib, shutil as _ca_shutil
 try:
     import dill as _ca_pk
     _ca_using_dill = True
@@ -196,6 +196,10 @@ def _ca_unpin_hidden(_ca_displaced):
             _ca_sys.modules.pop(_ca_name, None)
 
 _CA_STATE = '/mnt/data/.session_state.pkl'
+# Import name the wrapped entry file resolves to (e.g. 'main' for main.py).
+# Module aliases to it are neither persisted nor restored -- see the mods
+# loops below.
+_CA_ENTRY_MOD = _ca_os.path.splitext('__CA_ENTRY__')[0]
 _CA_SRC = _ca_b64.b64decode('__USERCODE_B64__').decode('utf-8')
 _ca_linecache.cache['<user_code>'] = (len(_CA_SRC), None, _CA_SRC.splitlines(True), '<user_code>')
 
@@ -261,6 +265,16 @@ else:
             # values.
             if isinstance(_ca_state, dict) and _ca_state.get('__ca_v__') == 1:
                 for _ca_alias, _ca_modname in _ca_state.get('mods', {}).items():
+                    # Never re-import an alias to the entry module itself
+                    # (a prior run's "import main"): importing the wrapped
+                    # entry file at restore time would exec the CURRENT
+                    # payload once through the ordinary-import branch above,
+                    # and then the wrapper runs it again as __main__ --
+                    # doubling every top-level side effect. Snapshots no
+                    # longer record such aliases, but pickles written before
+                    # that fix still carry them.
+                    if _ca_modname == _CA_ENTRY_MOD:
+                        continue
                     try:
                         _ca_ns[_ca_alias] = _ca_importlib.import_module(_ca_modname)
                     except Exception:
@@ -304,10 +318,15 @@ else:
                     continue
                 # Record module aliases by import name so they can be
                 # re-imported on the next run rather than lost (the
-                # advertised "namespace carries").
+                # advertised "namespace carries"). EXCEPT aliases to the
+                # entry module ("import main"): the next run's entry file
+                # holds that run's DIFFERENT source, so re-importing it at
+                # restore time would execute that payload twice (once via
+                # the import branch, once as __main__). The alias simply
+                # doesn't carry.
                 if isinstance(v, _ca_types.ModuleType):
                     name = getattr(v, '__name__', None)
-                    if isinstance(name, str) and name:
+                    if isinstance(name, str) and name and name != _CA_ENTRY_MOD:
                         mods[k] = name
                     continue
                 # Skip open file handles. dill CAN pickle a file handle, but
@@ -334,6 +353,16 @@ else:
                 ok[k] = v
             try:
                 tmp = _CA_STATE + '.tmp'
+                # User code may have left a DIRECTORY at the pickle path or
+                # its tmp sibling; open()/os.replace() would fail on those on
+                # every later continuation too (the collision rides the
+                # snapshot tar), permanently bricking variable persistence.
+                # Clear non-file collisions first so the session recovers.
+                # Symlinks can't appear here: the sandbox strips them from
+                # the workspace before archiving and on restore.
+                for _ca_c in (tmp, _CA_STATE):
+                    if _ca_os.path.isdir(_ca_c):
+                        _ca_shutil.rmtree(_ca_c, ignore_errors=True)
                 with open(tmp, 'wb') as f:
                     _ca_pk.dump({'__ca_v__': 1, 'ns': ok, 'mods': mods}, f)
                 _ca_os.replace(tmp, _CA_STATE)
@@ -346,10 +375,14 @@ else:
                 # variables -- a mixed snapshot no single run ever produced.
                 # Drop the stale pickle (and any partial tmp) best-effort so a
                 # failed snapshot degrades to "files carry, variables reset",
-                # the same shape as a first run.
+                # the same shape as a first run. rmtree handles a directory
+                # planted at either path (os.remove can't), so the collision
+                # never rides the snapshot even if it appeared mid-write.
                 for stale in (tmp, _CA_STATE):
                     try:
                         _ca_os.remove(stale)
+                    except IsADirectoryError:
+                        _ca_shutil.rmtree(stale, ignore_errors=True)
                     except OSError:
                         pass
 
@@ -396,6 +429,8 @@ else:
 export function wrapPythonForSessionPersistence(code: string, entryFileName: string): string {
   const b64 = Buffer.from(code, 'utf-8').toString('base64');
   return PYTHON_SESSION_WRAPPER
-    .replace('__CA_ENTRY__', entryFileName.replace(/[^A-Za-z0-9._-]/g, '_'))
+    // Global: the entry placeholder appears twice (_CA_ENTRY_MOD and
+    // __file__); a plain string .replace would leave the literal second one.
+    .replace(/__CA_ENTRY__/g, entryFileName.replace(/[^A-Za-z0-9._-]/g, '_'))
     .replace('__USERCODE_B64__', b64);
 }

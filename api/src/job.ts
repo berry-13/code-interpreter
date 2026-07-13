@@ -1681,17 +1681,22 @@ export class Job {
   /**
    * Remove the current run's read-only input files (tracked in
    * `inputFileHashes`) so they are never captured in a session snapshot, then
-   * prune any parent directory (e.g. `skill/`) left empty by that removal.
-   * Read-only inputs are the only thing that lived in those directories --
-   * `registerRestoredBaseline` only baselines leaf files, never the directory
-   * itself, so an empty dir surviving into the tar would come back on the
-   * *next* restore as a fresh, unbaselined empty directory. That run's output
-   * walk would then plant a `.dirkeep` for it (and re-trigger this same
-   * emptying/pruning), regenerating a `.dirkeep` output every run and
-   * crowding out real artifacts under `max_output_files`.
+   * remove each directory tree that hosted one (e.g. `skill/`) OUTRIGHT --
+   * not merely when the removal left it empty. Read-only inputs are
+   * non-persistent infrastructure and their directories belong to that
+   * infrastructure: anything else found inside is something sandbox code
+   * planted next to them (e.g. `skill/evil.py`), and letting it ride the
+   * snapshot would restore it alongside the NEXT run's freshly staged
+   * read-only files, poisoning that run's skill/import resolution. Sweeping
+   * the whole tree also means no empty dir survives into the tar to come
+   * back as an unbaselined directory and burn a `.dirkeep` output slot every
+   * run. Trade-off, by design: nothing under a read-only input's directory
+   * persists, not even user-written files. Read-only inputs sitting directly
+   * in the workspace root get only the per-file removal -- the root is the
+   * user's own persistent workspace and is never swept.
    */
   private async removeReadOnlyInputs(): Promise<void> {
-    const emptiedDirs = new Set<string>();
+    const infraDirs = new Set<string>();
     for (const info of this.inputFileHashes.values()) {
       if (info.readOnly && info.path) {
         // Recursive: sandbox code could have replaced the read-only path with
@@ -1702,34 +1707,18 @@ export class Job {
         // infrastructure. stripSymlinks already ran before this, so there's no
         // symlink left in `info.path` for a recursive removal to follow.
         await fsp.rm(info.path, { recursive: true, force: true }).catch(() => { /* best effort */ });
-        emptiedDirs.add(path.dirname(info.path));
+        // Topmost path component under the workspace root (`skill/a/b.py`
+        // -> `skill/`): the whole staged tree is infrastructure, so sweep
+        // from its top, catching siblings at every level.
+        const rel = path.relative(this.submissionDir, info.path);
+        const topSegment = rel.split(path.sep)[0];
+        if (topSegment && rel.includes(path.sep)) {
+          infraDirs.add(path.join(this.submissionDir, topSegment));
+        }
       }
     }
-    for (const dir of emptiedDirs) {
-      await this.pruneEmptyAncestors(dir);
-    }
-  }
-
-  /**
-   * Remove `dir` and each ancestor up to (but not including) `submissionDir`
-   * as long as each is empty, stopping at the first non-empty one. Best-effort.
-   */
-  private async pruneEmptyAncestors(dir: string): Promise<void> {
-    let cursor = dir;
-    while (cursor !== this.submissionDir && cursor.startsWith(this.submissionDir + path.sep)) {
-      let entries: string[];
-      try {
-        entries = await fsp.readdir(cursor);
-      } catch {
-        return;
-      }
-      if (entries.length > 0) return;
-      try {
-        await fsp.rmdir(cursor);
-      } catch {
-        return;
-      }
-      cursor = path.dirname(cursor);
+    for (const dir of infraDirs) {
+      await fsp.rm(dir, { recursive: true, force: true }).catch(() => { /* best effort */ });
     }
   }
 

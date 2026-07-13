@@ -1040,17 +1040,23 @@ function objectFileIdFromListItem(item: unknown): string | undefined {
 }
 
 /**
- * True when a route-param `:fileId` refers to the hidden persistent-session
- * snapshot -- whether given bare (`codeapi-session-state`) or extension-
- * qualified (`codeapi-session-state.tar`, matching how it's actually stored).
- * file-server's object GET/DELETE handlers resolve `:fileId` by PREFIX match
- * against `<session>/<fileId>` (see file-server.ts), so an extension-qualified
- * id passes straight through a bare `=== SESSION_STATE_FILE_ID` check yet
- * still resolves to the same hidden object there. Strips any trailing
- * `.<ext>` before comparing, mirroring `objectFileIdFromListItem` above.
+ * True when a route-param `:fileId` can refer to the hidden persistent-session
+ * snapshot. file-server's object GET/DELETE handlers resolve `:fileId` by
+ * PREFIX match against `<session>/<fileId>` (see file-server.ts), so it is not
+ * enough to block the bare id and the extension-qualified form: ANY strict
+ * prefix (`codeapi-session-stat`, `codeapi-s`, ...) also resolves to the
+ * stored `codeapi-session-state.tar` object there. Reject every prefix of the
+ * stored name, plus any `<id>.<ext>` spelling (mirroring
+ * `objectFileIdFromListItem` above). Over-blocking is harmless: real object
+ * ids are full-length nanoids, which can never be a strict prefix of the
+ * 21-char reserved id, and an exact-length collision is blocked by design.
  */
 function isSessionStateFileId(fileId: string): boolean {
-  return fileId.replace(/\.[^.]+$/, '') === SESSION_STATE_FILE_ID;
+  if (fileId.length === 0) return false;
+  return (
+    `${SESSION_STATE_FILE_ID}.tar`.startsWith(fileId) ||
+    fileId.replace(/\.[^.]+$/, '') === SESSION_STATE_FILE_ID
+  );
 }
 
 router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
