@@ -104,6 +104,20 @@ def ______custom_savefig(*args, **kwargs):
 
 ______plt.savefig = ______custom_savefig
 
+# Re-expose the canonical `plt` alias: /v1/exec code routed through this
+# template has always been able to call `plt.show()` without its own
+# `import matplotlib.pyplot as plt`, and dropping the binding entirely (when
+# the template's helpers moved to `______`-prefixed names) broke e.g.
+# `import seaborn as sns; ...; plt.show()` with a NameError. Guarded so a
+# RESTORED user binding named `plt` is never clobbered -- with persistence,
+# this module scope runs AFTER the wrapper has restored the prior namespace
+# into these same globals, and the unguarded module-level `plt` was removed
+# for exactly that overwrite hazard (see header comment). When we do bind
+# it, later snapshots simply record a module alias, the same as if the user
+# had imported pyplot themselves.
+if 'plt' not in globals():
+    plt = ______plt
+
 # User code runs directly at module scope (inside this `if`, not a function
 # body) so it shares the real module globals rather than a nested local scope.
 # A `def main(): ...` wrapper here would make every name the user assigns

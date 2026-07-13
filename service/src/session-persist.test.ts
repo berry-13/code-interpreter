@@ -107,7 +107,7 @@ describe('wrapPythonForSessionPersistence', () => {
     expect(importBranch).not.toContain('_CA_STATE');
 
     const launchBranch = wrapped.slice(elseIdx);
-    expect(launchBranch).toContain('_ca_atexit.register(_ca_snapshot)');
+    expect(launchBranch).toContain('_ca_atexit.register(_ca_snapshot_pinned)');
     expect(launchBranch).toContain("ModuleType('__main__')");
     expect(launchBranch).toContain('_ca_os.path.exists(_CA_STATE)');
   });

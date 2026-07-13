@@ -156,17 +156,44 @@ except Exception:
     import pickle as _ca_pk
     _ca_using_dill = False
 _ca_sys.path[:] = _ca_saved_path
-# We already hold our own references (_ca_os, _ca_b64, ...), so evict any of
-# THESE SPECIFIC names that this import just newly added to sys.modules
-# (some, like types/io, are typically already cached by CPython's own
-# startup and stay put; others, like base64, typically aren't). Otherwise a
-# later plain "import base64" in user code -- now with /mnt/data restored to
-# sys.path -- would still hit the module WE loaded while the workspace was
-# hidden, rather than performing a fresh lookup that lets a legitimate
-# workspace base64.py shadow it, exactly as it would without persistence.
-for _ca_modname in ('os', 'atexit', 'base64', 'linecache', 'types', 'io', 'importlib', 'dill', 'pickle'):
+# Evict EVERY module these imports newly added to sys.modules -- not just
+# the names imported explicitly, but their transitive dependencies too
+# (dill alone pulls in tempfile, pathlib, dataclasses, ...). Any of them
+# left cached would make a later matching import in user code -- now with
+# /mnt/data restored to sys.path -- hit the module WE loaded while the
+# workspace was hidden, rather than perform a fresh lookup that lets a
+# legitimate workspace tempfile.py/base64.py shadow it, exactly as it
+# would without persistence. The evicted modules are kept aside rather
+# than dropped: dill resolves its OWN internals through sys.modules
+# lazily at load()/dump() time, so the restore/snapshot paths below pin
+# this exact set back in while they run (see _ca_pin_hidden). Without the
+# pin, a workspace shadow of a dill dependency would be re-imported INTO
+# the pickling machinery itself: every value probe then fails, silently
+# bricking the session's variable persistence.
+_ca_hidden_mods = {}
+for _ca_modname in list(_ca_sys.modules):
     if _ca_modname not in _ca_preexisting_mods:
-        _ca_sys.modules.pop(_ca_modname, None)
+        _ca_hidden_mods[_ca_modname] = _ca_sys.modules.pop(_ca_modname)
+
+def _ca_pin_hidden():
+    # Swap the bootstrap's own (real-stdlib) modules back into sys.modules
+    # so dill's lazy sibling imports resolve to the modules it was loaded
+    # with, never a workspace file. Returns whatever entries (user imports
+    # of the same names, i.e. their shadows) were displaced, for
+    # _ca_unpin_hidden to restore.
+    _ca_displaced = {}
+    for _ca_name, _ca_mod in _ca_hidden_mods.items():
+        if _ca_name in _ca_sys.modules:
+            _ca_displaced[_ca_name] = _ca_sys.modules[_ca_name]
+        _ca_sys.modules[_ca_name] = _ca_mod
+    return _ca_displaced
+
+def _ca_unpin_hidden(_ca_displaced):
+    for _ca_name in _ca_hidden_mods:
+        if _ca_name in _ca_displaced:
+            _ca_sys.modules[_ca_name] = _ca_displaced[_ca_name]
+        else:
+            _ca_sys.modules.pop(_ca_name, None)
 
 _CA_STATE = '/mnt/data/.session_state.pkl'
 _CA_SRC = _ca_b64.b64decode('__USERCODE_B64__').decode('utf-8')
@@ -219,8 +246,15 @@ else:
 
     if _ca_os.path.exists(_CA_STATE):
         try:
-            with open(_CA_STATE, 'rb') as _ca_f:
-                _ca_state = _ca_pk.load(_ca_f)
+            # Pin only around the load itself: dill may lazily re-import its
+            # own submodules here. The alias re-import loop below must stay
+            # UNPINNED so a user alias resolves workspace shadows normally.
+            _ca_displaced = _ca_pin_hidden()
+            try:
+                with open(_CA_STATE, 'rb') as _ca_f:
+                    _ca_state = _ca_pk.load(_ca_f)
+            finally:
+                _ca_unpin_hidden(_ca_displaced)
             # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
             # Re-import module aliases by name first (so "import pandas as pd"
             # in one cell leaves pd bound in the next), then restore pickled
@@ -319,7 +353,21 @@ else:
                     except OSError:
                         pass
 
-        _ca_atexit.register(_ca_snapshot)
+        def _ca_snapshot_pinned():
+            # By snapshot time user code may have imported ITS OWN shadow of
+            # a bootstrap dependency (that was the point of the eviction
+            # above); pin the real set while dill probes/dumps, then put the
+            # user's entries back. User atexit callbacks run before this one
+            # (atexit is LIFO and this registration precedes user code), so
+            # nothing user-visible executes during the pin window except
+            # daemon threads, which are torn down mid-flight anyway.
+            _ca_displaced = _ca_pin_hidden()
+            try:
+                _ca_snapshot()
+            finally:
+                _ca_unpin_hidden(_ca_displaced)
+
+        _ca_atexit.register(_ca_snapshot_pinned)
         # A raw os.fork() (unlike multiprocessing's spawn/forkserver, already
         # handled above) duplicates the WHOLE process, atexit registry
         # included: the child inherits this exact registration. If the child
@@ -332,7 +380,7 @@ else:
         # the one process whose namespace this snapshot actually describes
         # ever persists it.
         try:
-            _ca_os.register_at_fork(after_in_child=lambda: _ca_atexit.unregister(_ca_snapshot))
+            _ca_os.register_at_fork(after_in_child=lambda: _ca_atexit.unregister(_ca_snapshot_pinned))
         except (AttributeError, ValueError):
             pass  # register_at_fork is POSIX-only; not expected to be missing here
 

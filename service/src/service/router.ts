@@ -182,6 +182,20 @@ async function claimPriorSnapshotRef(pointerKey: string, refTtlSeconds: number):
   return typeof result === 'string' && result.length > 0 ? result : null;
 }
 
+/* Releases one ref. A plain DECR on a key that has already EXPIRED would mint
+ * a fresh counter at -1 and read as "last ref drained" -- but expiry means the
+ * refcount is simply UNKNOWN: a continuation queued longer than
+ * SNAPSHOT_REF_TTL_SECONDS (its claim's EXPIRE lapsing before the job ran) may
+ * still be about to restore the snapshot this key guards -- including this
+ * very handler's own still-queued job, whose finally block gives up waiting
+ * after the same TTL. EXISTS+DECR in one script is atomic (Redis serializes
+ * scripts), and a missing key reports a positive remainder so the caller stays
+ * conservative and keeps the snapshot, the same stance the pointer-read
+ * failure path below takes. */
+const RELEASE_SNAPSHOT_REF = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 1 end
+return redis.call('DECR', KEYS[1])`;
+
 /* Bound on both the snapshot ref key's own TTL and how long the `finally`
  * block below will keep waiting for a still-queued job before giving up and
  * releasing the ref anyway -- past max run time + a generous queue-wait
@@ -499,7 +513,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
           await job.waitUntilFinished(queueEvents, SNAPSHOT_REF_TTL_SECONDS * 1000).catch(() => { /* released below regardless of outcome */ });
         }
       }
-      const remaining = await connection.decr(snapshotRefKey).catch(() => 1);
+      const remaining = Number(await connection.eval(RELEASE_SNAPSHOT_REF, 1, snapshotRefKey).catch(() => 1));
       if (remaining <= 0 && priorSnapshotSession !== session_id) {
         // We're the last in-flight referencer. Delete the prior snapshot only if
         // the pointer no longer references it -- i.e. some run has advanced past

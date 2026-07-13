@@ -443,7 +443,11 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
        * last good snapshot (as any other skipped persist already does) is
        * safer than manufacturing a snapshot no single run ever produced. A
        * plain nonzero exit (an uncaught exception, or the user's own
-       * `sys.exit(n)`) still runs atexit normally and is not skipped here. */
+       * `sys.exit(n)`) still runs atexit normally and is not skipped here.
+       * Exits that bypass atexit WITHOUT a signal -- os._exit(0), os.exec*
+       * -- can't be told apart from a clean exit here; persistSessionState
+       * itself catches those by fingerprinting the restored pickle and
+       * skipping when this run never rewrote it. */
       if (wasKilledBySignal(result.run)) {
         result.session_state_persisted = false;
       } else {

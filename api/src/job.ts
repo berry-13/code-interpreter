@@ -773,6 +773,10 @@ export class Job {
    *  persistSessionState() so the resulting cold workspace never supersedes
    *  (and deletes) the session's last good snapshot. */
   private sessionRestoreFailed = false;
+  /** Identity (inode + mtime) of the restored `.session_state.pkl` right
+   *  after extraction, if one was present. persistSessionState compares
+   *  against it to detect a Python run whose atexit snapshot never fired. */
+  private restoredPickleStat: { ino: number; mtimeMs: number } | undefined;
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -1252,6 +1256,16 @@ export class Job {
       // otherwise a session with many restored files would exhaust
       // max_output_files before a new plot/report and drop it from the response.
       await this.registerRestoredBaseline(this.submissionDir);
+      // Fingerprint the restored namespace pickle (if any) so persist time
+      // can tell whether THIS run's wrapper actually rewrote it -- see the
+      // atexit-bypass gate in persistSessionState. The chown/chmod passes
+      // above touch neither inode nor mtime, so the identity is stable.
+      const pklStat = await fsp
+        .lstat(path.join(this.submissionDir, SESSION_STATE_PKL_BASENAME))
+        .catch(() => null);
+      if (pklStat?.isFile()) {
+        this.restoredPickleStat = { ino: pklStat.ino, mtimeMs: pklStat.mtimeMs };
+      }
       this.log.info({ size }, 'Restored persisted session workspace');
     } catch (err) {
       // Documented contract is "start empty on restore failure". A corrupt or
@@ -1344,6 +1358,27 @@ export class Job {
     // saw a cold workspace, and snapshotting it would supersede -- and via
     // the service's CAS-advance, delete -- the last good snapshot.
     if (this.sessionRestoreFailed) return false;
+    // Python's persistence wrapper rewrites the namespace pickle from atexit
+    // (os.replace -> new inode + mtime) or, on a failed dump, deletes it. If
+    // a restored pickle is still the IDENTICAL file at persist time, this
+    // run's atexit never fired despite a signal-free exit -- os._exit(0) or
+    // os.exec* bypass atexit without setting run.signal (signal deaths are
+    // already gated in v2.ts). Persisting would tar THIS run's files with
+    // the PRIOR run's variables -- the same torn state the signal gate
+    // avoids -- so skip and leave the pointer on the last good snapshot.
+    // Python-only: other languages never rewrite the pickle by design
+    // (file-only persistence), so an untouched pickle is expected there and
+    // must keep persisting -- it is how Python variables survive an
+    // intervening run of another language in the same session.
+    if (this.restoredPickleStat && this.runtime.language === 'python') {
+      const st = await fsp
+        .lstat(path.join(this.submissionDir, SESSION_STATE_PKL_BASENAME))
+        .catch(() => null);
+      if (st?.isFile() && st.ino === this.restoredPickleStat.ino && st.mtimeMs === this.restoredPickleStat.mtimeMs) {
+        this.log.warn('Restored namespace pickle untouched; atexit snapshot never ran (os._exit/exec*) -- skipping persist');
+        return false;
+      }
+    }
 
     const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
     try {
