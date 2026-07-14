@@ -260,11 +260,23 @@ function restoreFailureKey(snapshotSession: string): string {
 }
 
 /* Deletes the pointer only if it still names the snapshot whose restore kept
- * failing -- a concurrent run that already advanced it must not be undone. */
+ * failing -- a concurrent run that already advanced it must not be undone --
+ * AND no OTHER continuation currently holds a claim on that snapshot
+ * (KEYS[2] is its snapshotrefs counter; the caller's own ref is still held
+ * at this point, hence <= 1). Without the ref check, three transient blips
+ * under concurrency could delete the pointer while a run that restored the
+ * SAME snapshot successfully is still executing -- its later CAS would find
+ * the key missing and discard a perfectly valid snapshot, resetting a
+ * healthy session. Skipping the release is safe: the failure streak stays
+ * >= the limit, so any later failure with no other claims in flight
+ * releases it then. */
 const RELEASE_DEAD_POINTER = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then
-  redis.call('DEL', KEYS[1])
-  return 1
+  local refs = tonumber(redis.call('GET', KEYS[2]) or '0')
+  if refs <= 1 then
+    redis.call('DEL', KEYS[1])
+    return 1
+  end
 end
 return 0`;
 
@@ -282,11 +294,20 @@ async function noteRestoreFailure(sessionKey: string, priorSnapshotSession: stri
     const fails = await connection.incr(failKey);
     await connection.expire(failKey, env.SESSION_STATE_TTL_SECONDS);
     if (fails >= SESSION_RESTORE_FAILURE_LIMIT) {
-      const released = await connection.eval(RELEASE_DEAD_POINTER, 1, sessionStatePointerKey(sessionKey), priorSnapshotSession);
+      const released = await connection.eval(
+        RELEASE_DEAD_POINTER,
+        2,
+        sessionStatePointerKey(sessionKey),
+        `snapshotrefs:${priorSnapshotSession}`,
+        priorSnapshotSession,
+      );
       if (released === 1) {
         logger.warn(`[${INSTANCE_ID}] Released session pointer after ${fails} consecutive failed restores`);
+        // Only clear the streak when the release actually happened -- a
+        // skipped release (other claims in flight) must keep the count at
+        // the limit so a later lone failure can still release.
+        await connection.del(failKey);
       }
-      await connection.del(failKey);
     }
   } catch (error) {
     logger.error(`[${INSTANCE_ID}] Failed to record restore failure:`, error);

@@ -55,6 +55,13 @@ const defaultMaxFileSize = Number(process.env.MAX_FILE_SIZE) || 25 * 1024 * 1024
 const defaultExecutionManifestTtlSeconds = Math.min(Math.ceil((defaultJobTimeoutMs + 60000) / 1000), 600);
 const EGRESS_GRANT_GRACE_MS = 10 * 60 * 1000;
 
+/** Parse an env var as a positive integer, falling back on anything
+ *  fractional, negative, zero, non-finite, or unset. */
+function positiveIntEnv(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
+}
+
 export function resolveEgressGrantTtlSeconds(rawTtlSeconds: string | undefined, jobTimeoutMs: number): number {
   const defaultTtlSeconds = Math.max(1, Math.ceil((jobTimeoutMs + EGRESS_GRANT_GRACE_MS) / 1000));
   if (rawTtlSeconds == null || rawTtlSeconds.trim() === '') {
@@ -123,10 +130,14 @@ export const env = {
   PERSIST_SESSIONS: process.env.CODEAPI_PERSIST_SESSIONS === 'true',
   // Cap on the persisted workspace tar; oversize snapshots are skipped (the run
   // still succeeds), so a runaway workspace can't balloon object storage.
-  SESSION_STATE_MAX_BYTES: Number(process.env.CODEAPI_SESSION_STATE_MAX_BYTES) || 104_857_600,
+  SESSION_STATE_MAX_BYTES: positiveIntEnv(process.env.CODEAPI_SESSION_STATE_MAX_BYTES, 104_857_600),
   // Idle expiry for the persisted state object. Refreshed on every run, so an
   // active session never expires; an abandoned one is collected after this.
-  SESSION_STATE_TTL_SECONDS: Number(process.env.CODEAPI_SESSION_STATE_TTL_SECONDS) || 604_800,
+  // Clamped to a positive integer: the value goes straight into Redis
+  // SET ... EX / EXPIRE, which reject fractional/negative/non-finite expiries
+  // -- a bad value would make every pointer advance/refresh fail and every
+  // run start cold despite persistence being enabled.
+  SESSION_STATE_TTL_SECONDS: positiveIntEnv(process.env.CODEAPI_SESSION_STATE_TTL_SECONDS, 604_800),
   /** Strict tenant isolation. When true, sessionKey resolution fails closed
    *  (500) on requests whose auth context lacks `tenantId`, instead of
    *  silently falling back to the `'legacy'` tenant prefix. Default OFF in
