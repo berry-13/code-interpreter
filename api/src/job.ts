@@ -735,15 +735,6 @@ interface InputFileInfo {
    * persist like any other workspace file.
    */
   staged?: boolean;
-  /**
-   * Set when this CURRENT-run entry replaced a restored baseline at the same
-   * path. The entry itself is ordinary current input (walker semantics
-   * unchanged), but nameTouchesRestoredState must still know the prior
-   * snapshot holds an older version here: if this run's re-upload of the
-   * path fails, excluding it from the snapshot would supersede (and delete)
-   * that last good copy.
-   */
-  replacedRestored?: boolean;
 }
 
 interface ExecuteResult {
@@ -815,6 +806,9 @@ export class Job {
    *  after extraction, if one was present. persistSessionState compares
    *  against it to detect a Python run whose atexit snapshot never fired. */
   private restoredPickleStat: { ino: number; mtimeMs: number } | undefined;
+  /** True once a prior snapshot was successfully restored this run -- a
+   *  last-good snapshot exists that this run's persist would supersede. */
+  private sessionRestoredOk = false;
   /** Set when this run's workspace was degraded by infrastructure failure
    *  (e.g. a restored carry-over was discarded because its replacement input
    *  failed to download). Unlike sessionRestoreFailed the restore itself
@@ -827,10 +821,6 @@ export class Job {
    *  where the baseline would suppress it as an unchanged carry-over and the
    *  caller could never obtain a ref for it. */
   private snapshotExcludedNames = new Set<string>();
-  /** Restored-baseline rel paths whose entries were dropped by a collision
-   *  cleanup (dropRestoredBaselines). The prior snapshot still holds these,
-   *  so nameTouchesRestoredState consults them alongside the live map. */
-  private clearedRestoredPaths = new Set<string>();
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -1188,14 +1178,12 @@ export class Job {
           await this.clearNonRegularCollision(finalPath);
           await fsp.rename(tempPath, finalPath);
           await this.applySandboxFilePermissions(finalPath);
-          const prior = this.inputFileHashes.get(originalName);
           this.inputFileHashes.set(originalName, {
             originalId: file.id,
             originalSessionId: file.storage_session_id!,
             hash,
             path: finalPath,
             readOnly: readOnly || undefined,
-            replacedRestored: (prior?.restored || prior?.replacedRestored) || undefined,
           });
         });
         /* Defense-in-depth: keep read-only inputs root-owned + 0444 so the
@@ -1433,6 +1421,12 @@ export class Job {
       if (pklStat?.isFile()) {
         this.restoredPickleStat = { ino: pklStat.ino, mtimeMs: pklStat.mtimeMs };
       }
+      // A prior snapshot was restored: this run's persist would SUPERSEDE it.
+      // Guards the failed-upload path (excludeFromSessionSnapshot) -- once a
+      // last-good snapshot exists, any output whose upload failed makes a
+      // surgical exclusion unsafe (a renamed/moved restored file's new name
+      // isn't path-detectable), so persistence blocks instead.
+      this.sessionRestoredOk = true;
       this.log.info({ size }, 'Restored persisted session workspace');
     } catch (err) {
       // Documented contract is "start empty on restore failure". A corrupt or
@@ -1560,6 +1554,61 @@ export class Job {
     }
   }
 
+  /**
+   * Names that are runtime plumbing, never user outputs.
+   *
+   * `_ptc_history.json`: the PTC replay preamble injects this tool-history
+   * fixture at the workspace root for deterministic cached results. (Earlier
+   * prefix-form `_ptc_*` matching ate any user file starting with `_ptc_`; the
+   * exact basename avoids that regression. Tempfiles like `_ptc_pending.*`
+   * live in `/tmp`, never the submission dir.) MUST stay in sync with
+   * `PTC_HISTORY_FILENAME` in `service/src/ptc-constants.ts` (separate npm
+   * package -- asserted equal in `service/scripts/test-ptc-sentinel.ts`).
+   *
+   * `.session_state.pkl`(+`.tmp`): the dill namespace snapshot and its
+   * atomic-write tempfile. Gated on persistSession: with persistence off the
+   * wrapper never writes these, so a user file using the name is an ordinary
+   * artifact and must not vanish from the response. MUST stay in sync with
+   * SESSION_STATE_FILENAME in `service/src/session-persist.ts`.
+   */
+  private isReservedOutputName(name: string): boolean {
+    if (name === '_ptc_history.json') return true;
+    return this.persistSession !== undefined &&
+      (name === SESSION_STATE_PKL_BASENAME || name === `${SESSION_STATE_PKL_BASENAME}.tmp`);
+  }
+
+  /**
+   * True when any entry from `startIdx` onward would become a genuine new
+   * OUTPUT (so a cap-full break really hid something and persistence must
+   * block). Skips entries that never surface as outputs regardless of the
+   * cap: reserved plumbing, the echoed entry source, invalid-shape paths,
+   * and hidden dirs with no primed inputs. A regular file or a walkable
+   * directory counts -- an unchanged restored carry-over trailing here would
+   * over-count, but it round-trips via the snapshot tar (never a permanently
+   * invisible artifact), so a spurious block there is at worst lost variable
+   * continuity for one max-output run, not data loss.
+   */
+  private async remainingHasOutputCandidate(
+    entries: fs.Dirent[],
+    startIdx: number,
+    dir: string,
+    inputByName: Map<string, TFile>,
+  ): Promise<boolean> {
+    for (let i = startIdx; i < entries.length; i++) {
+      const entry = entries[i];
+      if (this.isReservedOutputName(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(this.submissionDir, full);
+      if (!isValidPathShape(rel)) continue;
+      if (rel === this.entryPointName) continue; // echoed source, never an output
+      const kind = await this.classifyDirent(entry, full, rel);
+      if (kind === 'skip') continue;
+      if (kind === 'dir' && isHiddenDirectory(entry.name) && !inputsLiveUnder(inputByName, rel)) continue;
+      return true;
+    }
+    return false;
+  }
+
   /** True when a prior snapshot was expected but could not be restored this
    *  run. Reported to the service so it does not refresh the (possibly dead)
    *  pointer's TTL -- see the router's refresh branch. */
@@ -1571,48 +1620,24 @@ export class Job {
    *  session snapshot -- used for files pruned from the response because
    *  their upload never reached the file server. */
   excludeFromSessionSnapshot(names: string[]): void {
-    for (const name of names) {
-      // A failed upload that touches RESTORED state must block the whole
-      // snapshot instead of excluding the path: excluding would publish a
-      // snapshot missing BOTH the new file and whatever restored content it
-      // replaced, superseding (and deleting) the last good snapshot that
-      // still holds the prior version -- a transient upload blip would erase
-      // the carry-over entirely. That covers not just an exact restored
-      // baseline (a modified restored file) but also a generated file that
-      // replaced a restored DIRECTORY (baselines live under `name/`) or was
-      // created under a replaced restored ancestor. Blocking keeps the
-      // pointer on the last good state; only this run's changes are lost.
-      if (this.nameTouchesRestoredState(name)) {
-        this.sessionPersistBlocked = true;
-        this.log.warn({ file: name }, 'Failed upload touches restored session state; blocking session persist');
-        continue;
-      }
-      this.snapshotExcludedNames.add(name);
+    // On a CONTINUATION (a prior snapshot was restored), any failed upload
+    // blocks persistence outright. Surgical exclusion is only sound when the
+    // excluded path can be proven not to drop restored content, but a
+    // restored file the run RENAMED (a.txt -> generated b.txt) surfaces the
+    // failure at b.txt, whose name touches no restored baseline by path --
+    // so excluding b.txt and advancing would delete a.txt from the lineage
+    // and lose the last good copy to a transient blip. Blocking keeps the
+    // pointer on the last good snapshot; the next run retries. Path-based
+    // detection can't see renames, so we can't do better cheaply.
+    if (this.sessionRestoredOk && names.length > 0) {
+      this.sessionPersistBlocked = true;
+      this.log.warn({ files: names }, 'Failed upload on a restored session; blocking session persist');
+      return;
     }
-  }
-
-  /** True when `name` has a restored baseline (or a current entry that
-   *  REPLACED one -- see replacedRestored) at the exact path, under it
-   *  (`name/` -- it replaced a restored directory), or at any ancestor
-   *  segment (it was created inside a replaced restored file's path). */
-  private nameTouchesRestoredState(name: string): boolean {
-    const touches = (rel: string): boolean => {
-      const info = this.inputFileHashes.get(rel);
-      return Boolean(info && (info.restored || info.replacedRestored)) || this.clearedRestoredPaths.has(rel);
-    };
-    if (touches(name)) return true;
-    const prefix = `${name}/`;
-    for (const [key, info] of this.inputFileHashes) {
-      if ((info.restored || info.replacedRestored) && key.startsWith(prefix)) return true;
-    }
-    for (const key of this.clearedRestoredPaths) {
-      if (key.startsWith(prefix)) return true;
-    }
-    const segments = name.split('/').filter(Boolean);
-    for (let i = segments.length - 1; i > 0; i--) {
-      if (touches(segments.slice(0, i).join('/'))) return true;
-    }
-    return false;
+    // First run (no prior snapshot to protect): the failed file simply
+    // doesn't enter this session's first snapshot, consistent with the
+    // response. Exclude it and let the rest persist.
+    for (const name of names) this.snapshotExcludedNames.add(name);
   }
 
   /**
@@ -2084,19 +2109,13 @@ export class Job {
    * on-disk tree was removed by a collision cleanup. A leftover entry would
    * make a file the run RECREATES at that path -- even with identical bytes
    * -- look like an unchanged carry-over and be suppressed from the response,
-   * despite being generated by this run. The dropped paths are remembered in
-   * `clearedRestoredPaths`: the prior snapshot still holds them, and this
-   * runs BEFORE the replacing input's registration can mark itself
-   * replacedRestored -- without the record, a later failed upload at or
-   * around these paths would take the surgical-exclusion path and supersede
-   * the last good copy.
+   * despite being generated by this run.
    */
   private dropRestoredBaselines(rel: string): void {
     const prefix = `${rel}/`;
     for (const [key, info] of [...this.inputFileHashes.entries()]) {
       if (info.restored && (key === rel || key.startsWith(prefix))) {
         this.inputFileHashes.delete(key);
-        this.clearedRestoredPaths.add(key);
       }
     }
   }
@@ -2211,13 +2230,7 @@ export class Job {
       await this.clearNonRegularCollision(filePath);
       await fsp.writeFile(filePath, content);
       await this.applySandboxFilePermissions(filePath);
-      const prior = this.inputFileHashes.get(file.name);
-      this.inputFileHashes.set(file.name, {
-        hash,
-        path: filePath,
-        staged: true,
-        replacedRestored: (prior?.restored || prior?.replacedRestored) || undefined,
-      });
+      this.inputFileHashes.set(file.name, { hash, path: filePath, staged: true });
     });
   }
 
@@ -2753,36 +2766,8 @@ export class Job {
       return 'skipped';
     }
 
-    /** The PTC replay preamble injects a single tool-history fixture file at
-     * `<submissionDir>/_ptc_history.json` so user code can read deterministic
-     * cached results without going back to the service. It is runtime plumbing
-     * and must never echo back as a session output. The previous prefix-form
-     * (`_ptc_*`) silently ate any user file starting with `_ptc_`, which is a
-     * regression for non-replay workloads — match the exact basename instead.
-     * Tempfiles like `_ptc_pending.*` and `_ptc_counter.*` written by the bash
-     * preamble live in `/tmp` and never reach the submission dir, so they
-     * don't need walkDir-side filtering.
-     *
-     * NOTE: This MUST stay in sync with `PTC_HISTORY_FILENAME` in
-     * `services/codeapi/service/src/ptc-constants.ts`. The two workspaces are
-     * separate npm packages so we can't import directly; the filename literal
-     * is asserted-equal in `service/scripts/test-ptc-sentinel.ts` to catch
-     * accidental drift in CI. */
-    const PTC_HISTORY_FILENAME = '_ptc_history.json';
-    /* Persistent-session artifacts written under /mnt/data: the dill namespace
-     * snapshot and its atomic-write tempfile. They are private runtime plumbing
-     * that rides inside the workspace tar and must never echo back as a session
-     * output. MUST stay in sync with SESSION_STATE_FILENAME in
-     * `service/src/session-persist.ts` (separate npm package — can't import).
-     * Gated on persistSession: with persistence off the wrapper never writes
-     * these, so a user file that happens to use the name is an ordinary
-     * artifact and must not silently vanish from the response. */
-    const SESSION_STATE_RESERVED = new Set(['.session_state.pkl', '.session_state.pkl.tmp']);
-    const isReservedOutputName = (name: string): boolean =>
-      name === PTC_HISTORY_FILENAME || (this.persistSession !== undefined && SESSION_STATE_RESERVED.has(name));
-
     const nonDirkeepCount = entries.reduce(
-      (n, e) => (e.name === DIRKEEP || isReservedOutputName(e.name) ? n : n + 1),
+      (n, e) => (e.name === DIRKEEP || this.isReservedOutputName(e.name) ? n : n + 1),
       0,
     );
 
@@ -2797,16 +2782,23 @@ export class Job {
      * `'skipped'` fall-through that suppresses marker creation. */
     let skippedHiddenDirs = 0;
 
-    for (const entry of entries) {
+    for (let entryIdx = 0; entryIdx < entries.length; entryIdx++) {
+      const entry = entries[entryIdx];
       if (this.isOutputCapFull()) {
-        // Entries remain but no slots do -- some of them may be would-be
-        // outputs this response will never mention; conservatively treat it
-        // as truncation for the persistence gate.
-        this.noteOutputTruncation(path.relative(this.submissionDir, dir) || '.');
+        // No slots left. Treat as truncation for the persistence gate ONLY
+        // if a genuine would-be OUTPUT remains among the unprocessed
+        // entries: readdir order could leave only infrastructure here
+        // (the entry file, reserved session artifacts, or hidden dirs that
+        // never surface as outputs), in which case nothing was actually
+        // hidden and blocking persistence would needlessly cost a max-output
+        // run its variable/file continuity.
+        if (await this.remainingHasOutputCandidate(entries, entryIdx, dir, inputByName)) {
+          this.noteOutputTruncation(path.relative(this.submissionDir, dir) || '.');
+        }
         truncated = true;
         break;
       }
-      if (isReservedOutputName(entry.name)) continue;
+      if (this.isReservedOutputName(entry.name)) continue;
 
       const fullPath = path.join(dir, entry.name);
       const relativePath = path.relative(this.submissionDir, fullPath);
