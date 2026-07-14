@@ -782,8 +782,7 @@ export class Job {
   private inputFileHashes = new Map<string, InputFileInfo>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
-  /** Serializes parent-dir preparation across parallel fileOps -- see
-   *  prepareParentDir. */
+  /** Serializes input placement across parallel fileOps -- see runStaged. */
   private dirPrepChain: Promise<void> = Promise.resolve();
   private persistSession: { file_id: string; filename: string; restore_session_id?: string } | undefined;
   /** A prior snapshot existed but could not be restored this run; gates
@@ -1130,16 +1129,27 @@ export class Job {
         }
         lastResolvedName = originalName;
         const finalPath = path.join(this.submissionDir, originalName);
-        await this.prepareParentDir(path.dirname(finalPath));
 
-        const hash = await this.streamToDisk(response, tempPath, finalPath);
+        // Stream to the temp path OUTSIDE the staging lock (tempPath lives
+        // at the workspace root, needing no parent prep), then place +
+        // register atomically under it -- see runStaged.
+        const hash = await this.streamToTemp(response, tempPath);
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
-        this.inputFileHashes.set(originalName, {
-          originalId: file.id,
-          originalSessionId: file.storage_session_id!,
-          hash,
-          path: finalPath,
-          readOnly: readOnly || undefined,
+        await this.runStaged(async () => {
+          await this.prepareParentDirUnderLock(path.dirname(finalPath));
+          // A prior persisted run may have left a directory/other node where
+          // this input must land; rename() over it would fail
+          // (EISDIR/ENOTEMPTY).
+          await this.clearNonRegularCollision(finalPath);
+          await fsp.rename(tempPath, finalPath);
+          await this.applySandboxFilePermissions(finalPath);
+          this.inputFileHashes.set(originalName, {
+            originalId: file.id,
+            originalSessionId: file.storage_session_id!,
+            hash,
+            path: finalPath,
+            readOnly: readOnly || undefined,
+          });
         });
         /* Defense-in-depth: keep read-only inputs root-owned + 0444 so the
          * sandbox UID can read them but cannot chmod them back to writable. */
@@ -1902,28 +1912,42 @@ export class Job {
   }
 
   /**
-   * Clear restored-session ancestor collisions, create `parent`, and secure
-   * its chain -- SERIALIZED across the parallel fileOps in prime(). Without
-   * the lock, two inputs nested under the same restored regular file (say a
-   * prior run left `data` as a file and this request stages `data/a.csv` and
+   * Serializes each input's FINAL PLACEMENT (ancestor-collision cleanup,
+   * parent mkdir/chmod, collision clear, write/rename, and inputFileHashes
+   * registration) across the parallel fileOps in prime(). Without the lock,
+   * two inputs nested under the same restored regular file (say a prior run
+   * left `data` as a file and this request stages `data/a.csv` and
    * `data/b.csv`) can interleave: both lstat the stale `data` file, one
    * replaces it with a directory and writes its input, and the other's stale
    * "non-directory" verdict then recursively removes that fresh directory --
-   * erasing the sibling's already-written file (and, since secureAncestors
-   * caches secured paths, the recreated tree could skip its ownership fix).
-   * The guarded section is fast pure-metadata work; the actual download
-   * streaming stays fully parallel.
+   * erasing the sibling's already-written file. Registration lives INSIDE
+   * the section for the same reason: a sibling's file on disk but not yet in
+   * `inputFileHashes` would read as removable restored debris to another
+   * input's collision cleanup. Only fast metadata work and the final
+   * rename/small write run under the lock; download STREAMING (to the temp
+   * path) stays fully parallel.
    */
-  private prepareParentDir(parent: string): Promise<void> {
-    const run = this.dirPrepChain.then(async () => {
-      await this.clearNonDirectoryAncestors(parent);
-      await fsp.mkdir(parent, { recursive: true });
-      await this.secureAncestors(parent);
-    });
+  private runStaged<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.dirPrepChain.then(fn, fn);
     // Keep the chain alive whether or not this link rejects; the caller
     // still observes the rejection through `run`.
     this.dirPrepChain = run.then(() => undefined, () => undefined);
     return run;
+  }
+
+  /**
+   * Collision-clear + create + secure the parent chain for one input's final
+   * path. MUST run inside runStaged(): the check-then-remove decisions here
+   * are only sound while no sibling is concurrently placing files, and the
+   * final placement itself (write/rename + inputFileHashes registration)
+   * must be in the SAME critical section -- a sibling whose file is on disk
+   * but not yet registered would otherwise look like removable restored
+   * debris to this cleanup (see downloadAndWriteFile / writeFile).
+   */
+  private async prepareParentDirUnderLock(parent: string): Promise<void> {
+    await this.clearNonDirectoryAncestors(parent);
+    await fsp.mkdir(parent, { recursive: true });
+    await this.secureAncestors(parent);
   }
 
   /**
@@ -1965,15 +1989,11 @@ export class Job {
   }
 
   /**
-   * Streams the response body to `tempPath`, computes its SHA-256 inline,
-   * then atomically renames to `finalPath` with sandbox-visible perms.
-   * Returns the hex digest.
+   * Streams the response body to `tempPath`, computing its SHA-256 inline.
+   * Returns the hex digest. Final placement (collision clear + rename +
+   * perms + registration) happens in the caller, under the staging lock.
    */
-  private async streamToDisk(
-    response: Response,
-    tempPath: string,
-    finalPath: string,
-  ): Promise<string> {
+  private async streamToTemp(response: Response, tempPath: string): Promise<string> {
     const body = response.body;
     if (!body) throw new Error('Response body is null');
 
@@ -1984,11 +2004,6 @@ export class Job {
     const fileStream = fs.createWriteStream(tempPath, { mode: SANDBOX_FILE_MODE });
     const reader = toNodeReadable(body);
     await pipeline(reader, hashTransform, fileStream);
-    // A prior persisted run may have left a directory/other node where this
-    // input must land; rename() over it would fail (EISDIR/ENOTEMPTY).
-    await this.clearNonRegularCollision(finalPath);
-    await fsp.rename(tempPath, finalPath);
-    await this.applySandboxFilePermissions(finalPath);
     return hashStream.digest('hex');
   }
 
@@ -2000,13 +2015,14 @@ export class Job {
     const filePath = path.join(this.submissionDir, file.name);
 
     const content = Buffer.from(file.content ?? '', (file.encoding as BufferEncoding) ?? 'utf8');
-    await this.prepareParentDir(path.dirname(filePath));
-    await this.clearNonRegularCollision(filePath);
-    await fsp.writeFile(filePath, content);
-    await this.applySandboxFilePermissions(filePath);
-
     const hash = crypto.createHash('sha256').update(content).digest('hex');
-    this.inputFileHashes.set(file.name, { hash, path: filePath, staged: true });
+    await this.runStaged(async () => {
+      await this.prepareParentDirUnderLock(path.dirname(filePath));
+      await this.clearNonRegularCollision(filePath);
+      await fsp.writeFile(filePath, content);
+      await this.applySandboxFilePermissions(filePath);
+      this.inputFileHashes.set(file.name, { hash, path: filePath, staged: true });
+    });
   }
 
   async safeCall(
@@ -2370,6 +2386,17 @@ export class Job {
   }): { collected: boolean; truncated: boolean } | null {
     const { wasModified, inputFileInfo, existingFile, relativePath } = ctx;
     const isReadOnly = inputFileInfo?.readOnly === true;
+    // Persistent runs: the wrapper materializes the user source over the
+    // staged entry file for the run's duration and restores the wrapper
+    // bytes from atexit -- any exit that bypasses atexit (SIGKILL/timeout,
+    // os._exit, os.exec*) leaves the entry "modified" here. The entry is run
+    // infrastructure either way (it never persists, and a user file with its
+    // name is a documented reservation), so swallow it silently rather than
+    // surface wrapper-vs-source churn as a generated artifact that burns an
+    // output slot in exactly the failure cases persistence handles specially.
+    if (this.persistSession && inputFileInfo?.staged && relativePath === this.entryPointName) {
+      return { collected: true, truncated: false };
+    }
     if (wasModified && !isReadOnly) return null;
     if (!inputFileInfo) return null;
     if (!existingFile) return null;

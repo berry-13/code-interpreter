@@ -470,6 +470,20 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       if (job.sessionRestoreDidFail()) {
         result.session_state_restore_failed = true;
       }
+      /* Rollout flag-skew: the service expected a restore (persist_session
+       * with a restore marker) but THIS runner has persistence disabled, so
+       * getJob stripped the marker and nothing was restored or persisted.
+       * Without this, the response carries neither session_state flag, and
+       * the service's skipped-persist branch would refresh the old pointer
+       * as if the restore succeeded -- keeping stale state alive while this
+       * run executed cold and its changes are silently dropped from the
+       * session. Reporting it as a failed restore skips that refresh; if the
+       * skew persists, the failure streak eventually releases the pointer,
+       * which is the intended pressure valve during a misrollout. */
+      const requestedPersist = (req.body as { persist_session?: { restore_session_id?: string } })?.persist_session;
+      if (!config.persist_sessions && requestedPersist?.restore_session_id) {
+        result.session_state_restore_failed = true;
+      }
 
       metricsOutcome = 'success';
       return res.status(200).json(result);
