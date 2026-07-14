@@ -281,10 +281,22 @@ else:
             _ca_had_entry = _CA_ENTRY_MOD in _ca_sys.modules
             _ca_entry_saved = _ca_sys.modules.get(_CA_ENTRY_MOD)
             _ca_sys.modules[_CA_ENTRY_MOD] = None
+            # Also hide the workspace from imports for the load's duration: a
+            # legacy pickle may hold a value pickled by reference through a
+            # workspace module ("import helper; obj = helper.C()"), and
+            # letting the unpickler import /mnt/data/helper.py here would
+            # replay its top-level side effects before the payload runs. New
+            # snapshots drop such values (see the probe in _ca_snapshot);
+            # failing the load (restore skipped) is the safe degradation for
+            # old ones. Site-packages refs are unaffected -- only the
+            # workspace comes off sys.path.
+            _ca_load_path = list(_ca_sys.path)
+            _ca_sys.path[:] = [_ca_p for _ca_p in _ca_sys.path if _ca_p not in ('', '/mnt/data')]
             try:
                 with open(_CA_STATE, 'rb') as _ca_f:
                     _ca_state = _ca_pk.load(_ca_f)
             finally:
+                _ca_sys.path[:] = _ca_load_path
                 if _ca_had_entry:
                     _ca_sys.modules[_CA_ENTRY_MOD] = _ca_entry_saved
                 else:
@@ -360,6 +372,24 @@ else:
             _ca_probe_main = None if _ca_using_dill else _ca_types.ModuleType('__main__')
             if _ca_probe_main is not None:
                 _ca_probe_main.__dict__['__builtins__'] = __builtins__
+            # Modules loaded from the workspace this run ("import helper" for
+            # /mnt/data/helper.py). Values pickled BY REFERENCE through one
+            # would make the next run's restore import that file before the
+            # payload executes, replaying its top-level side effects (or
+            # aborting the whole restore if the class is gone) -- the same
+            # hazard the entry-module block below handles. The probe blocks
+            # every one of these names alongside the entry module, so such
+            # values fail the round-trip and are dropped. __main__ stays
+            # exempt: its handling is the scratch-module swap below.
+            _ca_ws_mods = {}
+            for _ca_wn, _ca_wm in list(_ca_sys.modules.items()):
+                if _ca_wn in ('__main__', '__mp_main__') or _ca_wm is None:
+                    continue
+                if (getattr(_ca_wm, '__file__', None) or '').startswith('/mnt/data'):
+                    _ca_ws_mods[_ca_wn] = _ca_wm
+            _ca_probe_block = set(_ca_ws_mods)
+            _ca_probe_block.add(_CA_ENTRY_MOD)
+            _ca_probe_block_bytes = [_ca_bn.encode('utf-8') for _ca_bn in _ca_probe_block]
             for k, v in list(_ca_ns.items()):
                 if k.startswith('_'):
                     continue
@@ -408,16 +438,19 @@ else:
                 # WITHOUT executing the entry file, so such values are
                 # dropped like any other non-portable value. (The alias
                 # skip above covers module objects; this covers values that
-                # merely reference the module.) The dill path only pays for
-                # the loads when the blob can actually name the entry module
-                # -- a cheap bytes scan, false positives just probe once.
-                if _ca_probe_main is not None or _CA_ENTRY_MOD_BYTES in _ca_blob:
+                # merely reference the module.) Workspace modules get the
+                # same treatment as the entry module -- see _ca_probe_block.
+                # The dill path only pays for the loads when the blob can
+                # actually name a blocked module -- a cheap bytes scan,
+                # false positives just probe once.
+                if _ca_probe_main is not None or any(_ca_bb in _ca_blob for _ca_bb in _ca_probe_block_bytes):
                     _ca_real_main = _ca_sys.modules.get('__main__')
-                    _ca_had_entry = _CA_ENTRY_MOD in _ca_sys.modules
-                    _ca_entry_saved = _ca_sys.modules.get(_CA_ENTRY_MOD)
+                    _ca_saved_blocked = {}
+                    for _ca_bn in _ca_probe_block:
+                        _ca_saved_blocked[_ca_bn] = (_ca_bn in _ca_sys.modules, _ca_sys.modules.get(_ca_bn))
+                        _ca_sys.modules[_ca_bn] = None
                     if _ca_probe_main is not None:
                         _ca_sys.modules['__main__'] = _ca_probe_main
-                    _ca_sys.modules[_CA_ENTRY_MOD] = None
                     try:
                         _ca_pk.loads(_ca_blob)
                     except Exception:
@@ -425,10 +458,11 @@ else:
                     finally:
                         if _ca_probe_main is not None:
                             _ca_sys.modules['__main__'] = _ca_real_main
-                        if _ca_had_entry:
-                            _ca_sys.modules[_CA_ENTRY_MOD] = _ca_entry_saved
-                        else:
-                            _ca_sys.modules.pop(_CA_ENTRY_MOD, None)
+                        for _ca_bn, (_ca_bhad, _ca_bmod) in _ca_saved_blocked.items():
+                            if _ca_bhad:
+                                _ca_sys.modules[_ca_bn] = _ca_bmod
+                            else:
+                                _ca_sys.modules.pop(_ca_bn, None)
                 ok[k] = v
             try:
                 tmp = _CA_STATE + '.tmp'
