@@ -330,7 +330,15 @@ export async function releaseEgressUpload(args: {
 }): Promise<void> {
   if (!env.EGRESS_LEDGER_REQUIRED) return;
   await mutateRecord(args.grant, record => {
-    record.uploaded_bytes = Math.max(0, record.uploaded_bytes - args.bytes);
+    // Mirror reserveEgressUpload's asymmetry: the hidden session-state
+    // snapshot never entered the visible-file aggregate, so releasing it
+    // must not subtract from it either -- otherwise a failed snapshot PUT
+    // issued after user outputs were reserved under the same grant would
+    // erase THOSE files' bytes from the ledger, leaving the grant
+    // undercounted for any later upload attempts before revocation/expiry.
+    if (args.fileId !== SESSION_STATE_FILE_ID) {
+      record.uploaded_bytes = Math.max(0, record.uploaded_bytes - args.bytes);
+    }
     record.upload_count = Math.max(0, record.upload_count - 1);
     record.request_count = Math.max(0, record.request_count - 1);
     record.output_file_ids = record.output_file_ids.filter(id => id !== args.fileId);
