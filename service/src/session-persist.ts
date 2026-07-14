@@ -61,6 +61,17 @@ export function sessionStatePointerKey(sessionKey: string): string {
 export const SESSION_STATE_SANDBOX_PATH = `/mnt/data/${SESSION_STATE_FILENAME}`;
 
 /**
+ * Placeholder the service sends as `persist_session.restore_session_id`
+ * instead of the real prior output-session id. The sandbox treats the field
+ * purely as a presence marker ("a prior snapshot was injected; match it by
+ * filename") -- the actual fetch goes through the injected file entry, whose
+ * id/session the egress layer masks into opaque handles like every other file
+ * ref. Sending the raw id would leak the previous run's storage session to
+ * the sandbox on every continuation, bypassing that masking.
+ */
+export const SESSION_STATE_RESTORE_MARKER = 'expected';
+
+/**
  * Reserved basenames the persistence layer writes into the submission dir.
  * The output-file classifier must skip these so the private state blob is
  * never surfaced back to the user as a generated file (it still rides inside
@@ -197,9 +208,11 @@ def _ca_unpin_hidden(_ca_displaced):
 
 _CA_STATE = '/mnt/data/.session_state.pkl'
 # Import name the wrapped entry file resolves to (e.g. 'main' for main.py).
-# Module aliases to it are neither persisted nor restored -- see the mods
-# loops below.
+# Module aliases to it are neither persisted nor restored, and values that
+# pickle BY REFERENCE through it are dropped by the snapshot probe -- see the
+# mods loops and _ca_snapshot below.
 _CA_ENTRY_MOD = _ca_os.path.splitext('__CA_ENTRY__')[0]
+_CA_ENTRY_MOD_BYTES = _CA_ENTRY_MOD.encode('utf-8')
 _CA_SRC = _ca_b64.b64decode('__USERCODE_B64__').decode('utf-8')
 _ca_linecache.cache['<user_code>'] = (len(_CA_SRC), None, _CA_SRC.splitlines(True), '<user_code>')
 
@@ -253,11 +266,24 @@ else:
             # Pin only around the load itself: dill may lazily re-import its
             # own submodules here. The alias re-import loop below must stay
             # UNPINNED so a user alias resolves workspace shadows normally.
+            # The entry module is BLOCKED during the load: new snapshots never
+            # reference it (the probe in _ca_snapshot drops such values), but
+            # a legacy pickle could, and letting the unpickler import the
+            # CURRENT entry file would execute this run's payload before its
+            # primary execution. Failing the load (restore skipped) is the
+            # safe degradation.
             _ca_displaced = _ca_pin_hidden()
+            _ca_had_entry = _CA_ENTRY_MOD in _ca_sys.modules
+            _ca_entry_saved = _ca_sys.modules.get(_CA_ENTRY_MOD)
+            _ca_sys.modules[_CA_ENTRY_MOD] = None
             try:
                 with open(_CA_STATE, 'rb') as _ca_f:
                     _ca_state = _ca_pk.load(_ca_f)
             finally:
+                if _ca_had_entry:
+                    _ca_sys.modules[_CA_ENTRY_MOD] = _ca_entry_saved
+                else:
+                    _ca_sys.modules.pop(_CA_ENTRY_MOD, None)
                 _ca_unpin_hidden(_ca_displaced)
             # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
             # Re-import module aliases by name first (so "import pandas as pd"
@@ -341,15 +367,40 @@ else:
                     _ca_blob = _ca_pk.dumps(v)
                 except Exception:
                     continue
-                if _ca_probe_main is not None:
+                # Round-trip the blob in an environment shaped like the NEXT
+                # run's restore: the scratch __main__ (stdlib-pickle path,
+                # see above) and -- for BOTH picklers -- the entry module
+                # blocked. A value whose class came from an ordinary
+                # "import main" serializes BY REFERENCE through module
+                # 'main' and passes a bare dumps because 'main' is
+                # importable right now; at the next run's restore that
+                # import would execute the NEW payload out of order (or
+                # abort the whole stream if the class is gone). Setting
+                # sys.modules['main'] = None makes the probe's import raise
+                # WITHOUT executing the entry file, so such values are
+                # dropped like any other non-portable value. (The alias
+                # skip above covers module objects; this covers values that
+                # merely reference the module.) The dill path only pays for
+                # the loads when the blob can actually name the entry module
+                # -- a cheap bytes scan, false positives just probe once.
+                if _ca_probe_main is not None or _CA_ENTRY_MOD_BYTES in _ca_blob:
                     _ca_real_main = _ca_sys.modules.get('__main__')
-                    _ca_sys.modules['__main__'] = _ca_probe_main
+                    _ca_had_entry = _CA_ENTRY_MOD in _ca_sys.modules
+                    _ca_entry_saved = _ca_sys.modules.get(_CA_ENTRY_MOD)
+                    if _ca_probe_main is not None:
+                        _ca_sys.modules['__main__'] = _ca_probe_main
+                    _ca_sys.modules[_CA_ENTRY_MOD] = None
                     try:
                         _ca_pk.loads(_ca_blob)
                     except Exception:
                         continue
                     finally:
-                        _ca_sys.modules['__main__'] = _ca_real_main
+                        if _ca_probe_main is not None:
+                            _ca_sys.modules['__main__'] = _ca_real_main
+                        if _ca_had_entry:
+                            _ca_sys.modules[_CA_ENTRY_MOD] = _ca_entry_saved
+                        else:
+                            _ca_sys.modules.pop(_CA_ENTRY_MOD, None)
                 ok[k] = v
             try:
                 tmp = _CA_STATE + '.tmp'

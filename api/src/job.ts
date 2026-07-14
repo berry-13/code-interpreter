@@ -768,6 +768,9 @@ export class Job {
   private inputFileHashes = new Map<string, InputFileInfo>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
+  /** Serializes parent-dir preparation across parallel fileOps -- see
+   *  prepareParentDir. */
+  private dirPrepChain: Promise<void> = Promise.resolve();
   private persistSession: { file_id: string; filename: string; restore_session_id?: string } | undefined;
   /** A prior snapshot existed but could not be restored this run; gates
    *  persistSessionState() so the resulting cold workspace never supersedes
@@ -1086,10 +1089,7 @@ export class Job {
         }
         lastResolvedName = originalName;
         const finalPath = path.join(this.submissionDir, originalName);
-        const finalParent = path.dirname(finalPath);
-        await this.clearNonDirectoryAncestors(finalParent);
-        await fsp.mkdir(finalParent, { recursive: true });
-        await this.secureAncestors(finalParent);
+        await this.prepareParentDir(path.dirname(finalPath));
 
         const hash = await this.streamToDisk(response, tempPath, finalPath);
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
@@ -1237,13 +1237,31 @@ export class Job {
     // this name is the one it injected.
     if (!ps || !ps.restore_session_id) return; // first run: nothing to restore
     const idx = this.files.findIndex(f => f.id && f.storage_session_id && f.name === ps.filename);
-    if (idx < 0) return; // no matching prior-state object
+    if (idx < 0) {
+      // The service marked a restore but no injected state file made it here
+      // -- something upstream dropped it. Same stance as every other restore
+      // failure below: run empty, but don't let this cold run's persist
+      // supersede (and delete) a snapshot that may still be perfectly live.
+      this.sessionRestoreFailed = true;
+      this.log.warn('Restore expected but no injected prior-state file found; skipping persist');
+      return;
+    }
     const [restoreFile] = this.files.splice(idx, 1);
 
     const tmpTar = path.join(os.tmpdir(), `sess-restore-${nanoid()}.tar`);
     try {
       const fetched = await this.downloadObjectToPath(restoreFile, tmpTar, config.session_state_max_bytes);
-      if (!fetched) return; // 404 / miss -> treat as no prior state
+      if (!fetched) {
+        // 404/miss. The run starts empty per contract, but this is still a
+        // FAILED restore: the pointer may well still name a live snapshot (a
+        // transient file-server miss looks identical to true deletion from
+        // here). Persisting this cold run would CAS-advance the pointer over
+        // the last good snapshot and delete it, so gate persistence exactly
+        // like the catch below and let the next run retry.
+        this.sessionRestoreFailed = true;
+        this.log.warn('Prior session snapshot missing (404/miss); starting empty and skipping persist');
+        return;
+      }
       const { size } = await fsp.stat(tmpTar);
       // GNU tar strips leading `/` and `..` members by default, so extraction
       // stays confined to `-C submissionDir`. `--no-same-owner` keeps the
@@ -1751,10 +1769,37 @@ export class Job {
   }
 
   /**
+   * Clear restored-session ancestor collisions, create `parent`, and secure
+   * its chain -- SERIALIZED across the parallel fileOps in prime(). Without
+   * the lock, two inputs nested under the same restored regular file (say a
+   * prior run left `data` as a file and this request stages `data/a.csv` and
+   * `data/b.csv`) can interleave: both lstat the stale `data` file, one
+   * replaces it with a directory and writes its input, and the other's stale
+   * "non-directory" verdict then recursively removes that fresh directory --
+   * erasing the sibling's already-written file (and, since secureAncestors
+   * caches secured paths, the recreated tree could skip its ownership fix).
+   * The guarded section is fast pure-metadata work; the actual download
+   * streaming stays fully parallel.
+   */
+  private prepareParentDir(parent: string): Promise<void> {
+    const run = this.dirPrepChain.then(async () => {
+      await this.clearNonDirectoryAncestors(parent);
+      await fsp.mkdir(parent, { recursive: true });
+      await this.secureAncestors(parent);
+    });
+    // Keep the chain alive whether or not this link rejects; the caller
+    // still observes the rejection through `run`.
+    this.dirPrepChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
    * Walk submissionDir -> `dir` and remove any ancestor that a restored session
    * left as a non-directory (e.g. a regular file where an input now needs a
    * parent dir), so the subsequent `mkdir(..., { recursive: true })` can't fail
-   * with ENOTDIR. No-op on a fresh workspace.
+   * with ENOTDIR. No-op on a fresh workspace. Callers on the parallel input
+   * path must go through prepareParentDir, which serializes this check-then-
+   * remove against concurrent mkdir of the same ancestors.
    */
   private async clearNonDirectoryAncestors(dir: string): Promise<void> {
     const rel = path.relative(this.submissionDir, dir);
@@ -1806,10 +1851,7 @@ export class Job {
     const filePath = path.join(this.submissionDir, file.name);
 
     const content = Buffer.from(file.content ?? '', (file.encoding as BufferEncoding) ?? 'utf8');
-    const parentDir = path.dirname(filePath);
-    await this.clearNonDirectoryAncestors(parentDir);
-    await fsp.mkdir(parentDir, { recursive: true });
-    await this.secureAncestors(parentDir);
+    await this.prepareParentDir(path.dirname(filePath));
     await this.clearNonRegularCollision(filePath);
     await fsp.writeFile(filePath, content);
     await this.applySandboxFilePermissions(filePath);

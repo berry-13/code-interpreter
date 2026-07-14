@@ -17,6 +17,7 @@ import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import {
   SESSION_STATE_FILE_ID,
+  SESSION_STATE_RESTORE_MARKER,
   SESSION_STATE_TAR_FILENAME,
   isReservedSessionInputName,
   sessionStatePointerKey,
@@ -363,7 +364,12 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       priorSnapshotSession = await claimPriorSnapshotRef(sessionStatePointerKey(sessionKey), SNAPSHOT_REF_KEY_TTL_SECONDS);
       if (priorSnapshotSession) {
         snapshotRefKey = `snapshotrefs:${priorSnapshotSession}`;
-        rawPayload.persist_session.restore_session_id = priorSnapshotSession;
+        // Presence marker only -- never the raw prior session id, which
+        // prepareSandboxEgress does not rewrite and would otherwise reach the
+        // sandbox unmasked (see SESSION_STATE_RESTORE_MARKER). The sandbox
+        // locates the snapshot via the injected file entry below, whose
+        // id/session ARE masked like every other file ref.
+        rawPayload.persist_session.restore_session_id = SESSION_STATE_RESTORE_MARKER;
         rawPayload.files.push({
           id: SESSION_STATE_FILE_ID,
           storage_session_id: priorSnapshotSession,
