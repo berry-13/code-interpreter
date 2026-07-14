@@ -246,6 +246,11 @@ else:
         # reachable now via the persisted namespace, not this run's own
         # source) can still be used as a multiprocessing target -- the child
         # must resolve it via __main__.<name> the same way the parent does.
+        # NOTE: children normally never see this wrapper anymore -- the launch
+        # path below rewrites the on-disk entry file with the plain user
+        # source before user code runs, so spawn children runpy that source
+        # exactly like vanilla Python. This branch remains as the fallback
+        # for when that rewrite could not be performed.
         _ca_ns = globals()
     else:
         # Run user code in a real module registered as sys.modules['__main__'],
@@ -437,6 +442,44 @@ else:
                     except OSError:
                         pass
 
+        # On disk the entry file currently holds THIS bootstrap wrapper, yet
+        # __file__ advertises it as the user's own script: code reading its
+        # own source (Path(__file__).read_text(), inspect on __main__) and
+        # spawn-multiprocessing children (which runpy __main__.__file__)
+        # would see base64 wrapper goo where the submitted source used to
+        # be. Materialize the real source over the entry file for the run's
+        # duration -- this wrapper is already fully compiled, the file is
+        # not re-read by this process -- and put the wrapper bytes back at
+        # exit, AFTER the state snapshot (atexit is LIFO; this registration
+        # precedes the snapshot's), so the api-side output walker sees the
+        # staged bytes unchanged and doesn't surface the entry file as a
+        # generated output. Spawn children therefore exec the plain user
+        # source exactly like vanilla Python -- which also means (as in
+        # vanilla) a multiprocessing target must be defined by the CURRENT
+        # run's source; a target existing only in the restored namespace no
+        # longer resolves in children.
+        _CA_ENTRY_PATH = '/mnt/data/__CA_ENTRY__'
+        _ca_wrapper_bytes = None
+        def _ca_restore_entry():
+            if _ca_wrapper_bytes is None:
+                return
+            try:
+                with open(_CA_ENTRY_PATH, 'wb') as f:
+                    f.write(_ca_wrapper_bytes)
+            except Exception:
+                pass
+        try:
+            with open(_CA_ENTRY_PATH, 'rb') as _ca_f:
+                _ca_wrapper_bytes = _ca_f.read()
+            _ca_atexit.register(_ca_restore_entry)
+            with open(_CA_ENTRY_PATH, 'w') as _ca_f:
+                _ca_f.write(_CA_SRC)
+        except Exception:
+            # Entry unreadable/unwritable: __file__ then exposes the wrapper
+            # (and children fall back to the __mp_main__ branch) -- never
+            # fatal.
+            _ca_wrapper_bytes = None
+
         def _ca_snapshot_pinned():
             # By snapshot time user code may have imported ITS OWN shadow of
             # a bootstrap dependency (that was the point of the eviction
@@ -464,7 +507,13 @@ else:
         # the one process whose namespace this snapshot actually describes
         # ever persists it.
         try:
-            _ca_os.register_at_fork(after_in_child=lambda: _ca_atexit.unregister(_ca_snapshot_pinned))
+            _ca_os.register_at_fork(after_in_child=lambda: (
+                _ca_atexit.unregister(_ca_snapshot_pinned),
+                # The child must not put the wrapper bytes back either -- it
+                # would flip the entry file mid-parent-run; only the launch
+                # process restores it, at its own exit.
+                _ca_atexit.unregister(_ca_restore_entry),
+            ))
         except (AttributeError, ValueError):
             pass  # register_at_fork is POSIX-only; not expected to be missing here
 
