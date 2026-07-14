@@ -1519,15 +1519,17 @@ export class Job {
    * the prior snapshot as the session's last good state.
    */
   /**
-   * Remove directories nested too deep for the output walker to ever scan
-   * (walkDir returns 'skipped' at config.max_nesting_depth), so a snapshot
-   * never carries files no response can reference -- restored, they'd be
-   * baselined by registerRestoredBaseline (which has no depth cap) yet stay
-   * invisible to every later walk, artifacts without a downloadable ref
-   * forever. Consistent with the response: what the walker can't reach
-   * doesn't exist. Hidden directories are left alone -- the walker skips
-   * them at ANY depth, and persisting their contents (dot-dir user state
-   * under HOME=/mnt/data) is deliberate.
+   * Remove workspace content the output walker can never scan -- directories
+   * nested beyond config.max_nesting_depth (walkDir returns 'skipped' at the
+   * cap) and entries whose relative path fails isValidPathShape (overlong or
+   * malformed paths that walkDir also skips) -- so a snapshot never carries
+   * files no response can reference. Restored, they'd be baselined by
+   * registerRestoredBaseline (which applies neither cap) yet stay invisible
+   * to every later walk: artifacts without a downloadable ref forever.
+   * Consistent with the response: what the walker can't reach doesn't exist.
+   * Hidden directories are left alone -- the walker skips them at ANY depth,
+   * and persisting their contents (dot-dir user state under HOME=/mnt/data)
+   * is deliberate.
    */
   private async pruneBeyondDepth(dir: string, depth: number): Promise<void> {
     let entries: fs.Dirent[];
@@ -1538,7 +1540,15 @@ export class Job {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      const rel = path.relative(this.submissionDir, full);
+      const kind = await this.classifyDirent(entry, full, rel);
+      if (kind === 'skip') continue;
+      if (!isValidPathShape(rel)) {
+        // walkDir skips this entry outright (overlong/malformed path), so
+        // nothing under it can ever be surfaced -- don't persist it.
+        await fsp.rm(full, { recursive: true, force: true }).catch(() => { /* best effort */ });
+        continue;
+      }
       if (kind !== 'dir' || isHiddenDirectory(entry.name)) continue;
       // A directory at nesting level L is walked with depth=L and skipped
       // once L >= max_nesting_depth; this child sits at level depth+1.

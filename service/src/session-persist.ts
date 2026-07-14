@@ -519,12 +519,23 @@ else:
                 # every later continuation too (the collision rides the
                 # snapshot tar), permanently bricking variable persistence.
                 # Clear non-file collisions first so the session recovers.
-                # Symlinks can't appear here: the sandbox strips them from
-                # the workspace before archiving and on restore.
                 for _ca_c in (tmp, _CA_STATE):
-                    if _ca_os.path.isdir(_ca_c):
+                    if _ca_os.path.isdir(_ca_c) and not _ca_os.path.islink(_ca_c):
                         _ca_shutil.rmtree(_ca_c, ignore_errors=True)
-                with open(tmp, 'wb') as f:
+                # tmp is OUR scratch path: unlink whatever sits there before
+                # writing. A planted symlink or hard link would otherwise be
+                # FOLLOWED by open() and fill its target (say notes.txt) with
+                # pickle bytes at interpreter shutdown -- corrupting a real
+                # user file that then persists and uploads. remove() drops
+                # the link itself, never its target, and 'xb' guarantees a
+                # fresh regular file even if something reappears in between.
+                # _CA_STATE needs no unlink: os.replace() swaps the directory
+                # entry itself and never follows a link there.
+                try:
+                    _ca_os.remove(tmp)
+                except OSError:
+                    pass
+                with open(tmp, 'xb') as f:
                     _ca_pk.dump({'__ca_v__': 1, 'ns': ok, 'mods': mods}, f)
                 _ca_os.replace(tmp, _CA_STATE)
             except Exception as e:
@@ -569,7 +580,19 @@ else:
             if _ca_wrapper_bytes is None:
                 return
             try:
-                with open(_CA_ENTRY_PATH, 'wb') as f:
+                # Never write THROUGH the existing path: user code may have
+                # replaced the entry with a symlink or hard link to a data
+                # file (os.remove('main.py'); os.symlink('notes.txt',
+                # 'main.py')), and a plain open('wb') would follow it and
+                # fill the target with wrapper source -- corruption the
+                # snapshot then preserves. Unlink first (drops a link, never
+                # its target) and create exclusively so nothing can be
+                # followed.
+                try:
+                    _ca_os.remove(_CA_ENTRY_PATH)
+                except OSError:
+                    pass
+                with open(_CA_ENTRY_PATH, 'xb') as f:
                     f.write(_ca_wrapper_bytes)
             except Exception:
                 pass
