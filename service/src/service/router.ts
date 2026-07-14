@@ -170,6 +170,10 @@ async function casAdvanceSessionPointer(
 const CLAIM_PRIOR_SNAPSHOT_REF = `
 local cur = redis.call('GET', KEYS[1])
 if cur then
+  local ptrTtl = redis.call('TTL', KEYS[1])
+  if ptrTtl >= 0 and ptrTtl < tonumber(ARGV[2]) then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+  end
   local refKey = 'snapshotrefs:' .. cur
   redis.call('INCR', refKey)
   redis.call('EXPIRE', refKey, ARGV[1])
@@ -177,9 +181,28 @@ end
 return cur`;
 
 /** Returns the session pointer's current snapshot id (or null if unset),
- *  having atomically claimed a ref on it in the same call. */
-async function claimPriorSnapshotRef(pointerKey: string, refTtlSeconds: number): Promise<string | null> {
-  const result = await connection.eval(CLAIM_PRIOR_SNAPSHOT_REF, 1, pointerKey, String(refTtlSeconds));
+ *  having atomically claimed a ref on it in the same call.
+ *
+ *  The claim also FLOORS the pointer's own TTL at `pointerFloorSeconds`
+ *  (extending only when the remaining TTL is below it, never resetting a
+ *  healthy TTL): a pointer within seconds of SESSION_STATE_TTL_SECONDS
+ *  expiry could otherwise lapse while the claiming job is still queued or
+ *  running -- a second request arriving after that expiry would see no
+ *  prior snapshot, run cold, and CAS its cold state into the absent key,
+ *  making the original job's valid restored state lose its own CAS and be
+ *  discarded. The floor is the max in-flight job window, NOT a full TTL
+ *  refresh: a full refresh here would undo the failed-restore protection in
+ *  the response path (a session whose snapshot object is truly gone must
+ *  let its pointer age out to recover; with a floor, retries extend it by
+ *  at most the job window, so any quiet gap that long still frees it). */
+async function claimPriorSnapshotRef(
+  pointerKey: string,
+  refTtlSeconds: number,
+  pointerFloorSeconds: number,
+): Promise<string | null> {
+  const result = await connection.eval(
+    CLAIM_PRIOR_SNAPSHOT_REF, 1, pointerKey, String(refTtlSeconds), String(pointerFloorSeconds),
+  );
   return typeof result === 'string' && result.length > 0 ? result : null;
 }
 
@@ -370,7 +393,13 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       // longest legitimate hold (see SNAPSHOT_REF_KEY_TTL_SECONDS) so expiry
       // can't erase an outstanding ref, while still bounding a crashed
       // handler's leak.
-      priorSnapshotSession = await claimPriorSnapshotRef(sessionStatePointerKey(sessionKey), SNAPSHOT_REF_KEY_TTL_SECONDS);
+      priorSnapshotSession = await claimPriorSnapshotRef(
+        sessionStatePointerKey(sessionKey),
+        SNAPSHOT_REF_KEY_TTL_SECONDS,
+        // Pointer TTL floor = the same max in-flight window, so the pointer
+        // can't expire under a job that just claimed it (see claim docs).
+        SNAPSHOT_REF_KEY_TTL_SECONDS,
+      );
       if (priorSnapshotSession) {
         snapshotRefKey = `snapshotrefs:${priorSnapshotSession}`;
         // Presence marker only -- never the raw prior session id, which

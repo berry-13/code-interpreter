@@ -1241,19 +1241,28 @@ export class Job {
     }
     // registerRestoredBaseline recurses into restored directories and keys each
     // leaf file by its relative path -- the directory itself never gets its own
-    // `inputFileHashes` entry. Detect that case via a restored child under
-    // `name/` so a restored directory at this path is also discarded.
+    // `inputFileHashes` entry. Detect that case via a RESTORED child under
+    // `name/` (a child alone proves nothing: a Content-Disposition rename can
+    // land a CURRENT-run input below this name, and treating that as "restored
+    // directory" would delete the sibling this request just staged). Remove
+    // only the restored children themselves -- never the whole tree, which may
+    // hold current-run inputs -- then reap the directory only if that left it
+    // empty.
     const prefix = `${name}/`;
-    const hasRestoredChild = [...this.inputFileHashes.keys()].some((key) => key.startsWith(prefix));
-    if (!hasRestoredChild) return false;
-    try {
-      await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true });
-    } catch (err) {
-      this.log.warn({ file: name, err }, 'Failed to remove stale restored input directory after download failure');
+    let discarded = false;
+    for (const [key, info] of [...this.inputFileHashes.entries()]) {
+      if (!key.startsWith(prefix) || !info.restored || !info.path) continue;
+      try {
+        await fsp.rm(info.path, { force: true });
+      } catch (err) {
+        this.log.warn({ file: key, err }, 'Failed to remove stale restored child after download failure');
+      }
+      this.inputFileHashes.delete(key);
+      discarded = true;
     }
-    for (const key of [...this.inputFileHashes.keys()]) {
-      if (key.startsWith(prefix)) this.inputFileHashes.delete(key);
-    }
+    if (!discarded) return false;
+    // Non-recursive by design: succeeds only when nothing current remains.
+    await fsp.rmdir(path.join(this.submissionDir, name)).catch(() => { /* still holds current inputs or subdirs */ });
     return true;
   }
 
