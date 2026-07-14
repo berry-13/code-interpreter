@@ -414,6 +414,9 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
 
         const generatedIds = new Set(job.getGeneratedFileIds());
         const before = result.files.length;
+        const failedUploads = result.files.filter(
+          f => generatedIds.has(f.id) && !uploaded.has(f.id),
+        );
         result.files = result.files.filter(
           f => !generatedIds.has(f.id) || uploaded.has(f.id),
         );
@@ -423,6 +426,15 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
             { job: job.uuid, dropped, kept: result.files.length },
             'Pruned files from response because upload did not reach file_server',
           );
+          /* Persistent sessions: a file pruned from the response must not
+           * ride the snapshot either. Restored next run, it would be
+           * baselined as an unchanged carry-over and suppressed from every
+           * later response -- an artifact sitting in /mnt/data that never
+           * got (and never will get) a downloadable ref. Excluding just the
+           * failed files keeps the snapshot consistent with what the caller
+           * was told, without discarding the run's other state (variables,
+           * modified files) over a transient upload blip. */
+          job.excludeFromSessionSnapshot(failedUploads.map(f => f.name));
         }
       }
 

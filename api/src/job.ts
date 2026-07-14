@@ -812,6 +812,12 @@ export class Job {
    *  succeeded, but persisting would promote the degraded tree and delete
    *  files the last good snapshot still holds. */
   private sessionPersistBlocked = false;
+  /** Workspace-relative names of generated files whose upload never reached
+   *  the file server. persistSessionState prunes them from the snapshot: a
+   *  file absent from the response must not ride into the next restore,
+   *  where the baseline would suppress it as an unchanged carry-over and the
+   *  caller could never obtain a ref for it. */
+  private snapshotExcludedNames = new Set<string>();
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -1504,6 +1510,13 @@ export class Job {
     return this.sessionRestoreFailed;
   }
 
+  /** Exclude generated files (by workspace-relative name) from this run's
+   *  session snapshot -- used for files pruned from the response because
+   *  their upload never reached the file server. */
+  excludeFromSessionSnapshot(names: string[]): void {
+    for (const name of names) this.snapshotExcludedNames.add(name);
+  }
+
   async persistSessionState(): Promise<boolean> {
     const ps = this.persistSession;
     if (!ps || !this.submissionDir || !this.fileEgressBaseUrl()) return false;
@@ -1580,6 +1593,14 @@ export class Job {
         if (info.staged && info.path && rel === this.entryPointName) {
           await fsp.rm(info.path, { recursive: true, force: true }).catch(() => { /* best effort */ });
         }
+      }
+      // Generated files whose upload never reached the file server were
+      // pruned from the response; prune them from the snapshot too, so they
+      // can't ride into the next restore and be suppressed there as
+      // unchanged carry-overs the caller can never obtain a ref for (see
+      // excludeFromSessionSnapshot).
+      for (const name of this.snapshotExcludedNames) {
+        await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }
       for (const name of SNAPSHOT_PRUNE_DIRS) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
