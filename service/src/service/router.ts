@@ -419,25 +419,31 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      *     read_sessions + input_files, authorizing the sandbox to fetch it — no
      *     file-server or Redis-auth change needed. Done before
      *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
+    // Reserve every persistence artifact name: the state tar (identified in
+    // the sandbox by name only, since egress masks file id/session) and the
+    // namespace snapshot `.session_state.pkl` (+ its tempfile). A user input
+    // with any of these names would shadow restored state or be mistaken for
+    // the injected snapshot.
+    // Also reject refs to the hidden snapshot by its fixed storage ID (or
+    // any prefix that file-server's prefix matching would resolve to it):
+    // the snapshot upload creates a normal `upload:` cache entry under the
+    // caller's own session, so authorizeRequestedFiles would accept
+    // `id: codeapi-session-state` with a harmless-looking name and stage
+    // the internal workspace tar as an ordinary input -- bypassing the
+    // download/list routes that deliberately hide this artifact.
+    // DELIBERATELY outside the env.PERSIST_SESSIONS gate: snapshot objects
+    // written while the feature was enabled outlive a rollback (their
+    // `upload:` cache entries included), and the list/download routes keep
+    // hiding them unconditionally -- so the input-ref door must stay closed
+    // unconditionally too. Only the injection/pointer logic below is gated.
+    const reservedInput = (authorizedFiles ?? []).find(
+      f => isReservedSessionInputName(f.name) || (typeof f.id === 'string' && isSessionStateFileId(f.id)),
+    );
+    if (reservedInput) {
+      return res.status(400).json({ error: `File name '${reservedInput.name}' is reserved for session persistence` });
+    }
+
     if (env.PERSIST_SESSIONS) {
-      // Reserve every persistence artifact name: the state tar (identified in
-      // the sandbox by name only, since egress masks file id/session) and the
-      // namespace snapshot `.session_state.pkl` (+ its tempfile). A user input
-      // with any of these names would shadow restored state or be mistaken for
-      // the injected snapshot.
-      // Also reject refs to the hidden snapshot by its fixed storage ID (or
-      // any prefix that file-server's prefix matching would resolve to it):
-      // the snapshot upload creates a normal `upload:` cache entry under the
-      // caller's own session, so authorizeRequestedFiles would accept
-      // `id: codeapi-session-state` with a harmless-looking name and stage
-      // the internal workspace tar as an ordinary input -- bypassing the
-      // download/list routes that deliberately hide this artifact.
-      const reservedInput = (authorizedFiles ?? []).find(
-        f => isReservedSessionInputName(f.name) || (typeof f.id === 'string' && isSessionStateFileId(f.id)),
-      );
-      if (reservedInput) {
-        return res.status(400).json({ error: `File name '${reservedInput.name}' is reserved when persistent sessions are enabled` });
-      }
       rawPayload.persist_session = {
         file_id: SESSION_STATE_FILE_ID,
         filename: SESSION_STATE_TAR_FILENAME,
