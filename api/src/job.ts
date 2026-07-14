@@ -1514,7 +1514,36 @@ export class Job {
    *  session snapshot -- used for files pruned from the response because
    *  their upload never reached the file server. */
   excludeFromSessionSnapshot(names: string[]): void {
-    for (const name of names) this.snapshotExcludedNames.add(name);
+    for (const name of names) {
+      // A failed upload of a MODIFIED RESTORED file must block the whole
+      // snapshot instead of excluding the path: excluding would publish a
+      // snapshot WITHOUT the file, superseding (and deleting) the last good
+      // snapshot that still holds the prior version -- a transient upload
+      // blip would erase the carry-over entirely. Blocking keeps the pointer
+      // on the last good state; only this run's edits to the file are lost.
+      if (this.inputFileHashes.get(name)?.restored) {
+        this.sessionPersistBlocked = true;
+        this.log.warn({ file: name }, 'Upload of modified restored file failed; blocking session persist');
+        continue;
+      }
+      this.snapshotExcludedNames.add(name);
+    }
+  }
+
+  /**
+   * Records that the output walk hid at least one would-be artifact behind
+   * `max_output_files`. Persistent sessions MUST block the snapshot then:
+   * the hidden files were never returned or uploaded, and riding the tar
+   * would let the next restore baseline them as unchanged carry-overs,
+   * suppressing them from every later response -- the caller could never
+   * obtain refs for them. The walk stops at the cap, so the hidden set can't
+   * even be enumerated for a surgical exclusion; keeping the pointer on the
+   * last good snapshot is the only consistent choice.
+   */
+  private noteOutputTruncation(at: string): void {
+    if (!this.persistSession || this.sessionPersistBlocked) return;
+    this.sessionPersistBlocked = true;
+    this.log.warn({ at }, 'Output walk truncated by max_output_files; blocking session persist');
   }
 
   async persistSessionState(): Promise<boolean> {
@@ -2565,6 +2594,7 @@ export class Job {
     if (echoed) return { ...echoed, stopLoop: false };
 
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.noteOutputTruncation(relativePath);
       return { collected: false, truncated: true, stopLoop: true };
     }
 
@@ -2665,7 +2695,14 @@ export class Job {
     let skippedHiddenDirs = 0;
 
     for (const entry of entries) {
-      if (this.isOutputCapFull()) { truncated = true; break; }
+      if (this.isOutputCapFull()) {
+        // Entries remain but no slots do -- some of them may be would-be
+        // outputs this response will never mention; conservatively treat it
+        // as truncation for the persistence gate.
+        this.noteOutputTruncation(path.relative(this.submissionDir, dir) || '.');
+        truncated = true;
+        break;
+      }
       if (isReservedOutputName(entry.name)) continue;
 
       const fullPath = path.join(dir, entry.name);

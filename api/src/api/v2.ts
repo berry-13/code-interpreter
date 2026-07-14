@@ -268,7 +268,11 @@ function validateConstraints(body: ExecuteRequestBody, rt: Runtime): void {
  * killed are not buffered and would still be captured by a persist.
  */
 export function wasKilledBySignal(run: NsJailResult | undefined): boolean {
-  return Boolean(run?.signal);
+  // status 'SG' covers cgroup OOM kills that the nsjail log parser detects
+  // without extracting an explicit signal (see nsjail.ts) -- the interpreter
+  // died without running atexit either way. TO/OL/EL statuses already force
+  // signal=SIGKILL in the parser, so the signal check covers those.
+  return Boolean(run?.signal) || run?.status === 'SG';
 }
 
 function manifestErrorStatus(error: ExecutionManifestError): number {

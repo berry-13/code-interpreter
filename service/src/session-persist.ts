@@ -159,7 +159,7 @@ const PYTHON_SESSION_WRAPPER = String.raw`import sys as _ca_sys
 _ca_saved_path = list(_ca_sys.path)
 _ca_sys.path[:] = [_ca_p for _ca_p in _ca_sys.path if _ca_p not in ('', '/mnt/data')]
 _ca_preexisting_mods = set(_ca_sys.modules.keys())
-import os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib, shutil as _ca_shutil
+import os as _ca_os, atexit as _ca_atexit, base64 as _ca_b64, linecache as _ca_linecache, types as _ca_types, io as _ca_io, importlib as _ca_importlib, importlib.util as _ca_importlib_util, shutil as _ca_shutil
 try:
     import dill as _ca_pk
     _ca_using_dill = True
@@ -306,6 +306,22 @@ else:
                     # that fix still carry them.
                     if _ca_modname == _CA_ENTRY_MOD:
                         continue
+                    # Workspace modules are not re-imported eagerly either
+                    # (snapshots no longer record them; this guards legacy
+                    # pickles): importing a restored helper.py here would
+                    # replay its top-level side effects before the payload
+                    # runs. find_spec on the TOP-LEVEL name locates without
+                    # executing -- and unlike find_spec on a dotted name,
+                    # never imports a parent package as a side effect.
+                    try:
+                        _ca_spec = _ca_importlib_util.find_spec(_ca_modname.split('.')[0])
+                    except Exception:
+                        _ca_spec = None
+                    if _ca_spec is not None:
+                        _ca_origin = getattr(_ca_spec, 'origin', None) or ''
+                        _ca_locs = list(getattr(_ca_spec, 'submodule_search_locations', None) or [])
+                        if _ca_origin.startswith('/mnt/data') or any(str(_ca_loc).startswith('/mnt/data') for _ca_loc in _ca_locs):
+                            continue
                     try:
                         _ca_ns[_ca_alias] = _ca_importlib.import_module(_ca_modname)
                     except Exception:
@@ -353,11 +369,18 @@ else:
                 # entry module ("import main"): the next run's entry file
                 # holds that run's DIFFERENT source, so re-importing it at
                 # restore time would execute that payload twice (once via
-                # the import branch, once as __main__). The alias simply
-                # doesn't carry.
+                # the import branch, once as __main__). And EXCEPT modules
+                # living in the workspace ("import helper" for a restored
+                # helper.py): unlike a site-packages library, re-importing
+                # one at restore time replays ITS top-level side effects on
+                # every continuation, and can bind the stale module before
+                # the current payload replaces the file. Neither alias
+                # carries.
                 if isinstance(v, _ca_types.ModuleType):
                     name = getattr(v, '__name__', None)
-                    if isinstance(name, str) and name and name != _CA_ENTRY_MOD:
+                    mod_file = getattr(v, '__file__', None) or ''
+                    if (isinstance(name, str) and name and name != _CA_ENTRY_MOD
+                            and not mod_file.startswith('/mnt/data')):
                         mods[k] = name
                     continue
                 # Skip open file handles. dill CAN pickle a file handle, but

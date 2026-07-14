@@ -248,8 +248,15 @@ const SNAPSHOT_REF_KEY_TTL_SECONDS = 2 * SNAPSHOT_REF_TTL_SECONDS;
  * active retries alone would keep a dead pointer alive indefinitely. */
 const SESSION_RESTORE_FAILURE_LIMIT = 3;
 
-function restoreFailureKey(sessionKey: string): string {
-  return `sessionrestorefails:${sessionKey}`;
+/* Keyed by the SNAPSHOT id, not the sessionKey: a streak must die with the
+ * pointer it indicts. Keyed by sessionKey, a stale count (pointer expired
+ * naturally at 1-2 failures) would survive into the session's NEXT lifetime
+ * -- a cold run publishes a fresh snapshot, then a single transient miss on
+ * it inherits the old count, crosses the limit, and RELEASE_DEAD_POINTER
+ * deletes the brand-new pointer. Snapshot-scoped keys can't leak across
+ * lifetimes, and orphans age out via their TTL. */
+function restoreFailureKey(snapshotSession: string): string {
+  return `sessionrestorefails:${snapshotSession}`;
 }
 
 /* Deletes the pointer only if it still names the snapshot whose restore kept
@@ -270,7 +277,7 @@ return 0`;
  * session-persist.ts).
  */
 async function noteRestoreFailure(sessionKey: string, priorSnapshotSession: string): Promise<void> {
-  const failKey = restoreFailureKey(sessionKey);
+  const failKey = restoreFailureKey(priorSnapshotSession);
   try {
     const fails = await connection.incr(failKey);
     await connection.expire(failKey, env.SESSION_STATE_TTL_SECONDS);
@@ -542,7 +549,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       if ((result as t.ExecuteResult)?.session_state_restore_failed) {
         await noteRestoreFailure(sessionKey, priorSnapshotSession);
       } else {
-        await connection.del(restoreFailureKey(sessionKey)).catch(() => { /* best effort */ });
+        await connection.del(restoreFailureKey(priorSnapshotSession)).catch(() => { /* best effort */ });
       }
     }
 
