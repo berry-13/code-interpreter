@@ -119,24 +119,26 @@ function sendSessionKeyResolutionError(
 const router = Router();
 
 /* Atomically advance the session-state pointer (compare-and-swap). Advances
- * when the key still holds the value this run restored from (`cur == ARGV[1]`)
- * OR when the key is absent (`cur == false`). Returns whether the swap happened,
- * so a run whose baseline was overtaken by a concurrent run doesn't roll the
- * pointer back to stale state.
+ * when the key still holds the value this run restored from (`cur == ARGV[1]`),
+ * or when the key is absent AND this is a true first run (expected `''`).
+ * Returns whether the swap happened, so a run whose baseline was overtaken by
+ * a concurrent run doesn't roll the pointer back to stale state.
  *
- * The `cur == false` arm covers two cases with one rule: a genuine first run
- * (expected `''`), AND a continuation whose pointer TTL lapsed mid-run -- e.g. a
- * run that started just before `SESSION_STATE_TTL_SECONDS` elapsed, or a TTL
- * misconfigured below the max job time. Absent that arm, the expired-pointer run
- * would treat its own fresh snapshot as stale and (with the finally block) delete
- * both snapshots, losing all persisted state for an active session. Advancing on
- * a missing key is safe: the pointer is only ever SET forward or TTL-expired,
- * never deleted, so `cur == false` means no live pointer exists to clobber, and
- * any concurrent run that already advanced makes `cur` a non-empty id that
- * matches neither arm -- so rollback is still prevented. */
+ * A missing key must NOT satisfy a non-empty expectation: two continuations
+ * can restore snapshot A, the faster one advances the pointer to B, and B's
+ * key can then TTL-expire before the slower run finishes -- letting the
+ * slower run's CAS "succeed" against the absent key would publish its stale
+ * A-based snapshot over B's lineage, silently losing B's changes. The
+ * mid-run-lapse case this arm used to cover (a run that started seconds
+ * before SESSION_STATE_TTL_SECONDS elapsed) is instead handled where it
+ * belongs: claimPriorSnapshotRef floors the pointer's TTL at the max
+ * in-flight window when the claim is taken, so a pointer can no longer
+ * expire under a legitimately claimed run. A CAS that still finds the key
+ * missing is therefore genuinely stale (or a first run racing an expiry) and
+ * discarding its snapshot is the safe outcome. */
 const CAS_ADVANCE_SESSION_POINTER = `
 local cur = redis.call('GET', KEYS[1])
-if cur == false or cur == ARGV[1] then
+if (cur == false and ARGV[1] == '') or cur == ARGV[1] then
   redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
   return 1
 end
@@ -191,10 +193,11 @@ return cur`;
  *  prior snapshot, run cold, and CAS its cold state into the absent key,
  *  making the original job's valid restored state lose its own CAS and be
  *  discarded. The floor is the max in-flight job window, NOT a full TTL
- *  refresh: a full refresh here would undo the failed-restore protection in
- *  the response path (a session whose snapshot object is truly gone must
- *  let its pointer age out to recover; with a floor, retries extend it by
- *  at most the job window, so any quiet gap that long still frees it). */
+ *  refresh: a full refresh here would extend a possibly-dead pointer by the
+ *  whole SESSION_STATE_TTL on every attempt. The floor does still prolong a
+ *  dead pointer while retries keep arriving -- that case is handled by the
+ *  restore-failure streak (noteRestoreFailure), which RELEASES the pointer
+ *  after a few consecutive failed restores regardless of claim activity. */
 async function claimPriorSnapshotRef(
   pointerKey: string,
   refTtlSeconds: number,
@@ -236,6 +239,52 @@ const SNAPSHOT_REF_TTL_SECONDS = Math.ceil(env.JOB_TIMEOUT / 1000) + 60;
  * released or given up its wait. Each new claim's EXPIRE only ever pushes
  * the deadline further out, never closer. */
 const SNAPSHOT_REF_KEY_TTL_SECONDS = 2 * SNAPSHOT_REF_TTL_SECONDS;
+
+/* Consecutive failed restores tolerated before the session pointer is
+ * released. One or two misses are treated as transient (file-server blip) and
+ * cost nothing but a skipped TTL refresh; a streak this long means the
+ * snapshot object is gone or corrupt, and keeping the pointer would brick the
+ * session -- especially since every new claim floors the pointer's TTL, so
+ * active retries alone would keep a dead pointer alive indefinitely. */
+const SESSION_RESTORE_FAILURE_LIMIT = 3;
+
+function restoreFailureKey(sessionKey: string): string {
+  return `sessionrestorefails:${sessionKey}`;
+}
+
+/* Deletes the pointer only if it still names the snapshot whose restore kept
+ * failing -- a concurrent run that already advanced it must not be undone. */
+const RELEASE_DEAD_POINTER = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0`;
+
+/**
+ * Records one failed restore of `priorSnapshotSession`. After
+ * SESSION_RESTORE_FAILURE_LIMIT consecutive failures the pointer is released
+ * (CAS-guarded), so the next run starts a fresh session instead of retrying a
+ * dead snapshot forever. The abandoned snapshot object itself is left to the
+ * bucket lifecycle policy, like any other orphan (see the KNOWN GAP note in
+ * session-persist.ts).
+ */
+async function noteRestoreFailure(sessionKey: string, priorSnapshotSession: string): Promise<void> {
+  const failKey = restoreFailureKey(sessionKey);
+  try {
+    const fails = await connection.incr(failKey);
+    await connection.expire(failKey, env.SESSION_STATE_TTL_SECONDS);
+    if (fails >= SESSION_RESTORE_FAILURE_LIMIT) {
+      const released = await connection.eval(RELEASE_DEAD_POINTER, 1, sessionStatePointerKey(sessionKey), priorSnapshotSession);
+      if (released === 1) {
+        logger.warn(`[${INSTANCE_ID}] Released session pointer after ${fails} consecutive failed restores`);
+      }
+      await connection.del(failKey);
+    }
+  } catch (error) {
+    logger.error(`[${INSTANCE_ID}] Failed to record restore failure:`, error);
+  }
+}
 
 /** Fire-and-forget delete of a session's hidden snapshot object. */
 function deleteSessionSnapshot(outputSession: string): void {
@@ -485,6 +534,18 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'codeapi.language': language,
     }, () => currentJob.waitUntilFinished(currentQueueEvents, env.JOB_TIMEOUT), 'CONSUMER');
 
+    /* Track the restore-failure streak: a failed restore feeds it (releasing
+     * the pointer once the streak hits the limit); any healthy outcome for a
+     * run that had a prior snapshot resets it, so only CONSECUTIVE failures
+     * count and a transient blip between successes never accumulates. */
+    if (env.PERSIST_SESSIONS && priorSnapshotSession) {
+      if ((result as t.ExecuteResult)?.session_state_restore_failed) {
+        await noteRestoreFailure(sessionKey, priorSnapshotSession);
+      } else {
+        await connection.del(restoreFailureKey(sessionKey)).catch(() => { /* best effort */ });
+      }
+    }
+
     /* Advance the persistent-session pointer only when the sandbox actually
      * wrote a fresh snapshot to this run's output session. On a skip (oversize
      * / error) we leave the pointer on the last good snapshot so continuity
@@ -528,18 +589,19 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       // otherwise have its pointer lapse and lose the last good snapshot even
       // though it's still live. Refresh the TTL on the existing pointer instead.
       // Reusing the CAS advance script with `next == expected == priorSnapshotSession`
-      // rewrites the same value (whether the key is still live or already
-      // expired) without ever clobbering a pointer a concurrent run has since
-      // advanced.
+      // rewrites the same value while the key is live, without ever
+      // clobbering a pointer a concurrent run has since advanced (an
+      // already-expired key stays expired -- the CAS no longer recreates
+      // missing pointers for continuations, see its comment).
       //
       // EXCEPT after a FAILED restore (the guard above): if the snapshot
       // object is truly gone (lifecycle cleanup) or corrupt, every retry
       // fails, skips persist, and would land here -- refreshing would pin the
-      // dead pointer alive forever and brick the session until manual Redis
-      // surgery. Not refreshing bounds the outage: the pointer ages out from
-      // its last good refresh within SESSION_STATE_TTL_SECONDS and the
-      // session starts fresh. A transient miss merely skips one refresh,
-      // which is harmless against that TTL.
+      // dead pointer alive forever. Failed restores instead feed a failure
+      // streak (see noteRestoreFailure below) that RELEASES the pointer
+      // after a few consecutive misses, so the session recovers promptly
+      // even under active retries; a one-off transient miss merely skips
+      // one refresh and resets the streak on the next success.
       try {
         await casAdvanceSessionPointer(
           sessionStatePointerKey(sessionKey),

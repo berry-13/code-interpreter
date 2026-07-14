@@ -447,8 +447,13 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
        * Exits that bypass atexit WITHOUT a signal -- os._exit(0), os.exec*
        * -- can't be told apart from a clean exit here; persistSessionState
        * itself catches those by fingerprinting the restored pickle and
-       * skipping when this run never rewrote it. */
-      if (wasKilledBySignal(result.run)) {
+       * skipping when this run never rewrote it.
+       *
+       * The compile phase gets the same treatment: a compile killed by
+       * signal (timeout) leaves `result.run` undefined, so checking only the
+       * run phase would fall through and persist a workspace holding partial
+       * compiler outputs from a run that never executed. */
+      if (wasKilledBySignal(result.compile) || wasKilledBySignal(result.run)) {
         result.session_state_persisted = false;
       } else {
         result.session_state_persisted = await withSpan('codeapi.sandbox.persist_session', {

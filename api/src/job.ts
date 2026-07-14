@@ -1249,7 +1249,7 @@ export class Job {
     // hold current-run inputs -- then reap the directory only if that left it
     // empty.
     const prefix = `${name}/`;
-    let discarded = false;
+    const removedKeys: string[] = [];
     for (const [key, info] of [...this.inputFileHashes.entries()]) {
       if (!key.startsWith(prefix) || !info.restored || !info.path) continue;
       try {
@@ -1258,11 +1258,29 @@ export class Job {
         this.log.warn({ file: key, err }, 'Failed to remove stale restored child after download failure');
       }
       this.inputFileHashes.delete(key);
-      discarded = true;
+      removedKeys.push(key);
     }
-    if (!discarded) return false;
-    // Non-recursive by design: succeeds only when nothing current remains.
-    await fsp.rmdir(path.join(this.submissionDir, name)).catch(() => { /* still holds current inputs or subdirs */ });
+    if (removedKeys.length === 0) return false;
+    // Reap the emptied directory skeleton bottom-up: removing only leaf files
+    // above can leave `data/`, `data/sub/` behind, and the run would still
+    // observe those stale restored paths despite the replacement input being
+    // missing. Every rmdir is non-recursive by design -- it succeeds only for
+    // a directory holding nothing current, so a sibling this request staged
+    // (or anything else still live) stops the reap at that level.
+    const emptiedDirs = new Set<string>([name]);
+    for (const key of removedKeys) {
+      let parent = path.posix.dirname(key);
+      while (parent !== '.' && (parent === name || parent.startsWith(prefix))) {
+        emptiedDirs.add(parent);
+        parent = path.posix.dirname(parent);
+      }
+    }
+    const deepestFirst = [...emptiedDirs].sort(
+      (a, b) => b.split('/').length - a.split('/').length,
+    );
+    for (const dir of deepestFirst) {
+      await fsp.rmdir(path.join(this.submissionDir, dir)).catch(() => { /* still holds current content */ });
+    }
     return true;
   }
 
