@@ -253,7 +253,11 @@ input downloads and output uploads — user code still has no network.
 
 - **Per user, not per conversation.** No conversation id flows in the request,
   so continuity is scoped to the authenticated user/resource. Two concurrent
-  conversations by the same user share one namespace (last write wins).
+  conversations by the same user share one namespace. Overlapping runs that
+  restored the same snapshot race on a compare-and-swap: the FIRST to finish
+  and publish advances the session, and the later finisher's snapshot is
+  discarded (never merged, never a rollback) -- first successful write wins,
+  not last.
 - **Variable snapshot is best-effort.** Data (arrays, DataFrames, dicts)
   restores reliably; open handles, sockets, threads, and some native objects
   can't be serialized and are dropped with a warning — the rest is preserved.
@@ -277,9 +281,11 @@ input downloads and output uploads — user code still has no network.
 
 Tuning: `CODEAPI_SESSION_STATE_MAX_BYTES` caps the snapshot (oversize snapshots
 are skipped, the run still succeeds); `CODEAPI_SESSION_STATE_TTL_SECONDS` is the
-idle expiry (refreshed each run). In hardened mode the snapshot upload is also
-bounded by `EGRESS_GATEWAY_MAX_FILE_BYTES` (default 10 MB) — raise it for large
-workspaces. See `.env.example` for defaults.
+idle expiry (refreshed each run). In hardened mode the snapshot upload is
+exempt from `EGRESS_GATEWAY_MAX_FILE_BYTES` (that cap sizes user output files):
+the gateway and egress ledger let the hidden snapshot use the grant cap derived
+from `CODEAPI_SESSION_STATE_MAX_BYTES` directly, so that is the only knob that
+bounds snapshot size. See `.env.example` for defaults.
 
 ## Health Checks
 

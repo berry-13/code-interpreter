@@ -31,8 +31,9 @@ hardenedSandboxMode: true
 # .env.example for the storage-lifecycle caveats.
 persistSessions:
   enabled: false
-  # Max snapshot tar size in bytes (default 100 MiB). NOTE: in hardened mode
-  # the tar upload is also bounded by the egress gateway's max file size.
+  # Max snapshot tar size in bytes (default 100 MiB). This is the only knob
+  # bounding snapshot size -- the gateway/ledger exempt the hidden snapshot
+  # from the per-file egress cap that sizes user output files.
   stateMaxBytes: 104857600
   # Idle expiry of the session's Redis pointer in seconds (default 7d).
   stateTtlSeconds: 604800

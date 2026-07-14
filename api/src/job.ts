@@ -735,6 +735,15 @@ interface InputFileInfo {
    * persist like any other workspace file.
    */
   staged?: boolean;
+  /**
+   * Set when this CURRENT-run entry replaced a restored baseline at the same
+   * path. The entry itself is ordinary current input (walker semantics
+   * unchanged), but nameTouchesRestoredState must still know the prior
+   * snapshot holds an older version here: if this run's re-upload of the
+   * path fails, excluding it from the snapshot would supersede (and delete)
+   * that last good copy.
+   */
+  replacedRestored?: boolean;
 }
 
 interface ExecuteResult {
@@ -1175,12 +1184,14 @@ export class Job {
           await this.clearNonRegularCollision(finalPath);
           await fsp.rename(tempPath, finalPath);
           await this.applySandboxFilePermissions(finalPath);
+          const prior = this.inputFileHashes.get(originalName);
           this.inputFileHashes.set(originalName, {
             originalId: file.id,
             originalSessionId: file.storage_session_id!,
             hash,
             path: finalPath,
             readOnly: readOnly || undefined,
+            replacedRestored: (prior?.restored || prior?.replacedRestored) || undefined,
           });
         });
         /* Defense-in-depth: keep read-only inputs root-owned + 0444 so the
@@ -1534,18 +1545,21 @@ export class Job {
     }
   }
 
-  /** True when `name` has a restored baseline at the exact path, under it
+  /** True when `name` has a restored baseline (or a current entry that
+   *  REPLACED one -- see replacedRestored) at the exact path, under it
    *  (`name/` -- it replaced a restored directory), or at any ancestor
    *  segment (it was created inside a replaced restored file's path). */
   private nameTouchesRestoredState(name: string): boolean {
-    if (this.inputFileHashes.get(name)?.restored) return true;
+    const touches = (info: InputFileInfo | undefined): boolean =>
+      Boolean(info && (info.restored || info.replacedRestored));
+    if (touches(this.inputFileHashes.get(name))) return true;
     const prefix = `${name}/`;
     for (const [key, info] of this.inputFileHashes) {
-      if (info.restored && key.startsWith(prefix)) return true;
+      if (touches(info) && key.startsWith(prefix)) return true;
     }
     const segments = name.split('/').filter(Boolean);
     for (let i = segments.length - 1; i > 0; i--) {
-      if (this.inputFileHashes.get(segments.slice(0, i).join('/'))?.restored) return true;
+      if (touches(this.inputFileHashes.get(segments.slice(0, i).join('/')))) return true;
     }
     return false;
   }
@@ -2137,7 +2151,13 @@ export class Job {
       await this.clearNonRegularCollision(filePath);
       await fsp.writeFile(filePath, content);
       await this.applySandboxFilePermissions(filePath);
-      this.inputFileHashes.set(file.name, { hash, path: filePath, staged: true });
+      const prior = this.inputFileHashes.get(file.name);
+      this.inputFileHashes.set(file.name, {
+        hash,
+        path: filePath,
+        staged: true,
+        replacedRestored: (prior?.restored || prior?.replacedRestored) || undefined,
+      });
     });
   }
 
