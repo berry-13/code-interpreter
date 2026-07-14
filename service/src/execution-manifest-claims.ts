@@ -59,13 +59,13 @@ export function buildExecutionManifestClaims(args: {
   const now = args.nowSeconds ?? Math.floor(Date.now() / 1000);
   const inputFiles = collectManifestInputFiles(args.payload);
   // Persistent sessions do hidden gateway I/O the caller's budgets don't see:
-  // always a snapshot PUT (an upload = one output + one request), and on a
-  // continuation run (a prior snapshot exists) also a restore GET (one more
-  // request). Reserve accordingly so a run sized to its visible workload isn't
-  // failed by the persistence traffic (which would strand the pointer on stale
-  // state or drop a legit download/upload).
-  const persistUpload = args.payload.persist_session ? 1 : 0;
-  const persistRestoreGet = args.payload.persist_session?.restore_session_id ? 1 : 0;
+  // a snapshot PUT and, on continuations, a restore GET. Those are EXEMPTED
+  // from the request/output-count budgets inside the egress ledger/gateway
+  // (keyed on SESSION_STATE_FILE_ID) rather than added to the public caps
+  // here: a raised cap hands the extra slot/request to whichever operation
+  // asks first, and user outputs upload BEFORE the snapshot PUT -- a run
+  // could exceed the configured visible cap and then fail the snapshot
+  // anyway, or charge the hidden allowance to user traffic.
   const readSessions = Array.from(new Set(inputFiles.map(file => file.session_id))).sort();
   const ctx = args.req.codeApiAuthContext;
   const identity = buildExecutionIdentity({
@@ -97,8 +97,8 @@ export function buildExecutionManifestClaims(args: {
     max_upload_bytes: args.payload.persist_session
       ? Math.max(env.EXECUTION_MANIFEST_MAX_UPLOAD_BYTES, env.SESSION_STATE_MAX_BYTES)
       : env.EXECUTION_MANIFEST_MAX_UPLOAD_BYTES,
-    max_output_files: env.EXECUTION_MANIFEST_MAX_OUTPUT_FILES + persistUpload,
-    max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS + persistUpload + persistRestoreGet,
+    max_output_files: env.EXECUTION_MANIFEST_MAX_OUTPUT_FILES,
+    max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS,
     iat: now,
     exp: now + env.EXECUTION_MANIFEST_TTL_SECONDS,
     tool_call_socket: args.payload.tool_call_socket === true,

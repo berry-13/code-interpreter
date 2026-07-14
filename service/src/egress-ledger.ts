@@ -275,9 +275,14 @@ export async function assertEgressGrantActive(grant: EgressGrantClaims): Promise
   return record;
 }
 
-export async function recordEgressRead(grant: EgressGrantClaims): Promise<void> {
+export async function recordEgressRead(grant: EgressGrantClaims, hiddenSnapshot = false): Promise<void> {
   await mutateRecord(grant, record => {
-    record.request_count += 1;
+    // The hidden snapshot restore GET is persistence plumbing, not caller
+    // traffic: it must not consume the public request budget (the manifest
+    // deliberately does NOT raise max_requests for persistence -- see
+    // execution-manifest-claims.ts), or a run sized exactly to its visible
+    // workload would fail its last legitimate request instead.
+    if (!hiddenSnapshot) record.request_count += 1;
     record.read_count += 1;
   });
 }
@@ -306,7 +311,12 @@ export async function reserveEgressUpload(args: {
     if (record.output_file_ids.includes(args.fileId)) {
       throw new EgressGrantError('scope_mismatch', 'Output file id has already been used for this grant');
     }
-    if (record.output_file_ids.length >= record.max_output_files) {
+    // The snapshot PUT is exempt from the output-count and request budgets
+    // (mirroring the byte-aggregate exemption below): the manifest keeps the
+    // PUBLIC caps at their configured values instead of adding a persistence
+    // slot that user outputs -- which upload before the snapshot -- could
+    // consume first. The id-reuse check above still applies.
+    if (!isStateSnapshot && record.output_file_ids.length >= record.max_output_files) {
       throw new EgressGrantError('scope_mismatch', 'Output file count budget exceeded');
     }
     if (!isStateSnapshot) {
@@ -315,7 +325,7 @@ export async function reserveEgressUpload(args: {
         throw new EgressGrantError('scope_mismatch', 'Aggregate upload byte budget exceeded');
       }
     }
-    record.request_count += 1;
+    if (!isStateSnapshot) record.request_count += 1;
     record.upload_count += 1;
     // Keep the snapshot out of the visible-file aggregate accounting.
     if (!isStateSnapshot) record.uploaded_bytes += args.bytes;
@@ -330,17 +340,18 @@ export async function releaseEgressUpload(args: {
 }): Promise<void> {
   if (!env.EGRESS_LEDGER_REQUIRED) return;
   await mutateRecord(args.grant, record => {
-    // Mirror reserveEgressUpload's asymmetry: the hidden session-state
-    // snapshot never entered the visible-file aggregate, so releasing it
-    // must not subtract from it either -- otherwise a failed snapshot PUT
-    // issued after user outputs were reserved under the same grant would
-    // erase THOSE files' bytes from the ledger, leaving the grant
-    // undercounted for any later upload attempts before revocation/expiry.
+    // Mirror reserveEgressUpload's asymmetries: the hidden session-state
+    // snapshot never entered the visible-file aggregate NOR the request
+    // budget, so releasing it must not subtract from them either --
+    // otherwise a failed snapshot PUT issued after user outputs were
+    // reserved under the same grant would erase THOSE files' accounting,
+    // leaving the grant undercounted for any later attempts before
+    // revocation/expiry.
     if (args.fileId !== SESSION_STATE_FILE_ID) {
       record.uploaded_bytes = Math.max(0, record.uploaded_bytes - args.bytes);
+      record.request_count = Math.max(0, record.request_count - 1);
     }
     record.upload_count = Math.max(0, record.upload_count - 1);
-    record.request_count = Math.max(0, record.request_count - 1);
     record.output_file_ids = record.output_file_ids.filter(id => id !== args.fileId);
   });
 }

@@ -1518,6 +1518,38 @@ export class Job {
    * (failed restore / oversize / no storage / error) is non-fatal and leaves
    * the prior snapshot as the session's last good state.
    */
+  /**
+   * Remove directories nested too deep for the output walker to ever scan
+   * (walkDir returns 'skipped' at config.max_nesting_depth), so a snapshot
+   * never carries files no response can reference -- restored, they'd be
+   * baselined by registerRestoredBaseline (which has no depth cap) yet stay
+   * invisible to every later walk, artifacts without a downloadable ref
+   * forever. Consistent with the response: what the walker can't reach
+   * doesn't exist. Hidden directories are left alone -- the walker skips
+   * them at ANY depth, and persisting their contents (dot-dir user state
+   * under HOME=/mnt/data) is deliberate.
+   */
+  private async pruneBeyondDepth(dir: string, depth: number): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      if (kind !== 'dir' || isHiddenDirectory(entry.name)) continue;
+      // A directory at nesting level L is walked with depth=L and skipped
+      // once L >= max_nesting_depth; this child sits at level depth+1.
+      if (depth + 1 >= config.max_nesting_depth) {
+        await fsp.rm(full, { recursive: true, force: true }).catch(() => { /* best effort */ });
+      } else {
+        await this.pruneBeyondDepth(full, depth + 1);
+      }
+    }
+  }
+
   /** True when a prior snapshot was expected but could not be restored this
    *  run. Reported to the service so it does not refresh the (possibly dead)
    *  pointer's TTL -- see the router's refresh branch. */
@@ -1674,6 +1706,9 @@ export class Job {
       for (const name of this.snapshotExcludedNames) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }
+      // Directories nested too deep for the output walker never persist
+      // either -- see pruneBeyondDepth.
+      await this.pruneBeyondDepth(this.submissionDir, 0);
       for (const name of SNAPSHOT_PRUNE_DIRS) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }

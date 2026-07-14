@@ -624,7 +624,8 @@ app.get('/sessions/:sessionHandle/objects/:objectHandle', async (req, res) => {
     const grant = await getGrant(req, res);
     const sessionId = openSessionParam(req.params.sessionHandle, grant, 'read');
     const object = openObjectParam(req.params.objectHandle, grant, sessionId);
-    await recordEgressRead(grant);
+    // Snapshot restore GETs are budget-exempt persistence plumbing.
+    await recordEgressRead(grant, object.id === SESSION_STATE_FILE_ID);
     const upstream = await fetch(
       forwardUrl(
         env.EGRESS_GATEWAY_FILE_SERVER_URL,
