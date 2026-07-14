@@ -941,6 +941,27 @@ export class Job {
       await this.autoLoadDirkeep();
     }
 
+    // Reject a request whose own inputs conflict as file-vs-directory (`data`
+    // alongside `data/a.csv`): a path cannot be both, so staging one would
+    // have to destroy the other, and with parallel fileOps WHICH one survives
+    // would be timing-dependent -- the job would proceed with a requested
+    // input silently missing. Checked after autoLoadDirkeep so synthetic
+    // inherited markers are policed by the same rule. (Content-Disposition
+    // renames can still mint a conflict mid-staging; clearNonDirectoryAncestors
+    // and clearNonRegularCollision reject those instead of silently deleting.)
+    const stagedNames = new Set(
+      this.files.filter(f => f.id || f.content !== undefined).map(f => f.name),
+    );
+    for (const name of stagedNames) {
+      const segments = name.split('/').filter(Boolean);
+      for (let i = 1; i < segments.length; i++) {
+        const ancestor = segments.slice(0, i).join('/');
+        if (stagedNames.has(ancestor)) {
+          throw new ValidationError(`input '${name}' conflicts with input '${ancestor}' (file vs directory at the same path)`);
+        }
+      }
+    }
+
     const fileOps: Promise<void>[] = [];
     for (const file of this.files) {
       if (file.id) {
@@ -1811,12 +1832,25 @@ export class Job {
    * regular file or absent -- so this is safe to call before every input write.
    */
   private async clearNonRegularCollision(p: string): Promise<void> {
+    let st: fs.Stats;
     try {
-      const st = await fsp.lstat(p);
-      if (!st.isFile()) {
-        await fsp.rm(p, { recursive: true, force: true });
+      st = await fsp.lstat(p);
+    } catch { return; /* nothing there; the write will create it */ }
+    if (st.isFile()) return;
+    // Never delete a directory that holds CURRENT-run inputs to make room
+    // for this file (a Content-Disposition rename can mint a file-vs-dir
+    // conflict the up-front prime() check couldn't see). Restored carry-over
+    // content is fair game -- replacing stale session state is this method's
+    // purpose -- but destroying a sibling input this request also staged
+    // would make the job silently run without it; reject instead.
+    const rel = path.relative(this.submissionDir, p);
+    const prefix = `${rel}/`;
+    for (const [key, info] of this.inputFileHashes) {
+      if (key.startsWith(prefix) && !info.restored) {
+        throw new ValidationError(`input '${rel}' conflicts with already-staged input '${key}' (file vs directory at the same path)`);
       }
-    } catch { /* nothing there; the write will create it */ }
+    }
+    await fsp.rm(p, { recursive: true, force: true });
   }
 
   /**
@@ -1861,8 +1895,23 @@ export class Job {
       cursor = path.join(cursor, part);
       try {
         const st = await fsp.lstat(cursor);
-        if (!st.isDirectory()) await fsp.rm(cursor, { recursive: true, force: true });
-      } catch { /* doesn't exist yet; mkdir will create it */ }
+        if (!st.isDirectory()) {
+          // Only restored carry-overs (or untracked debris) may be cleared to
+          // make room for a nested path. A CURRENT-run input file here means
+          // this request staged conflicting paths that slipped past the
+          // up-front check (Content-Disposition rename); deleting it would
+          // silently drop a requested input, so reject this file instead.
+          const rel = path.relative(this.submissionDir, cursor);
+          const tracked = this.inputFileHashes.get(rel);
+          if (tracked && !tracked.restored) {
+            throw new ValidationError(`input path under '${rel}' conflicts with already-staged input '${rel}' (file vs directory at the same path)`);
+          }
+          await fsp.rm(cursor, { recursive: true, force: true });
+        }
+      } catch (err) {
+        if (err instanceof ValidationError) throw err;
+        /* doesn't exist yet; mkdir will create it */
+      }
     }
   }
 

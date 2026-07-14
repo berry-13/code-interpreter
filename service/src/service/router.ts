@@ -346,7 +346,16 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       // namespace snapshot `.session_state.pkl` (+ its tempfile). A user input
       // with any of these names would shadow restored state or be mistaken for
       // the injected snapshot.
-      const reservedInput = (authorizedFiles ?? []).find(f => isReservedSessionInputName(f.name));
+      // Also reject refs to the hidden snapshot by its fixed storage ID (or
+      // any prefix that file-server's prefix matching would resolve to it):
+      // the snapshot upload creates a normal `upload:` cache entry under the
+      // caller's own session, so authorizeRequestedFiles would accept
+      // `id: codeapi-session-state` with a harmless-looking name and stage
+      // the internal workspace tar as an ordinary input -- bypassing the
+      // download/list routes that deliberately hide this artifact.
+      const reservedInput = (authorizedFiles ?? []).find(
+        f => isReservedSessionInputName(f.name) || (typeof f.id === 'string' && isSessionStateFileId(f.id)),
+      );
       if (reservedInput) {
         return res.status(400).json({ error: `File name '${reservedInput.name}' is reserved when persistent sessions are enabled` });
       }
