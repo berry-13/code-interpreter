@@ -187,20 +187,36 @@ for _ca_modname in list(_ca_sys.modules):
         _ca_hidden_mods[_ca_modname] = _ca_sys.modules.pop(_ca_modname)
 
 def _ca_pin_hidden():
-    # Swap the bootstrap's own (real-stdlib) modules back into sys.modules
-    # so dill's lazy sibling imports resolve to the modules it was loaded
-    # with, never a workspace file. Returns whatever entries (user imports
-    # of the same names, i.e. their shadows) were displaced, for
-    # _ca_unpin_hidden to restore.
+    # Make the bootstrap's own (real-stdlib) modules resolvable again so
+    # dill's lazy sibling imports resolve to real modules, never a workspace
+    # file. Only two situations need action:
+    #   - the name is ABSENT from sys.modules (a fresh import would go to
+    #     sys.path, where a workspace shadow could poison the machinery), or
+    #   - the live entry IS a workspace shadow (dill resolving through it
+    #     is the poisoning the pin exists to stop).
+    # A live NON-workspace instance (user code re-imported the real module
+    # after the bootstrap eviction) is left untouched: displacing it would
+    # break BY-REFERENCE pickling of every value whose class lives in the
+    # user's instance -- dill would fail to locate e.g. that pathlib's
+    # PosixPath inside the pinned copy and fall back to by-value, which can
+    # fail outright. Returns (displaced, pinned_names) for _ca_unpin_hidden.
     _ca_displaced = {}
+    _ca_pinned = []
     for _ca_name, _ca_mod in _ca_hidden_mods.items():
+        _ca_cur = _ca_sys.modules.get(_ca_name)
+        if _ca_cur is not None and not (getattr(_ca_cur, '__file__', None) or '').startswith('/mnt/data'):
+            continue
         if _ca_name in _ca_sys.modules:
             _ca_displaced[_ca_name] = _ca_sys.modules[_ca_name]
         _ca_sys.modules[_ca_name] = _ca_mod
-    return _ca_displaced
+        _ca_pinned.append(_ca_name)
+    return (_ca_displaced, _ca_pinned)
 
-def _ca_unpin_hidden(_ca_displaced):
-    for _ca_name in _ca_hidden_mods:
+def _ca_unpin_hidden(_ca_pin_state):
+    # Reverts exactly what _ca_pin_hidden did -- names it left alone (live
+    # real instances) are never evicted here.
+    _ca_displaced, _ca_pinned = _ca_pin_state
+    for _ca_name in _ca_pinned:
         if _ca_name in _ca_displaced:
             _ca_sys.modules[_ca_name] = _ca_displaced[_ca_name]
         else:
@@ -277,7 +293,7 @@ else:
             # CURRENT entry file would execute this run's payload before its
             # primary execution. Failing the load (restore skipped) is the
             # safe degradation.
-            _ca_displaced = _ca_pin_hidden()
+            _ca_pin_state = _ca_pin_hidden()
             _ca_had_entry = _CA_ENTRY_MOD in _ca_sys.modules
             _ca_entry_saved = _ca_sys.modules.get(_CA_ENTRY_MOD)
             _ca_sys.modules[_CA_ENTRY_MOD] = None
@@ -292,16 +308,41 @@ else:
             # workspace comes off sys.path.
             _ca_load_path = list(_ca_sys.path)
             _ca_sys.path[:] = [_ca_p for _ca_p in _ca_sys.path if _ca_p not in ('', '/mnt/data')]
+            _ca_retained = set()
             try:
                 with open(_CA_STATE, 'rb') as _ca_f:
-                    _ca_state = _ca_pk.load(_ca_f)
+                    _ca_state_bytes = _ca_f.read()
+                _ca_state = _ca_pk.loads(_ca_state_bytes)
+                # Restored values were reconstructed against the PINNED
+                # bootstrap modules -- a restored Path IS an instance of the
+                # pinned pathlib's PosixPath. Unpinning below would evict
+                # those modules, and user code's later "import pathlib" would
+                # build a SECOND module whose isinstance checks fail against
+                # the restored objects. Retain (keep cached after unpin) the
+                # hidden modules the pickle actually references -- module
+                # names appear literally in a pickle stream, so a bytes scan
+                # is a safe over-approximation -- EXCEPT names a workspace
+                # file shadows: there the user's import must keep resolving
+                # their file, and identity breakage is inherent to shadowing
+                # (vanilla Python behaves the same).
+                for _ca_hn in _ca_hidden_mods:
+                    _ca_ht = _ca_hn.split('.')[0]
+                    if _ca_ht.encode('utf-8') not in _ca_state_bytes:
+                        continue
+                    if _ca_os.path.exists('/mnt/data/' + _ca_ht + '.py') or _ca_os.path.isdir('/mnt/data/' + _ca_ht):
+                        continue
+                    _ca_retained.add(_ca_hn)
+                del _ca_state_bytes
             finally:
                 _ca_sys.path[:] = _ca_load_path
                 if _ca_had_entry:
                     _ca_sys.modules[_CA_ENTRY_MOD] = _ca_entry_saved
                 else:
                     _ca_sys.modules.pop(_CA_ENTRY_MOD, None)
-                _ca_unpin_hidden(_ca_displaced)
+                _ca_unpin_hidden(_ca_pin_state)
+                for _ca_rn in _ca_retained:
+                    if _ca_rn not in _ca_sys.modules:
+                        _ca_sys.modules[_ca_rn] = _ca_hidden_mods[_ca_rn]
             # Envelope: {'__ca_v__':1, 'ns': {values}, 'mods': {alias: modname}}.
             # Re-import module aliases by name first (so "import pandas as pd"
             # in one cell leaves pd bound in the next), then restore pickled
@@ -348,7 +389,7 @@ else:
     if __name__ == '__mp_main__':
         exec(compile(_CA_SRC, '<user_code>', 'exec'), _ca_ns)
     else:
-        def _ca_snapshot():
+        def _ca_snapshot(_ca_displaced_shadows=None):
             ok = {}
             mods = {}
             # Without dill, dumps() alone can't tell whether a value will
@@ -380,9 +421,16 @@ else:
             # hazard the entry-module block below handles. The probe blocks
             # every one of these names alongside the entry module, so such
             # values fail the round-trip and are dropped. __main__ stays
-            # exempt: its handling is the scratch-module swap below.
+            # exempt: its handling is the scratch-module swap below. The
+            # DISPLACED entries matter too: this runs under _ca_pin_hidden(),
+            # which swaps a user's workspace shadow of a bootstrap dependency
+            # (/mnt/data/tempfile.py imported as "tempfile") OUT of
+            # sys.modules -- scanning only the live table would miss exactly
+            # those workspace modules and let values pickled through them
+            # bypass the probe.
             _ca_ws_mods = {}
-            for _ca_wn, _ca_wm in list(_ca_sys.modules.items()):
+            _ca_scan = list(_ca_sys.modules.items()) + list((_ca_displaced_shadows or {}).items())
+            for _ca_wn, _ca_wm in _ca_scan:
                 if _ca_wn in ('__main__', '__mp_main__') or _ca_wm is None:
                     continue
                 if (getattr(_ca_wm, '__file__', None) or '').startswith('/mnt/data'):
@@ -545,11 +593,11 @@ else:
             # (atexit is LIFO and this registration precedes user code), so
             # nothing user-visible executes during the pin window except
             # daemon threads, which are torn down mid-flight anyway.
-            _ca_displaced = _ca_pin_hidden()
+            _ca_pin_state = _ca_pin_hidden()
             try:
-                _ca_snapshot()
+                _ca_snapshot(_ca_pin_state[0])
             finally:
-                _ca_unpin_hidden(_ca_displaced)
+                _ca_unpin_hidden(_ca_pin_state)
 
         _ca_atexit.register(_ca_snapshot_pinned)
         # A raw os.fork() (unlike multiprocessing's spawn/forkserver, already

@@ -1515,19 +1515,39 @@ export class Job {
    *  their upload never reached the file server. */
   excludeFromSessionSnapshot(names: string[]): void {
     for (const name of names) {
-      // A failed upload of a MODIFIED RESTORED file must block the whole
+      // A failed upload that touches RESTORED state must block the whole
       // snapshot instead of excluding the path: excluding would publish a
-      // snapshot WITHOUT the file, superseding (and deleting) the last good
-      // snapshot that still holds the prior version -- a transient upload
-      // blip would erase the carry-over entirely. Blocking keeps the pointer
-      // on the last good state; only this run's edits to the file are lost.
-      if (this.inputFileHashes.get(name)?.restored) {
+      // snapshot missing BOTH the new file and whatever restored content it
+      // replaced, superseding (and deleting) the last good snapshot that
+      // still holds the prior version -- a transient upload blip would erase
+      // the carry-over entirely. That covers not just an exact restored
+      // baseline (a modified restored file) but also a generated file that
+      // replaced a restored DIRECTORY (baselines live under `name/`) or was
+      // created under a replaced restored ancestor. Blocking keeps the
+      // pointer on the last good state; only this run's changes are lost.
+      if (this.nameTouchesRestoredState(name)) {
         this.sessionPersistBlocked = true;
-        this.log.warn({ file: name }, 'Upload of modified restored file failed; blocking session persist');
+        this.log.warn({ file: name }, 'Failed upload touches restored session state; blocking session persist');
         continue;
       }
       this.snapshotExcludedNames.add(name);
     }
+  }
+
+  /** True when `name` has a restored baseline at the exact path, under it
+   *  (`name/` -- it replaced a restored directory), or at any ancestor
+   *  segment (it was created inside a replaced restored file's path). */
+  private nameTouchesRestoredState(name: string): boolean {
+    if (this.inputFileHashes.get(name)?.restored) return true;
+    const prefix = `${name}/`;
+    for (const [key, info] of this.inputFileHashes) {
+      if (info.restored && key.startsWith(prefix)) return true;
+    }
+    const segments = name.split('/').filter(Boolean);
+    for (let i = segments.length - 1; i > 0; i--) {
+      if (this.inputFileHashes.get(segments.slice(0, i).join('/'))?.restored) return true;
+    }
+    return false;
   }
 
   /**
