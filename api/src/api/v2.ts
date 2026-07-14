@@ -459,6 +459,12 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
             return false;
           });
       }
+      /* Tell the service when the prior snapshot could not be restored, so
+       * its pointer-TTL refresh (which otherwise fires on every skipped
+       * persist) doesn't pin a dead/corrupt snapshot alive forever. */
+      if (job.sessionRestoreDidFail()) {
+        result.session_state_restore_failed = true;
+      }
 
       metricsOutcome = 'success';
       return res.status(200).json(result);

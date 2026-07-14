@@ -712,6 +712,14 @@ interface InputFileInfo {
    * treated as a normal generated output.
    */
   restored?: boolean;
+  /**
+   * Set for files staged from inline payload content (the wrapped entry
+   * source -- main.py / main.ts / script.sh -- and anything else the service
+   * sends by value rather than by id). These are run infrastructure, never
+   * user state: persistSessionState prunes them from the session snapshot so
+   * one run's wrapper source can't masquerade as a carried-over user file.
+   */
+  staged?: boolean;
 }
 
 interface ExecuteResult {
@@ -724,6 +732,10 @@ interface ExecuteResult {
   files: FileRef[];
   /** True when a fresh workspace snapshot was written for a persistent session. */
   session_state_persisted?: boolean;
+  /** True when a prior snapshot was expected but could not be restored this
+   *  run (missing/corrupt object). The service must NOT refresh the session
+   *  pointer's TTL in that case -- see the router's refresh branch. */
+  session_state_restore_failed?: boolean;
 }
 
 const jobQueue: Array<() => void> = [];
@@ -780,6 +792,12 @@ export class Job {
    *  after extraction, if one was present. persistSessionState compares
    *  against it to detect a Python run whose atexit snapshot never fired. */
   private restoredPickleStat: { ino: number; mtimeMs: number } | undefined;
+  /** Set when this run's workspace was degraded by infrastructure failure
+   *  (e.g. a restored carry-over was discarded because its replacement input
+   *  failed to download). Unlike sessionRestoreFailed the restore itself
+   *  succeeded, but persisting would promote the degraded tree and delete
+   *  files the last good snapshot still holds. */
+  private sessionPersistBlocked = false;
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -1146,9 +1164,17 @@ export class Job {
     // stale carry-over + its baseline so user code sees the input as missing --
     // at the requested name AND at the Content-Disposition-resolved name a
     // failed attempt got far enough to see.
-    await this.discardStaleRestoredInput(file.name);
+    let discardedRestored = await this.discardStaleRestoredInput(file.name);
     if (lastResolvedName && lastResolvedName !== file.name) {
-      await this.discardStaleRestoredInput(lastResolvedName);
+      discardedRestored = (await this.discardStaleRestoredInput(lastResolvedName)) || discardedRestored;
+    }
+    if (discardedRestored) {
+      // The last good snapshot still holds the file we just discarded.
+      // Persisting this run would archive the deletion and CAS the pointer
+      // forward, permanently losing that file to a transient fetch failure --
+      // block persistence so the next run restores it and retries the input.
+      this.sessionPersistBlocked = true;
+      this.log.warn({ file: file.name }, 'Discarded restored carry-over after failed download; blocking session persist');
     }
     return null;
   }
@@ -1157,9 +1183,11 @@ export class Job {
    * On a failed input download, remove a restored persistent-session file (or
    * directory) left at the same path (and its output-walk baseline) so the run
    * doesn't observe stale bytes in place of the current, unavailable input.
-   * No-op unless the path was a restored carry-over.
+   * No-op unless the path was a restored carry-over. Returns whether anything
+   * restored was actually discarded -- the caller must then block persistence
+   * for this run (see sessionPersistBlocked).
    */
-  private async discardStaleRestoredInput(name: string): Promise<void> {
+  private async discardStaleRestoredInput(name: string): Promise<boolean> {
     const info = this.inputFileHashes.get(name);
     if (info?.restored && info.path) {
       try {
@@ -1168,7 +1196,7 @@ export class Job {
         this.log.warn({ file: name, err }, 'Failed to remove stale restored input after download failure');
       }
       this.inputFileHashes.delete(name);
-      return;
+      return true;
     }
     // `name` itself has no restored entry, but a restored FILE at one of its
     // ancestor path segments would block it just the same (e.g. a prior run
@@ -1187,7 +1215,7 @@ export class Job {
           this.log.warn({ file: ancestor, err }, 'Failed to remove stale restored ancestor after download failure');
         }
         this.inputFileHashes.delete(ancestor);
-        return;
+        return true;
       }
     }
     // registerRestoredBaseline recurses into restored directories and keys each
@@ -1196,7 +1224,7 @@ export class Job {
     // `name/` so a restored directory at this path is also discarded.
     const prefix = `${name}/`;
     const hasRestoredChild = [...this.inputFileHashes.keys()].some((key) => key.startsWith(prefix));
-    if (!hasRestoredChild) return;
+    if (!hasRestoredChild) return false;
     try {
       await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true });
     } catch (err) {
@@ -1205,6 +1233,7 @@ export class Job {
     for (const key of [...this.inputFileHashes.keys()]) {
       if (key.startsWith(prefix)) this.inputFileHashes.delete(key);
     }
+    return true;
   }
 
   /**
@@ -1382,13 +1411,22 @@ export class Job {
    * (failed restore / oversize / no storage / error) is non-fatal and leaves
    * the prior snapshot as the session's last good state.
    */
+  /** True when a prior snapshot was expected but could not be restored this
+   *  run. Reported to the service so it does not refresh the (possibly dead)
+   *  pointer's TTL -- see the router's refresh branch. */
+  sessionRestoreDidFail(): boolean {
+    return this.sessionRestoreFailed;
+  }
+
   async persistSessionState(): Promise<boolean> {
     const ps = this.persistSession;
     if (!ps || !this.submissionDir || !this.fileEgressBaseUrl()) return false;
     // See restoreSessionWorkspace's catch: a failed restore means this run
     // saw a cold workspace, and snapshotting it would supersede -- and via
-    // the service's CAS-advance, delete -- the last good snapshot.
-    if (this.sessionRestoreFailed) return false;
+    // the service's CAS-advance, delete -- the last good snapshot. Likewise
+    // when infrastructure failure degraded the restored tree mid-staging
+    // (sessionPersistBlocked) -- the snapshot must keep the last good copy.
+    if (this.sessionRestoreFailed || this.sessionPersistBlocked) return false;
     // Python's persistence wrapper rewrites the namespace pickle from atexit
     // (os.replace -> new inode + mtime) or, on a failed dump, deletes it. If
     // a restored pickle is still the IDENTICAL file at persist time, this
@@ -1442,6 +1480,19 @@ export class Job {
       //    HOME=/mnt/data) and the atomic-write tempfile -- not useful state.
       // The `.session_state.pkl` snapshot is kept so variables carry forward.
       await this.removeReadOnlyInputs();
+      // Payload-staged content files (the wrapped entry source -- main.py /
+      // main.ts / script.sh) are likewise run infrastructure. Persisting them
+      // would carry this run's wrapper source forward as if it were user
+      // data; and since restore runs BEFORE source staging, a user file that
+      // shares the entry name is overwritten by the next run's source anyway
+      // -- it can never round-trip. Pruning makes that reservation explicit
+      // and consistent: entry filenames simply never persist. Recursive: the
+      // run could have replaced the path with a directory.
+      for (const info of this.inputFileHashes.values()) {
+        if (info.staged && info.path) {
+          await fsp.rm(info.path, { recursive: true, force: true }).catch(() => { /* best effort */ });
+        }
+      }
       for (const name of SNAPSHOT_PRUNE_DIRS) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }
@@ -1857,7 +1908,7 @@ export class Job {
     await this.applySandboxFilePermissions(filePath);
 
     const hash = crypto.createHash('sha256').update(content).digest('hex');
-    this.inputFileHashes.set(file.name, { hash, path: filePath });
+    this.inputFileHashes.set(file.name, { hash, path: filePath, staged: true });
   }
 
   async safeCall(

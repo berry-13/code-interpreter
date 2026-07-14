@@ -477,7 +477,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       } catch (error) {
         logger.error(`[${INSTANCE_ID}] Failed to advance session-state pointer:`, error);
       }
-    } else if (env.PERSIST_SESSIONS && priorSnapshotSession) {
+    } else if (
+      env.PERSIST_SESSIONS &&
+      priorSnapshotSession &&
+      !(result as t.ExecuteResult)?.session_state_restore_failed
+    ) {
       // This run restored a prior snapshot but didn't write a fresh one (oversize
       // workspace, upload failure, etc.). The comment above promises an active
       // session's pointer never expires, but that's only true when a fresh
@@ -489,6 +493,15 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       // rewrites the same value (whether the key is still live or already
       // expired) without ever clobbering a pointer a concurrent run has since
       // advanced.
+      //
+      // EXCEPT after a FAILED restore (the guard above): if the snapshot
+      // object is truly gone (lifecycle cleanup) or corrupt, every retry
+      // fails, skips persist, and would land here -- refreshing would pin the
+      // dead pointer alive forever and brick the session until manual Redis
+      // surgery. Not refreshing bounds the outage: the pointer ages out from
+      // its last good refresh within SESSION_STATE_TTL_SECONDS and the
+      // session starts fresh. A transient miss merely skips one refresh,
+      // which is harmless against that TTL.
       try {
         await casAdvanceSessionPointer(
           sessionStatePointerKey(sessionKey),

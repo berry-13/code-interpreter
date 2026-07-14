@@ -138,10 +138,13 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     }
 
     /* Read straight from the raw sandbox response: the egress-restore reshaping
-     * above only rewrites `files`, and this flag governs whether the router
-     * advances the persistent-session Redis pointer. */
+     * above only rewrites `files`, and these flags govern whether the router
+     * advances (or TTL-refreshes) the persistent-session Redis pointer. */
     if ((response.data as { session_state_persisted?: boolean }).session_state_persisted === true) {
       result.session_state_persisted = true;
+    }
+    if ((response.data as { session_state_restore_failed?: boolean }).session_state_restore_failed === true) {
+      result.session_state_restore_failed = true;
     }
 
     if (result.message || result.signal) {

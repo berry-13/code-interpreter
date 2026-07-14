@@ -234,6 +234,10 @@ export type ExecuteResult = {
    *  `sessionstate:<sessionKey>` Redis pointer only on true, so a skipped
    *  snapshot (oversize/error) leaves the last good state pointed-to. */
   session_state_persisted?: boolean;
+  /** True when a prior snapshot was expected but could not be restored
+   *  (missing/corrupt object). The router must NOT refresh the pointer's TTL
+   *  then -- pinning a dead snapshot alive would brick the session. */
+  session_state_restore_failed?: boolean;
 };
 
 export interface LanguageConfig {
