@@ -81,9 +81,22 @@ const RESERVED_SESSION_BASENAMES = new Set([
   ...SESSION_STATE_INTERNAL_BASENAMES,
   SESSION_STATE_TAR_BASENAME,
 ]);
-/* Top-level runtime cache dirs pruned from a session snapshot (pip/matplotlib
- * scatter these under HOME=/mnt/data; they are not useful state). */
-const SNAPSHOT_PRUNE_DIRS = ['.cache', '.config', '.npm', `${SESSION_STATE_PKL_BASENAME}.tmp`];
+/* Runtime cache paths pruned from a session snapshot before archiving. HOME
+ * is /mnt/data inside the sandbox, so package managers and libraries scatter
+ * regenerable caches here that would balloon every snapshot -- but user code
+ * ALSO stores legitimate state under dot directories for exactly the same
+ * reason, and persistent sessions promise that files left under /mnt/data
+ * carry forward. Prune only the specific cache subtrees runtimes are known
+ * to write, never a whole top-level dot dir (`.config` may hold user state,
+ * `.cache/myapp` too). */
+const SNAPSHOT_PRUNE_DIRS = [
+  '.cache/pip',
+  '.cache/matplotlib',
+  '.cache/fontconfig',
+  '.npm/_cacache',
+  '.npm/_logs',
+  `${SESSION_STATE_PKL_BASENAME}.tmp`,
+];
 
 /* Checks every path segment, not just the basename: a name like
  * `.session_state.pkl/chunk` would otherwise pass as an ordinary input,
@@ -1109,23 +1122,36 @@ export class Job {
         });
 
         if (response.status === 404 && attempt < maxRetries) {
+          // Cancel unconsumed bodies on every non-streaming exit: an
+          // abandoned body pins its undici connection until GC, and a retry
+          // storm could drain the fetch pool for unrelated transfers.
+          await response.body?.cancel().catch(() => { /* release socket */ });
           const delay = retryDelay * Math.pow(2, attempt - 1);
           this.log.info({ fileId: file.id, attempt, maxRetries, delay }, 'File not found, retrying');
           await sleep(delay);
           continue;
         }
 
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => { /* release socket */ });
+          throw new Error(`HTTP error: ${response.status}`);
+        }
 
-        const originalName = resolveOriginalName(response, file);
-        validateFilePath(originalName, this.submissionDir);
-        // The router reserves these names by RequestFile.name, but the on-disk
-        // name comes from Content-Disposition here -- so a file sent under a
-        // harmless name could still land on a reserved basename and shadow
-        // restored state. Reject it (the injected state file is already spliced
-        // out before this runs, so this only ever sees user inputs).
-        if (this.persistSession && isReservedSessionBasename(originalName)) {
-          throw new ValidationError(`input resolves to reserved session filename '${originalName}'`);
+        let originalName: string;
+        try {
+          originalName = resolveOriginalName(response, file);
+          validateFilePath(originalName, this.submissionDir);
+          // The router reserves these names by RequestFile.name, but the on-disk
+          // name comes from Content-Disposition here -- so a file sent under a
+          // harmless name could still land on a reserved basename and shadow
+          // restored state. Reject it (the injected state file is already spliced
+          // out before this runs, so this only ever sees user inputs).
+          if (this.persistSession && isReservedSessionBasename(originalName)) {
+            throw new ValidationError(`input resolves to reserved session filename '${originalName}'`);
+          }
+        } catch (err) {
+          await response.body?.cancel().catch(() => { /* release socket */ });
+          throw err;
         }
         lastResolvedName = originalName;
         const finalPath = path.join(this.submissionDir, originalName);
@@ -1558,6 +1584,16 @@ export class Job {
       for (const name of SNAPSHOT_PRUNE_DIRS) {
         await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
       }
+      // Pruning subtrees can leave their parents (.cache, .npm) empty; reap
+      // those best-effort with a non-recursive rmdir so a bare cache shell
+      // doesn't ride every snapshot -- a parent holding real user files
+      // simply stays.
+      const pruneParents = new Set(
+        SNAPSHOT_PRUNE_DIRS.filter(p => p.includes('/')).map(p => p.split('/')[0]),
+      );
+      for (const parent of pruneParents) {
+        await fsp.rmdir(path.join(this.submissionDir, parent)).catch(() => { /* not empty: user state stays */ });
+      }
       // Bound the aggregate size so a huge workspace can't make the runner
       // materialize a multi-GB tar in /tmp and fill host disk.
       const approxBytes = await this.dirSizeBytes(this.submissionDir);
@@ -1592,8 +1628,18 @@ export class Job {
    */
   private async downloadObjectToPath(file: TFile, destPath: string, maxBytes: number): Promise<boolean> {
     const res = await fetch(this.buildDownloadUrl(file), { headers: this.fileEgressHeaders() });
-    if (res.status === 404) return false;
-    if (!res.ok) throw new Error(`Session object download HTTP ${res.status}`);
+    // Cancel unconsumed bodies on every non-streaming exit: an abandoned body
+    // pins its undici connection until GC, and repeated failed restores
+    // (lifecycle-deleted snapshots, transient misses) could drain the fetch
+    // pool and stall unrelated downloads/uploads.
+    if (res.status === 404) {
+      await res.body?.cancel().catch(() => { /* release socket */ });
+      return false;
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => { /* release socket */ });
+      throw new Error(`Session object download HTTP ${res.status}`);
+    }
     if (!res.body) throw new Error('Session object download returned empty body');
     const declared = Number(res.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > maxBytes) {
