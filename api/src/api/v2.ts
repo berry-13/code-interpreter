@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import type { Runtime } from '../runtime';
 import type { TFile } from '../job';
+import type { NsJailResult } from '../nsjail';
 import { getLatestRuntimeMatchingLanguageVersion, getRuntimes } from '../runtime';
 import { logger } from '../logger';
 import { config } from '../config';
@@ -38,6 +39,11 @@ export interface ExecuteRequestBody {
   egress_grant?: string;
   execution_manifest?: string;
   tool_call_socket?: boolean;
+  /** Persistent-session marker (opt-in). When present, prime() restores a prior
+   *  workspace tar found at `/mnt/data/<filename>` and, after the run, snapshots
+   *  `/mnt/data` back to `output_session_id/<file_id>`. Covered by the manifest
+   *  body hash like every other field. */
+  persist_session?: { file_id: string; filename: string; restore_session_id?: string };
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;
@@ -151,6 +157,17 @@ function getJob(
   if (body.tool_call_socket !== undefined && typeof body.tool_call_socket !== 'boolean') {
     throw { message: 'tool_call_socket must be a boolean if specified' };
   }
+  if (body.persist_session !== undefined) {
+    const ps = body.persist_session;
+    if (
+      typeof ps !== 'object' || ps === null ||
+      typeof ps.file_id !== 'string' || ps.file_id.length === 0 ||
+      typeof ps.filename !== 'string' || ps.filename.length === 0 ||
+      (ps.restore_session_id !== undefined && typeof ps.restore_session_id !== 'string')
+    ) {
+      throw { message: 'persist_session must be { file_id, filename, restore_session_id? }' };
+    }
+  }
   for (const [i, file] of files.entries()) {
     if (typeof file.content !== 'string' && typeof file.id !== 'string') {
       throw { message: `files[${i}].content is required as a string if no id is provided` };
@@ -171,12 +188,23 @@ function getJob(
 
   validateConstraints(body, rt);
 
+  // Rollout flag-skew guard: if the service injected the synthetic state file
+  // but this sandbox has persistence disabled, the marker is dropped below, so
+  // the file would otherwise be downloaded and echoed as an ordinary input.
+  // Strip it here so a hidden state object can never leak to the caller.
+  let effectiveFiles = files;
+  if (body.persist_session && !config.persist_sessions) {
+    effectiveFiles = files.filter(
+      f => !(f.id && f.storage_session_id && f.name === body.persist_session!.filename),
+    );
+  }
+
   return new Job({
     session_id: session_id ?? null,
     runtime: rt,
     args: args ?? [],
     stdin: stdin ?? '',
-    files,
+    files: effectiveFiles,
     timeouts: {
       run: run_timeout ?? rt.timeouts.run,
       compile: compile_timeout ?? rt.timeouts.compile,
@@ -194,6 +222,7 @@ function getJob(
     egress_grant: egressGrantToken,
     tool_call_socket_enabled: toolCallSocketEnabled,
     is_synthetic: isSynthetic,
+    persist_session: config.persist_sessions ? body.persist_session : undefined,
   });
 }
 
@@ -227,6 +256,23 @@ function validateConstraints(body: ExecuteRequestBody, rt: Runtime): void {
       }
     }
   }
+}
+
+/**
+ * True when the run step ended via a signal (SIGKILL from a timeout, or any
+ * other signal death) rather than a normal Python exit. The persisted-session
+ * atexit snapshot only runs on normal interpreter shutdown (clean exit OR an
+ * uncaught exception -- both still process atexit); a signal kill bypasses
+ * it entirely, so `.session_state.pkl` on disk is stale (from the prior run,
+ * not this one) even though ordinary file writes this run made before being
+ * killed are not buffered and would still be captured by a persist.
+ */
+export function wasKilledBySignal(run: NsJailResult | undefined): boolean {
+  // status 'SG' covers cgroup OOM kills that the nsjail log parser detects
+  // without extracting an explicit signal (see nsjail.ts) -- the interpreter
+  // died without running atexit either way. TO/OL/EL statuses already force
+  // signal=SIGKILL in the parser, so the signal check covers those.
+  return Boolean(run?.signal) || run?.status === 'SG';
 }
 
 function manifestErrorStatus(error: ExecutionManifestError): number {
@@ -372,6 +418,9 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
 
         const generatedIds = new Set(job.getGeneratedFileIds());
         const before = result.files.length;
+        const failedUploads = result.files.filter(
+          f => generatedIds.has(f.id) && !uploaded.has(f.id),
+        );
         result.files = result.files.filter(
           f => !generatedIds.has(f.id) || uploaded.has(f.id),
         );
@@ -381,7 +430,75 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
             { job: job.uuid, dropped, kept: result.files.length },
             'Pruned files from response because upload did not reach file_server',
           );
+          /* Persistent sessions: a file pruned from the response must not
+           * ride the snapshot either. Restored next run, it would be
+           * baselined as an unchanged carry-over and suppressed from every
+           * later response -- an artifact sitting in /mnt/data that never
+           * got (and never will get) a downloadable ref. Excluding just the
+           * failed files keeps the snapshot consistent with what the caller
+           * was told, without discarding the run's other state (variables,
+           * modified files) over a transient upload blip. */
+          job.excludeFromSessionSnapshot(failedUploads.map(f => f.name));
         }
+      }
+
+      /* Persistent sessions: snapshot the workspace (files + dill namespace)
+       * back to the current output session. No-op unless a persist_session
+       * marker is set; always non-fatal. The service advances the
+       * `sessionstate:<sessionKey>` Redis pointer only when this returns true.
+       *
+       * Skip entirely when the run was killed by a signal (timeout -> SIGKILL,
+       * or any other signal death): the Python wrapper's snapshot runs from
+       * `atexit`, which a signal kill never reaches, so `.session_state.pkl`
+       * on disk is whatever the LAST successful run left there -- stale, not
+       * this run's -- while ordinary file writes this run made before being
+       * killed (including a mid-write, truncated file) are NOT buffered and
+       * WOULD still land in the tar. Persisting that mix would advance the
+       * session pointer to a torn snapshot: files reflecting the killed run,
+       * variables reflecting the run before it. Leaving the pointer on the
+       * last good snapshot (as any other skipped persist already does) is
+       * safer than manufacturing a snapshot no single run ever produced. A
+       * plain nonzero exit (an uncaught exception, or the user's own
+       * `sys.exit(n)`) still runs atexit normally and is not skipped here.
+       * Exits that bypass atexit WITHOUT a signal -- os._exit(0), os.exec*
+       * -- can't be told apart from a clean exit here; persistSessionState
+       * itself catches those by fingerprinting the restored pickle and
+       * skipping when this run never rewrote it.
+       *
+       * The compile phase gets the same treatment: a compile killed by
+       * signal (timeout) leaves `result.run` undefined, so checking only the
+       * run phase would fall through and persist a workspace holding partial
+       * compiler outputs from a run that never executed. */
+      if (wasKilledBySignal(result.compile) || wasKilledBySignal(result.run)) {
+        result.session_state_persisted = false;
+      } else {
+        result.session_state_persisted = await withSpan('codeapi.sandbox.persist_session', {
+          'codeapi.language': job.runtime.language,
+        }, () => job!.persistSessionState())
+          .catch((err) => {
+            logger.error({ job: job!.uuid, err }, 'Session persist failed');
+            return false;
+          });
+      }
+      /* Tell the service when the prior snapshot could not be restored, so
+       * its pointer-TTL refresh (which otherwise fires on every skipped
+       * persist) doesn't pin a dead/corrupt snapshot alive forever. */
+      if (job.sessionRestoreDidFail()) {
+        result.session_state_restore_failed = true;
+      }
+      /* Rollout flag-skew: the service expected a restore (persist_session
+       * with a restore marker) but THIS runner has persistence disabled, so
+       * getJob stripped the marker and nothing was restored or persisted.
+       * Without this, the response carries neither session_state flag, and
+       * the service's skipped-persist branch would refresh the old pointer
+       * as if the restore succeeded -- keeping stale state alive while this
+       * run executed cold and its changes are silently dropped from the
+       * session. Reporting it as a failed restore skips that refresh; if the
+       * skew persists, the failure streak eventually releases the pointer,
+       * which is the intended pressure valve during a misrollout. */
+      const requestedPersist = (req.body as { persist_session?: { restore_session_id?: string } })?.persist_session;
+      if (!config.persist_sessions && requestedPersist?.restore_session_id) {
+        result.session_state_restore_failed = true;
       }
 
       metricsOutcome = 'success';

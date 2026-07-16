@@ -1,9 +1,12 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { nanoid } from 'nanoid';
 import * as crypto from 'crypto';
 import * as semver from 'semver';
 import * as fsp from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { pipeline } from 'stream/promises';
 import { Readable, Transform } from 'stream';
 import type { Logger } from 'pino';
@@ -22,9 +25,11 @@ import {
   applySandboxPathPermissionsNoFollow,
   cleanupSandboxWorkspace,
   createSandboxWorkspace,
+  currentUid,
   fallbackSandboxIdentity,
   retainWorkspaceCleanupUntilRemoved,
   sandboxJobUidPool,
+  SANDBOX_WORKSPACE_MODE,
   type SandboxJobIdentity,
   type SandboxWorkspaceLease,
 } from './workspace-isolation';
@@ -52,6 +57,64 @@ export {
 } from './validation';
 
 const AUTO_LOAD_DIRKEEP_TIMEOUT_MS = 10000;
+
+const execFileP = promisify(execFile);
+
+/* Basenames the persistence layer manages under /mnt/data. MUST stay in sync
+ * with SESSION_STATE_FILENAME / SESSION_STATE_TAR_FILENAME in
+ * service/src/session-persist.ts (separate npm package -- cannot import). */
+const SESSION_STATE_PKL_BASENAME = '.session_state.pkl';
+const SESSION_STATE_TAR_BASENAME = 'session-workspace.tar';
+/* Internal artifacts that never legitimately exist as user content -- the
+ * pickle only ever lives at this exact path and is always excluded before
+ * archiving/output. Deliberately excludes SESSION_STATE_TAR_BASENAME: unlike
+ * the pickle, that name CAN collide with a real user-created file (the
+ * persisted tar object itself is downloaded to a path outside submissionDir
+ * and extracted -- its own filename never becomes a member inside the
+ * archive it produces, so a file with this name in a restored workspace can
+ * only be one the user's own code wrote). */
+const SESSION_STATE_INTERNAL_BASENAMES = new Set([
+  SESSION_STATE_PKL_BASENAME,
+  `${SESSION_STATE_PKL_BASENAME}.tmp`,
+]);
+const RESERVED_SESSION_BASENAMES = new Set([
+  ...SESSION_STATE_INTERNAL_BASENAMES,
+  SESSION_STATE_TAR_BASENAME,
+]);
+/* Runtime cache paths pruned from a session snapshot before archiving. HOME
+ * is /mnt/data inside the sandbox, so package managers and libraries scatter
+ * regenerable caches here that would balloon every snapshot -- but user code
+ * ALSO stores legitimate state under dot directories for exactly the same
+ * reason, and persistent sessions promise that files left under /mnt/data
+ * carry forward. Prune only the specific cache subtrees runtimes are known
+ * to write, never a whole top-level dot dir (`.config` may hold user state,
+ * `.cache/myapp` too). */
+const SNAPSHOT_PRUNE_DIRS = [
+  '.cache/pip',
+  '.cache/matplotlib',
+  '.cache/fontconfig',
+  '.npm/_cacache',
+  '.npm/_logs',
+  `${SESSION_STATE_PKL_BASENAME}.tmp`,
+];
+
+/* Checks every path segment, not just the basename: a name like
+ * `.session_state.pkl/chunk` would otherwise pass as an ordinary input,
+ * staging a directory at the reserved path that the Python wrapper then
+ * can't replace with (or read as) the actual pickle file. */
+function pathSegments(name: string): string[] {
+  return name.replace(/\\/g, '/').split('/').filter(Boolean);
+}
+
+function isReservedSessionBasename(name: string): boolean {
+  return pathSegments(name).some(segment => RESERVED_SESSION_BASENAMES.has(segment));
+}
+
+/** True for the internal pickle artifacts only -- never a legitimate restored
+ *  user file, unlike SESSION_STATE_TAR_BASENAME (see comment above). */
+function isSessionStateInternalBasename(name: string): boolean {
+  return pathSegments(name).some(segment => SESSION_STATE_INTERNAL_BASENAMES.has(segment));
+}
 
 /**
  * Bridges a `fetch` response body to a Node-stream Readable. The types at the
@@ -435,6 +498,33 @@ export function markerConflictsWithExplicitFile(
   return false;
 }
 
+/**
+ * Extra tar bytes for a member whose stored path forces a long-name record, or
+ * 0 when the path fits the header's name field. GNU tar (default `--format=gnu`,
+ * as shipped) stores the full path in a 100-byte name field with NO ustar
+ * prefix splitting, so any member name over 100 bytes -- INCLUDING the trailing
+ * '/' GNU tar appends to directory members -- gets a preceding
+ * `GNUTYPE_LONGNAME` ('L') record: a 512-byte header plus the path
+ * (NUL-terminated) padded to a 512-byte boundary, right before the member's own
+ * header. The `+16` margin also covers the marginally larger extended header a
+ * POSIX/pax-format tar would emit for the same path (its `path=` record), so the
+ * estimate never undercounts under either format.
+ *
+ * The size estimator MUST add this: a swarm of long-named files (e.g. many empty
+ * files with ~120-byte basenames) or deeply nested paths would otherwise pass
+ * the pre-archive cap while `tar -cf` still materializes a much larger archive
+ * on runner disk before the post-archive size check rejects it.
+ *
+ * `storedName` must be the exact archive member name -- `./<rel>` for files and
+ * symlinks, `./<rel>/` (trailing slash) for directories. Pure; exported for
+ * unit testing.
+ */
+export function tarLongNameOverheadBytes(storedName: string): number {
+  const len = Buffer.byteLength(storedName, 'utf8');
+  if (len <= 100) return 0;
+  return 512 + Math.ceil((len + 16) / 512) * 512;
+}
+
 function mergeDelimitedEnvEntries(
   key: string,
   source: string | undefined,
@@ -626,6 +716,25 @@ interface InputFileInfo {
    * file) and modifications are not surfaced as artifacts to the client.
    */
   readOnly?: boolean;
+  /**
+   * Set for files materialized by a persistent-session restore (not part of
+   * this request's inputs). Unchanged restored files are skipped by the output
+   * walker -- they are internal session state carried in the snapshot tar, not
+   * user-facing artifacts -- so they never consume a max_output_files slot and
+   * crowd out a genuinely new output. A restored file the run MODIFIES is
+   * treated as a normal generated output.
+   */
+  restored?: boolean;
+  /**
+   * Set for files staged from inline payload content (sent by value rather
+   * than by id). Of these, only the runtime ENTRYPOINT (main.py / main.ts /
+   * script.sh -- `entryPointName`) is run infrastructure that
+   * persistSessionState prunes from the session snapshot, so one run's
+   * wrapper source can't masquerade as a carried-over user file. Other
+   * inline content files (a helper `notes.txt`) are ordinary user inputs and
+   * persist like any other workspace file.
+   */
+  staged?: boolean;
 }
 
 interface ExecuteResult {
@@ -636,6 +745,12 @@ interface ExecuteResult {
   /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRef[];
+  /** True when a fresh workspace snapshot was written for a persistent session. */
+  session_state_persisted?: boolean;
+  /** True when a prior snapshot was expected but could not be restored this
+   *  run (missing/corrupt object). The service must NOT refresh the session
+   *  pointer's TTL in that case -- see the router's refresh branch. */
+  session_state_restore_failed?: boolean;
 }
 
 const jobQueue: Array<() => void> = [];
@@ -680,6 +795,32 @@ export class Job {
   private inputFileHashes = new Map<string, InputFileInfo>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
+  /** Serializes input placement across parallel fileOps -- see runStaged. */
+  private dirPrepChain: Promise<void> = Promise.resolve();
+  private persistSession: { file_id: string; filename: string; restore_session_id?: string } | undefined;
+  /** A prior snapshot existed but could not be restored this run; gates
+   *  persistSessionState() so the resulting cold workspace never supersedes
+   *  (and deletes) the session's last good snapshot. */
+  private sessionRestoreFailed = false;
+  /** Identity (inode + mtime) of the restored `.session_state.pkl` right
+   *  after extraction, if one was present. persistSessionState compares
+   *  against it to detect a Python run whose atexit snapshot never fired. */
+  private restoredPickleStat: { ino: number; mtimeMs: number } | undefined;
+  /** True once a prior snapshot was successfully restored this run -- a
+   *  last-good snapshot exists that this run's persist would supersede. */
+  private sessionRestoredOk = false;
+  /** Set when this run's workspace was degraded by infrastructure failure
+   *  (e.g. a restored carry-over was discarded because its replacement input
+   *  failed to download). Unlike sessionRestoreFailed the restore itself
+   *  succeeded, but persisting would promote the degraded tree and delete
+   *  files the last good snapshot still holds. */
+  private sessionPersistBlocked = false;
+  /** Workspace-relative names of generated files whose upload never reached
+   *  the file server. persistSessionState prunes them from the snapshot: a
+   *  file absent from the response must not ride into the next restore,
+   *  where the baseline would suppress it as an unchanged carry-over and the
+   *  caller could never obtain a ref for it. */
+  private snapshotExcludedNames = new Set<string>();
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -698,6 +839,7 @@ export class Job {
     egress_grant?: string;
     tool_call_socket_enabled?: boolean;
     is_synthetic?: boolean;
+    persist_session?: { file_id: string; filename: string; restore_session_id?: string };
   }) {
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
@@ -731,6 +873,7 @@ export class Job {
     this.egressGrantToken = opts.egress_grant;
     this.toolCallSocketEnabled = opts.tool_call_socket_enabled === true;
     this.isSynthetic = opts.is_synthetic === true;
+    this.persistSession = opts.persist_session;
   }
 
   async computeFileHash(filePath: string, noFollow = false): Promise<string> {
@@ -808,8 +951,38 @@ export class Job {
       );
     }
 
+    /* Restore a prior persistent-session workspace before any current-run
+     * files are written, so fresh code/inputs overwrite stale copies from the
+     * snapshot. Pulls its synthetic input file out of `this.files` so the
+     * normal download/dirkeep flow below never sees it. Best-effort: a miss or
+     * failure just means the session starts empty. */
+    if (this.persistSession) {
+      await this.restoreSessionWorkspace();
+    }
+
     if (this.fileEgressBaseUrl() && this.files.some(f => f.id && f.storage_session_id)) {
       await this.autoLoadDirkeep();
+    }
+
+    // Reject a request whose own inputs conflict as file-vs-directory (`data`
+    // alongside `data/a.csv`): a path cannot be both, so staging one would
+    // have to destroy the other, and with parallel fileOps WHICH one survives
+    // would be timing-dependent -- the job would proceed with a requested
+    // input silently missing. Checked after autoLoadDirkeep so synthetic
+    // inherited markers are policed by the same rule. (Content-Disposition
+    // renames can still mint a conflict mid-staging; clearNonDirectoryAncestors
+    // and clearNonRegularCollision reject those instead of silently deleting.)
+    const stagedNames = new Set(
+      this.files.filter(f => f.id || f.content !== undefined).map(f => f.name),
+    );
+    for (const name of stagedNames) {
+      const segments = name.split('/').filter(Boolean);
+      for (let i = 1; i < segments.length; i++) {
+        const ancestor = segments.slice(0, i).join('/');
+        if (stagedNames.has(ancestor)) {
+          throw new ValidationError(`input '${name}' conflicts with input '${ancestor}' (file vs directory at the same path)`);
+        }
+      }
     }
 
     const fileOps: Promise<void>[] = [];
@@ -943,6 +1116,13 @@ export class Job {
     const tempPath = path.join(this.submissionDir, `.tmp-${nanoid()}`);
 
     let lastError: Error | null = null;
+    // The on-disk name can come from Content-Disposition and differ from
+    // `file.name`. Remember the last one a (possibly failed) attempt
+    // resolved, so the stale-restored-file cleanup below can also discard a
+    // carry-over sitting at THAT path -- discarding only `file.name` would
+    // leave a restored file at the resolved name and silently serve stale
+    // bytes when every attempt fails after headers.
+    let lastResolvedName: string | null = null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -951,29 +1131,60 @@ export class Job {
         });
 
         if (response.status === 404 && attempt < maxRetries) {
+          // Cancel unconsumed bodies on every non-streaming exit: an
+          // abandoned body pins its undici connection until GC, and a retry
+          // storm could drain the fetch pool for unrelated transfers.
+          await response.body?.cancel().catch(() => { /* release socket */ });
           const delay = retryDelay * Math.pow(2, attempt - 1);
           this.log.info({ fileId: file.id, attempt, maxRetries, delay }, 'File not found, retrying');
           await sleep(delay);
           continue;
         }
 
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => { /* release socket */ });
+          throw new Error(`HTTP error: ${response.status}`);
+        }
 
-        const originalName = resolveOriginalName(response, file);
-        validateFilePath(originalName, this.submissionDir);
+        let originalName: string;
+        try {
+          originalName = resolveOriginalName(response, file);
+          validateFilePath(originalName, this.submissionDir);
+          // The router reserves these names by RequestFile.name, but the on-disk
+          // name comes from Content-Disposition here -- so a file sent under a
+          // harmless name could still land on a reserved basename and shadow
+          // restored state. Reject it (the injected state file is already spliced
+          // out before this runs, so this only ever sees user inputs).
+          if (this.persistSession && isReservedSessionBasename(originalName)) {
+            throw new ValidationError(`input resolves to reserved session filename '${originalName}'`);
+          }
+        } catch (err) {
+          await response.body?.cancel().catch(() => { /* release socket */ });
+          throw err;
+        }
+        lastResolvedName = originalName;
         const finalPath = path.join(this.submissionDir, originalName);
-        const finalParent = path.dirname(finalPath);
-        await fsp.mkdir(finalParent, { recursive: true });
-        await this.secureAncestors(finalParent);
 
-        const hash = await this.streamToDisk(response, tempPath, finalPath);
+        // Stream to the temp path OUTSIDE the staging lock (tempPath lives
+        // at the workspace root, needing no parent prep), then place +
+        // register atomically under it -- see runStaged.
+        const hash = await this.streamToTemp(response, tempPath);
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
-        this.inputFileHashes.set(originalName, {
-          originalId: file.id,
-          originalSessionId: file.storage_session_id!,
-          hash,
-          path: finalPath,
-          readOnly: readOnly || undefined,
+        await this.runStaged(async () => {
+          await this.prepareParentDirUnderLock(path.dirname(finalPath));
+          // A prior persisted run may have left a directory/other node where
+          // this input must land; rename() over it would fail
+          // (EISDIR/ENOTEMPTY).
+          await this.clearNonRegularCollision(finalPath);
+          await fsp.rename(tempPath, finalPath);
+          await this.applySandboxFilePermissions(finalPath);
+          this.inputFileHashes.set(originalName, {
+            originalId: file.id,
+            originalSessionId: file.storage_session_id!,
+            hash,
+            path: finalPath,
+            readOnly: readOnly || undefined,
+          });
         });
         /* Defense-in-depth: keep read-only inputs root-owned + 0444 so the
          * sandbox UID can read them but cannot chmod them back to writable. */
@@ -1014,7 +1225,110 @@ export class Job {
 
     this.log.error({ fileId: file.id, maxRetries, err: lastError }, 'Failed to download file');
     try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
+    // A persistent-session restore stages carry-over files BEFORE current inputs
+    // download. If this input was meant to replace a restored file at the same
+    // path but the download failed (expired/transient 404), leaving the restored
+    // copy in place would silently run the sandbox against stale bytes. Drop the
+    // stale carry-over + its baseline so user code sees the input as missing --
+    // at the requested name AND at the Content-Disposition-resolved name a
+    // failed attempt got far enough to see.
+    let discardedRestored = await this.discardStaleRestoredInput(file.name);
+    if (lastResolvedName && lastResolvedName !== file.name) {
+      discardedRestored = (await this.discardStaleRestoredInput(lastResolvedName)) || discardedRestored;
+    }
+    if (discardedRestored) {
+      // The last good snapshot still holds the file we just discarded.
+      // Persisting this run would archive the deletion and CAS the pointer
+      // forward, permanently losing that file to a transient fetch failure --
+      // block persistence so the next run restores it and retries the input.
+      this.sessionPersistBlocked = true;
+      this.log.warn({ file: file.name }, 'Discarded restored carry-over after failed download; blocking session persist');
+    }
     return null;
+  }
+
+  /**
+   * On a failed input download, remove a restored persistent-session file (or
+   * directory) left at the same path (and its output-walk baseline) so the run
+   * doesn't observe stale bytes in place of the current, unavailable input.
+   * No-op unless the path was a restored carry-over. Returns whether anything
+   * restored was actually discarded -- the caller must then block persistence
+   * for this run (see sessionPersistBlocked).
+   */
+  private async discardStaleRestoredInput(name: string): Promise<boolean> {
+    const info = this.inputFileHashes.get(name);
+    if (info?.restored && info.path) {
+      try {
+        await fsp.rm(info.path, { force: true });
+      } catch (err) {
+        this.log.warn({ file: name, err }, 'Failed to remove stale restored input after download failure');
+      }
+      this.inputFileHashes.delete(name);
+      return true;
+    }
+    // `name` itself has no restored entry, but a restored FILE at one of its
+    // ancestor path segments would block it just the same (e.g. a prior run
+    // left `data` as a file and this request supplies `data/file.csv`).
+    // registerRestoredBaseline only gives leaf files their own entry -- a
+    // directory never gets one -- so any ancestor segment present in the map
+    // is necessarily a restored non-directory.
+    const segments = name.split('/').filter(Boolean);
+    for (let i = segments.length - 1; i > 0; i--) {
+      const ancestor = segments.slice(0, i).join('/');
+      const ancestorInfo = this.inputFileHashes.get(ancestor);
+      if (ancestorInfo?.restored && ancestorInfo.path) {
+        try {
+          await fsp.rm(ancestorInfo.path, { force: true });
+        } catch (err) {
+          this.log.warn({ file: ancestor, err }, 'Failed to remove stale restored ancestor after download failure');
+        }
+        this.inputFileHashes.delete(ancestor);
+        return true;
+      }
+    }
+    // registerRestoredBaseline recurses into restored directories and keys each
+    // leaf file by its relative path -- the directory itself never gets its own
+    // `inputFileHashes` entry. Detect that case via a RESTORED child under
+    // `name/` (a child alone proves nothing: a Content-Disposition rename can
+    // land a CURRENT-run input below this name, and treating that as "restored
+    // directory" would delete the sibling this request just staged). Remove
+    // only the restored children themselves -- never the whole tree, which may
+    // hold current-run inputs -- then reap the directory only if that left it
+    // empty.
+    const prefix = `${name}/`;
+    const removedKeys: string[] = [];
+    for (const [key, info] of [...this.inputFileHashes.entries()]) {
+      if (!key.startsWith(prefix) || !info.restored || !info.path) continue;
+      try {
+        await fsp.rm(info.path, { force: true });
+      } catch (err) {
+        this.log.warn({ file: key, err }, 'Failed to remove stale restored child after download failure');
+      }
+      this.inputFileHashes.delete(key);
+      removedKeys.push(key);
+    }
+    if (removedKeys.length === 0) return false;
+    // Reap the emptied directory skeleton bottom-up: removing only leaf files
+    // above can leave `data/`, `data/sub/` behind, and the run would still
+    // observe those stale restored paths despite the replacement input being
+    // missing. Every rmdir is non-recursive by design -- it succeeds only for
+    // a directory holding nothing current, so a sibling this request staged
+    // (or anything else still live) stops the reap at that level.
+    const emptiedDirs = new Set<string>([name]);
+    for (const key of removedKeys) {
+      let parent = path.posix.dirname(key);
+      while (parent !== '.' && (parent === name || parent.startsWith(prefix))) {
+        emptiedDirs.add(parent);
+        parent = path.posix.dirname(parent);
+      }
+    }
+    const deepestFirst = [...emptiedDirs].sort(
+      (a, b) => b.split('/').length - a.split('/').length,
+    );
+    for (const dir of deepestFirst) {
+      await fsp.rmdir(path.join(this.submissionDir, dir)).catch(() => { /* still holds current content */ });
+    }
+    return true;
   }
 
   /**
@@ -1027,15 +1341,868 @@ export class Job {
   }
 
   /**
-   * Streams the response body to `tempPath`, computes its SHA-256 inline,
-   * then atomically renames to `finalPath` with sandbox-visible perms.
-   * Returns the hex digest.
+   * Restore a prior persistent-session workspace tar into `submissionDir`.
+   *
+   * The service injects the previous run's snapshot as a synthetic input file
+   * (name === `persist_session.filename`, carrying an id + the previous output
+   * session as `storage_session_id`, so it is authorized by the grant's
+   * `read_sessions`/`input_files`). We fetch it to a scratch tar, size-check it,
+   * extract into `submissionDir`, and chown the tree to the job UID. Every
+   * failure mode is non-fatal — a persistent session that can't restore simply
+   * starts empty, exactly like its first run.
    */
-  private async streamToDisk(
-    response: Response,
-    tempPath: string,
-    finalPath: string,
-  ): Promise<string> {
+  private async restoreSessionWorkspace(): Promise<void> {
+    const ps = this.persistSession;
+    // Only attempt a restore when the service marked one (a prior snapshot
+    // exists). The injected state file is matched by name: the egress layer
+    // masks file id/session into opaque handles before the sandbox sees them,
+    // so name is the only stable field. This is safe because the service
+    // rejects user input files named like the state tar, so the only file with
+    // this name is the one it injected.
+    if (!ps || !ps.restore_session_id) return; // first run: nothing to restore
+    const idx = this.files.findIndex(f => f.id && f.storage_session_id && f.name === ps.filename);
+    if (idx < 0) {
+      // The service marked a restore but no injected state file made it here
+      // -- something upstream dropped it. Same stance as every other restore
+      // failure below: run empty, but don't let this cold run's persist
+      // supersede (and delete) a snapshot that may still be perfectly live.
+      this.sessionRestoreFailed = true;
+      this.log.warn('Restore expected but no injected prior-state file found; skipping persist');
+      return;
+    }
+    const [restoreFile] = this.files.splice(idx, 1);
+
+    const tmpTar = path.join(os.tmpdir(), `sess-restore-${nanoid()}.tar`);
+    try {
+      const fetched = await this.downloadObjectToPath(restoreFile, tmpTar, config.session_state_max_bytes);
+      if (!fetched) {
+        // 404/miss. The run starts empty per contract, but this is still a
+        // FAILED restore: the pointer may well still name a live snapshot (a
+        // transient file-server miss looks identical to true deletion from
+        // here). Persisting this cold run would CAS-advance the pointer over
+        // the last good snapshot and delete it, so gate persistence exactly
+        // like the catch below and let the next run retry.
+        this.sessionRestoreFailed = true;
+        this.log.warn('Prior session snapshot missing (404/miss); starting empty and skipping persist');
+        return;
+      }
+      const { size } = await fsp.stat(tmpTar);
+      // GNU tar strips leading `/` and `..` members by default, so extraction
+      // stays confined to `-C submissionDir`. `--no-same-owner` keeps the
+      // extracted files owned by the runner until we chown them to the job UID.
+      await execFileP('tar', ['--no-same-owner', '--no-same-permissions', '-xf', tmpTar, '-C', this.submissionDir]);
+      // Strip any symlinks the archive recreated BEFORE prime() stages fresh
+      // source/input files. A prior run could leave e.g. `main.py -> /host/path`;
+      // without this the runner's writeFile() would follow it and write
+      // attacker-controlled content outside the workspace. Restored state has no
+      // legitimate need for symlinks, so we drop them unconditionally.
+      await this.stripSymlinks(this.submissionDir);
+      const chownApplied = await this.chownTreeToJobUid(this.submissionDir);
+      // tar --no-same-permissions only umasks archived modes; it never ADDS
+      // access, so a prior run's `chmod 000` on any dir/file survives extraction
+      // and, now owned by the job UID, is still untraversable/unreadable --
+      // bricking restored state. `u+rwX` grants the owner read/write on files
+      // and traverse on dirs (and preserves existing execute bits) across the
+      // whole tree, and the root gets its exact canonical workspace mode.
+      await this.normalizeRestoredModes(this.submissionDir, chownApplied);
+      await applySandboxPathPermissions(this.submissionDir, this.sandboxIdentity(), SANDBOX_WORKSPACE_MODE);
+      // Record restored files as input baselines so handleSessionFiles treats
+      // unchanged carry-overs as inherited, not freshly generated outputs --
+      // otherwise a session with many restored files would exhaust
+      // max_output_files before a new plot/report and drop it from the response.
+      await this.registerRestoredBaseline(this.submissionDir);
+      // Fingerprint the restored namespace pickle (if any) so persist time
+      // can tell whether THIS run's wrapper actually rewrote it -- see the
+      // atexit-bypass gate in persistSessionState. The chown/chmod passes
+      // above touch neither inode nor mtime, so the identity is stable.
+      const pklStat = await fsp
+        .lstat(path.join(this.submissionDir, SESSION_STATE_PKL_BASENAME))
+        .catch(() => null);
+      if (pklStat?.isFile()) {
+        this.restoredPickleStat = { ino: pklStat.ino, mtimeMs: pklStat.mtimeMs };
+      }
+      // A prior snapshot was restored: this run's persist would SUPERSEDE it.
+      // Guards the failed-upload path (excludeFromSessionSnapshot) -- once a
+      // last-good snapshot exists, any output whose upload failed makes a
+      // surgical exclusion unsafe (a renamed/moved restored file's new name
+      // isn't path-detectable), so persistence blocks instead.
+      this.sessionRestoredOk = true;
+      this.log.info({ size }, 'Restored persisted session workspace');
+    } catch (err) {
+      // Documented contract is "start empty on restore failure". A corrupt or
+      // truncated tar can leave a partial tree, so wipe it rather than run
+      // against a mix of stale-and-missing files. Mark the failure too: this
+      // run now executes against a cold workspace, and letting it persist
+      // would CAS the session pointer forward and delete the last good
+      // snapshot -- one transient fetch/extract blip would permanently reset
+      // the session. Skipping persistence leaves the pointer untouched so
+      // the next run retries the restore.
+      this.sessionRestoreFailed = true;
+      this.log.warn({ err }, 'Session restore failed; starting empty');
+      await this.emptyDirContents(this.submissionDir);
+    } finally {
+      await fsp.rm(tmpTar, { force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /** Remove everything inside `dir` (but keep `dir` itself). */
+  private async emptyDirContents(dir: string): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await fsp.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      await fsp.rm(path.join(dir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /**
+   * Hash restored files into `inputFileHashes` so the output walker sees them as
+   * pre-existing inputs. Skips reserved session artifacts (never user outputs)
+   * and `.dirkeep` markers. Best-effort per file.
+   */
+  private async registerRestoredBaseline(dir: string): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      // classifyDirent falls back to lstat on DT_UNKNOWN (some NFS/FUSE/
+      // overlay mounts). Without it, both isDirectory() and isFile() report
+      // false for such an entry, so nothing would be baselined and every
+      // unchanged carry-over (and .dirkeep marker) would later be walked as
+      // a fresh output, exhausting max_output_files ahead of real artifacts.
+      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      if (kind === 'dir') {
+        await this.registerRestoredBaseline(full);
+        continue;
+      }
+      if (kind !== 'file') continue;
+      // Only the internal pickle artifacts are skipped here -- they never
+      // legitimately exist as restored user content. `.dirkeep` markers ARE
+      // baselined (unlike other skips): a restored empty dir is represented
+      // only by its marker, so without a baseline the output walk would
+      // regenerate it as a fresh file and let carried-over empty dirs crowd
+      // out real artifacts. A restored file that happens to be named like the
+      // internal tar (SESSION_STATE_TAR_BASENAME) is baselined too, for the
+      // same reason -- that name can only reach here via the user's own code
+      // (see the constant's comment), so treating it as reserved would starve
+      // it of a baseline and make the output walk re-flag it as "new" (and
+      // consume a max_output_files slot) on every subsequent run forever.
+      if (isSessionStateInternalBasename(entry.name)) continue;
+      const rel = path.relative(this.submissionDir, full);
+      try {
+        const hash = await this.computeFileHash(full);
+        this.inputFileHashes.set(rel, { hash, path: full, restored: true });
+      } catch { /* unreadable mid-walk; skip */ }
+    }
+  }
+
+  /**
+   * Snapshot `submissionDir` (files + the dill namespace pickle the Python
+   * wrapper wrote) to a tar and upload it to `output_session_id/<file_id>`,
+   * which is the single session the egress grant authorizes for writes. The
+   * service later promotes this into the `sessionstate:<sessionKey>` Redis
+   * pointer. Returns whether a fresh snapshot was actually written; a skip
+   * (failed restore / oversize / no storage / error) is non-fatal and leaves
+   * the prior snapshot as the session's last good state.
+   */
+  /**
+   * Remove workspace content the output walker can never scan -- directories
+   * nested beyond config.max_nesting_depth (walkDir returns 'skipped' at the
+   * cap) and entries whose relative path fails isValidPathShape (overlong or
+   * malformed paths that walkDir also skips) -- so a snapshot never carries
+   * files no response can reference. Restored, they'd be baselined by
+   * registerRestoredBaseline (which applies neither cap) yet stay invisible
+   * to every later walk: artifacts without a downloadable ref forever.
+   * Consistent with the response: what the walker can't reach doesn't exist.
+   * Hidden directories are left alone -- the walker skips them at ANY depth,
+   * and persisting their contents (dot-dir user state under HOME=/mnt/data)
+   * is deliberate.
+   */
+  private async pruneBeyondDepth(dir: string, depth: number): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(this.submissionDir, full);
+      const kind = await this.classifyDirent(entry, full, rel);
+      if (kind === 'skip') continue;
+      if (!isValidPathShape(rel)) {
+        // walkDir skips this entry outright (overlong/malformed path), so
+        // nothing under it can ever be surfaced -- don't persist it.
+        await fsp.rm(full, { recursive: true, force: true }).catch(() => { /* best effort */ });
+        continue;
+      }
+      if (kind !== 'dir' || isHiddenDirectory(entry.name)) continue;
+      // A directory at nesting level L is walked with depth=L and skipped
+      // once L >= max_nesting_depth; this child sits at level depth+1.
+      if (depth + 1 >= config.max_nesting_depth) {
+        await fsp.rm(full, { recursive: true, force: true }).catch(() => { /* best effort */ });
+      } else {
+        await this.pruneBeyondDepth(full, depth + 1);
+      }
+    }
+  }
+
+  /**
+   * Names that are runtime plumbing, never user outputs.
+   *
+   * `_ptc_history.json`: the PTC replay preamble injects this tool-history
+   * fixture at the workspace root for deterministic cached results. (Earlier
+   * prefix-form `_ptc_*` matching ate any user file starting with `_ptc_`; the
+   * exact basename avoids that regression. Tempfiles like `_ptc_pending.*`
+   * live in `/tmp`, never the submission dir.) MUST stay in sync with
+   * `PTC_HISTORY_FILENAME` in `service/src/ptc-constants.ts` (separate npm
+   * package -- asserted equal in `service/scripts/test-ptc-sentinel.ts`).
+   *
+   * `.session_state.pkl`(+`.tmp`): the dill namespace snapshot and its
+   * atomic-write tempfile. Gated on persistSession: with persistence off the
+   * wrapper never writes these, so a user file using the name is an ordinary
+   * artifact and must not vanish from the response. MUST stay in sync with
+   * SESSION_STATE_FILENAME in `service/src/session-persist.ts`.
+   */
+  private isReservedOutputName(name: string): boolean {
+    if (name === '_ptc_history.json') return true;
+    return this.persistSession !== undefined &&
+      (name === SESSION_STATE_PKL_BASENAME || name === `${SESSION_STATE_PKL_BASENAME}.tmp`);
+  }
+
+  /**
+   * True when any entry from `startIdx` onward would become a genuine new
+   * OUTPUT (so a cap-full break really hid something and persistence must
+   * block). Skips entries that never surface as outputs regardless of the
+   * cap: reserved plumbing, the echoed entry source, invalid-shape paths,
+   * and hidden dirs with no primed inputs. A regular file or a walkable
+   * directory counts -- an unchanged restored carry-over trailing here would
+   * over-count, but it round-trips via the snapshot tar (never a permanently
+   * invisible artifact), so a spurious block there is at worst lost variable
+   * continuity for one max-output run, not data loss.
+   */
+  private async remainingHasOutputCandidate(
+    entries: fs.Dirent[],
+    startIdx: number,
+    dir: string,
+    inputByName: Map<string, TFile>,
+  ): Promise<boolean> {
+    for (let i = startIdx; i < entries.length; i++) {
+      const entry = entries[i];
+      if (this.isReservedOutputName(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(this.submissionDir, full);
+      if (!isValidPathShape(rel)) continue;
+      if (rel === this.entryPointName) continue; // echoed source, never an output
+      const kind = await this.classifyDirent(entry, full, rel);
+      if (kind === 'skip') continue;
+      if (kind === 'dir' && isHiddenDirectory(entry.name) && !inputsLiveUnder(inputByName, rel)) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /** True when a prior snapshot was expected but could not be restored this
+   *  run. Reported to the service so it does not refresh the (possibly dead)
+   *  pointer's TTL -- see the router's refresh branch. */
+  sessionRestoreDidFail(): boolean {
+    return this.sessionRestoreFailed;
+  }
+
+  /** Exclude generated files (by workspace-relative name) from this run's
+   *  session snapshot -- used for files pruned from the response because
+   *  their upload never reached the file server. */
+  excludeFromSessionSnapshot(names: string[]): void {
+    // On a CONTINUATION (a prior snapshot was restored), any failed upload
+    // blocks persistence outright. Surgical exclusion is only sound when the
+    // excluded path can be proven not to drop restored content, but a
+    // restored file the run RENAMED (a.txt -> generated b.txt) surfaces the
+    // failure at b.txt, whose name touches no restored baseline by path --
+    // so excluding b.txt and advancing would delete a.txt from the lineage
+    // and lose the last good copy to a transient blip. Blocking keeps the
+    // pointer on the last good snapshot; the next run retries. Path-based
+    // detection can't see renames, so we can't do better cheaply.
+    if (this.sessionRestoredOk && names.length > 0) {
+      this.sessionPersistBlocked = true;
+      this.log.warn({ files: names }, 'Failed upload on a restored session; blocking session persist');
+      return;
+    }
+    // First run (no prior snapshot to protect): the failed file simply
+    // doesn't enter this session's first snapshot, consistent with the
+    // response. Exclude it and let the rest persist.
+    for (const name of names) this.snapshotExcludedNames.add(name);
+  }
+
+  /**
+   * Records that the output walk hid at least one would-be artifact behind
+   * `max_output_files`. Persistent sessions MUST block the snapshot then:
+   * the hidden files were never returned or uploaded, and riding the tar
+   * would let the next restore baseline them as unchanged carry-overs,
+   * suppressing them from every later response -- the caller could never
+   * obtain refs for them. The walk stops at the cap, so the hidden set can't
+   * even be enumerated for a surgical exclusion; keeping the pointer on the
+   * last good snapshot is the only consistent choice.
+   */
+  private noteOutputTruncation(at: string): void {
+    if (!this.persistSession || this.sessionPersistBlocked) return;
+    this.sessionPersistBlocked = true;
+    this.log.warn({ at }, 'Output walk truncated by max_output_files; blocking session persist');
+  }
+
+  async persistSessionState(): Promise<boolean> {
+    const ps = this.persistSession;
+    if (!ps || !this.submissionDir || !this.fileEgressBaseUrl()) return false;
+    // See restoreSessionWorkspace's catch: a failed restore means this run
+    // saw a cold workspace, and snapshotting it would supersede -- and via
+    // the service's CAS-advance, delete -- the last good snapshot. Likewise
+    // when infrastructure failure degraded the restored tree mid-staging
+    // (sessionPersistBlocked) -- the snapshot must keep the last good copy.
+    if (this.sessionRestoreFailed || this.sessionPersistBlocked) return false;
+    // Python's persistence wrapper rewrites the namespace pickle from atexit
+    // (os.replace -> new inode + mtime) or, on a failed dump, deletes it. If
+    // a restored pickle is still the IDENTICAL file at persist time, this
+    // run's atexit never fired despite a signal-free exit -- os._exit(0) or
+    // os.exec* bypass atexit without setting run.signal (signal deaths are
+    // already gated in v2.ts). Persisting would tar THIS run's files with
+    // the PRIOR run's variables -- the same torn state the signal gate
+    // avoids -- so skip and leave the pointer on the last good snapshot.
+    // Python-only: other languages never rewrite the pickle by design
+    // (file-only persistence), so an untouched pickle is expected there and
+    // must keep persisting -- it is how Python variables survive an
+    // intervening run of another language in the same session.
+    if (this.restoredPickleStat && this.runtime.language === 'python') {
+      const st = await fsp
+        .lstat(path.join(this.submissionDir, SESSION_STATE_PKL_BASENAME))
+        .catch(() => null);
+      if (st?.isFile() && st.ino === this.restoredPickleStat.ino && st.mtimeMs === this.restoredPickleStat.mtimeMs) {
+        this.log.warn('Restored namespace pickle untouched; atexit snapshot never ran (os._exit/exec*) -- skipping persist');
+        return false;
+      }
+    }
+
+    const tmpTar = path.join(os.tmpdir(), `sess-save-${nanoid()}.tar`);
+    try {
+      // Drop symlinks and special files (FIFOs, sockets, device nodes) FIRST,
+      // before any other pruning touches paths by name. Sandbox code (already
+      // finished running, but its on-disk output is untrusted) could have
+      // swapped a read-only input's directory -- e.g. `skill/` -- for a
+      // symlink pointing outside the workspace; if the read-only/prune-dir
+      // removal below ran first, resolving a path like `skill/foo.py` would
+      // follow that symlink through its intermediate `skill` component and
+      // delete/traverse outside `submissionDir`. Stripping all symlinks first
+      // (nothing else runs concurrently at this point -- the job has already
+      // finished) neutralizes that regardless of what removeReadOnlyInputs or
+      // SNAPSHOT_PRUNE_DIRS touches next. This also keeps the size estimate
+      // below exact: a symlink with a long target or long path makes GNU tar
+      // emit extra longlink/PAX blocks the estimator can't account for, and
+      // FIFOs/sockets/devices aren't counted by it at all despite each still
+      // costing tar a full 512-byte header -- either way a user could pass the
+      // pre-archive cap yet force a larger tarball onto runner disk. All of
+      // these are also stripped on restore, so they never carry forward
+      // regardless -- excluding them here loses nothing.
+      await this.stripSymlinks(this.submissionDir);
+      // Physically prune everything else the snapshot must not carry BEFORE
+      // measuring and archiving, so the pre-archive size check reflects
+      // exactly what the tar will contain (no --exclude divergence):
+      //  - read-only inputs (skill/infra): persisting them would re-materialize
+      //    an authorized-once resource on later runs, and restore chowns the
+      //    tree to the job UID, stripping their read-only protection;
+      //  - runtime cache dirs (pip/matplotlib scatter these under
+      //    HOME=/mnt/data) and the atomic-write tempfile -- not useful state.
+      // The `.session_state.pkl` snapshot is kept so variables carry forward.
+      await this.removeReadOnlyInputs();
+      // The staged ENTRYPOINT (main.py / main.ts / script.sh) is likewise run
+      // infrastructure. Persisting it would carry this run's wrapper source
+      // forward as if it were user data; and since restore runs BEFORE source
+      // staging, a user file sharing the entry name is overwritten by the
+      // next run's source anyway -- it can never round-trip. Pruning makes
+      // that reservation explicit and consistent: the entry filename simply
+      // never persists. ONLY the entry: other inline content files (a helper
+      // notes.txt sent by value) are ordinary user inputs whose carry-forward
+      // the persistence contract promises. Recursive: the run could have
+      // replaced the path with a directory.
+      for (const [rel, info] of this.inputFileHashes.entries()) {
+        if (info.staged && info.path && rel === this.entryPointName) {
+          await fsp.rm(info.path, { recursive: true, force: true }).catch(() => { /* best effort */ });
+        }
+      }
+      // Generated files whose upload never reached the file server were
+      // pruned from the response; prune them from the snapshot too, so they
+      // can't ride into the next restore and be suppressed there as
+      // unchanged carry-overs the caller can never obtain a ref for (see
+      // excludeFromSessionSnapshot).
+      for (const name of this.snapshotExcludedNames) {
+        await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
+      }
+      // Directories nested too deep for the output walker never persist
+      // either -- see pruneBeyondDepth.
+      await this.pruneBeyondDepth(this.submissionDir, 0);
+      for (const name of SNAPSHOT_PRUNE_DIRS) {
+        await fsp.rm(path.join(this.submissionDir, name), { recursive: true, force: true }).catch(() => { /* best effort */ });
+      }
+      // Pruning subtrees can leave their parents (.cache, .npm) empty; reap
+      // those best-effort with a non-recursive rmdir so a bare cache shell
+      // doesn't ride every snapshot -- a parent holding real user files
+      // simply stays.
+      const pruneParents = new Set(
+        SNAPSHOT_PRUNE_DIRS.filter(p => p.includes('/')).map(p => p.split('/')[0]),
+      );
+      for (const parent of pruneParents) {
+        await fsp.rmdir(path.join(this.submissionDir, parent)).catch(() => { /* not empty: user state stays */ });
+      }
+      // Bound the aggregate size so a huge workspace can't make the runner
+      // materialize a multi-GB tar in /tmp and fill host disk.
+      const approxBytes = await this.dirSizeBytes(this.submissionDir);
+      if (approxBytes > config.session_state_max_bytes) {
+        this.log.warn({ approxBytes, cap: config.session_state_max_bytes }, 'Session workspace exceeds cap; skipping persist before archiving');
+        return false;
+      }
+      await execFileP('tar', ['-cf', tmpTar, '-C', this.submissionDir, '.']);
+      const { size } = await fsp.stat(tmpTar);
+      if (size > config.session_state_max_bytes) {
+        this.log.warn({ size, cap: config.session_state_max_bytes }, 'Session snapshot exceeds cap; skipping persist');
+        return false;
+      }
+      const ok = await this.uploadObjectFromPath(tmpTar, ps.file_id, ps.filename, 'application/x-tar');
+      if (ok) this.log.info({ size }, 'Persisted session workspace');
+      return ok;
+    } catch (err) {
+      this.log.warn({ err }, 'Session persist failed; continuing');
+      return false;
+    } finally {
+      await fsp.rm(tmpTar, { force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /**
+   * Stream a file-server object to a local path, capped at `maxBytes`. Returns
+   * false on 404. A snapshot larger than the cap (e.g. after lowering the cap,
+   * or an older oversized snapshot) is rejected up front via Content-Length and,
+   * as a fallback when that header is absent/wrong, aborted mid-stream once the
+   * limit is crossed -- so a giant object can't fill runner disk before the
+   * post-download size check would have skipped it.
+   */
+  private async downloadObjectToPath(file: TFile, destPath: string, maxBytes: number): Promise<boolean> {
+    const res = await fetch(this.buildDownloadUrl(file), { headers: this.fileEgressHeaders() });
+    // Cancel unconsumed bodies on every non-streaming exit: an abandoned body
+    // pins its undici connection until GC, and repeated failed restores
+    // (lifecycle-deleted snapshots, transient misses) could drain the fetch
+    // pool and stall unrelated downloads/uploads.
+    if (res.status === 404) {
+      await res.body?.cancel().catch(() => { /* release socket */ });
+      return false;
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => { /* release socket */ });
+      throw new Error(`Session object download HTTP ${res.status}`);
+    }
+    if (!res.body) throw new Error('Session object download returned empty body');
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await res.body.cancel().catch(() => { /* release socket */ });
+      throw new Error(`Session object exceeds cap (${declared} > ${maxBytes})`);
+    }
+    let received = 0;
+    const limiter = new Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length;
+        if (received > maxBytes) {
+          cb(new Error(`Session object exceeds cap (> ${maxBytes})`));
+          return;
+        }
+        cb(null, chunk);
+      },
+    });
+    try {
+      await pipeline(toNodeReadable(res.body), limiter, fs.createWriteStream(destPath, { mode: SANDBOX_FILE_MODE }));
+    } catch (err) {
+      await fsp.rm(destPath, { force: true }).catch(() => { /* best effort */ });
+      throw err;
+    }
+    return true;
+  }
+
+  /** PUT a local file to `output_session_id/<fileId>` via the egress path. */
+  private async uploadObjectFromPath(
+    srcPath: string,
+    fileId: string,
+    filename: string,
+    contentType: string,
+  ): Promise<boolean> {
+    const { size } = await fsp.stat(srcPath);
+    const url = `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(this.outputSessionId)}/objects/${encodeURIComponent(fileId)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    let response: Response | undefined;
+    const stream = fs.createReadStream(srcPath);
+    stream.on('error', (err) => this.log.warn({ err }, 'Session upload stream error'));
+    try {
+      const headers = this.fileEgressHeaders({
+        'X-Original-Filename': encodeURIComponent(filename),
+        'Content-Type': contentType,
+        'Content-Length': String(size),
+      });
+      response = await fetch(url, {
+        method: 'PUT',
+        headers,
+        body: Readable.toWeb(stream) as unknown as BodyInit,
+        // @ts-expect-error — duplex is spec but missing from bundled lib.dom types.
+        duplex: 'half',
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`Session upload HTTP ${response.status}`);
+      return true;
+    } catch (err) {
+      this.log.warn({ err }, 'Session upload failed');
+      return false;
+    } finally {
+      clearTimeout(timeout);
+      stream.destroy();
+      if (response?.body && !response.bodyUsed) {
+        await response.body.cancel().catch(() => { /* socket released either way */ });
+      }
+    }
+  }
+
+  /**
+   * Recursively chown an extracted tree to the per-job UID so the sandboxed
+   * process (running as that UID) can read and modify restored files. Uses
+   * `-h` so symlink ownership, not the target's, is changed. Mirrors
+   * chownOrThrow's tolerance: a failure is swallowed (returns false so the
+   * caller can widen modes instead) only when per-job UIDs aren't required
+   * and the runner isn't expected to have the capability (root + hardened
+   * mode); otherwise it's rethrown, matching applySandboxPathPermissions.
+   */
+  private async chownTreeToJobUid(dir: string): Promise<boolean> {
+    const id = this.sandboxIdentity();
+    try {
+      await execFileP('chown', ['-Rh', `${id.uid}:${id.gid}`, dir]);
+      return true;
+    } catch (err) {
+      if (!id.perJobUid && currentUid() !== 0 && !config.hardened_sandbox_mode) {
+        this.log.warn({ err }, 'Failed to chown restored session tree to job UID');
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Grant the owner (job UID) read/write on files and traverse on directories
+   * across a restored tree, preserving existing execute bits. Repairs hostile
+   * modes (e.g. a prior run's `chmod 000`) that extraction preserves and would
+   * otherwise leave restored files unreadable/untraversable. Best-effort.
+   *
+   * When `chownApplied` is false (chownTreeToJobUid's ownership transfer was
+   * tolerated, not actually applied -- non-root/local dev mode), the tree is
+   * still owned by the runner, not the job UID the sandboxed process runs as.
+   * Snapshot members are commonly archived at 0600/0700 (owner-only), so
+   * `u+rwX` alone would grant access to the runner's UID and leave the
+   * sandboxed process locked out. Also widen group/other in that case,
+   * mirroring compatibilityModeForSkippedChown's same owner-bits-copied-down
+   * strategy used elsewhere for the identical no-chown compatibility path.
+   */
+  private async normalizeRestoredModes(dir: string, chownApplied: boolean): Promise<void> {
+    const spec = chownApplied ? 'u+rwX' : 'u+rwX,go+rwX';
+    try {
+      await execFileP('chmod', ['-R', spec, dir]);
+    } catch (err) {
+      this.log.warn({ err }, 'Failed to normalize restored session tree modes');
+    }
+  }
+
+  /**
+   * Recursively remove symlinks and special files (FIFOs, sockets, device
+   * nodes) from a tree. `readdir(withFileTypes)` reports the entry's own type
+   * (lstat semantics), so these are detected without following symlinks, and
+   * directories are recursed into. Used both when restoring (a prior run must
+   * not reintroduce a symlink that writeFile would follow outside the
+   * workspace, or a FIFO/device that a later run could hang opening) and when
+   * persisting (any of these makes tar emit header/longlink content the size
+   * estimator below doesn't model -- a symlink with a long target adds extra
+   * longlink/PAX blocks, and a FIFO/socket/device still costs a full 512-byte
+   * header despite carrying no file content -- so they must not survive into
+   * the archive; none of them round-trip through a restore anyway).
+   */
+  private async stripSymlinks(dir: string): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      // classifyDirent falls back to lstat on DT_UNKNOWN (some NFS/FUSE/
+      // overlay mounts). Without it, both isDirectory() and isFile() report
+      // false for such an entry, and treating that as "neither" would delete
+      // an ordinary file or skip recursing into an ordinary directory here.
+      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      if (kind === 'dir') {
+        await this.stripSymlinks(full);
+      } else if (kind !== 'file') {
+        // Symlink, FIFO, socket, block/char device, or unclassifiable even
+        // after lstat -- none are safe or sized by the estimator; drop them.
+        await fsp.rm(full, { force: true }).catch(() => { /* best effort */ });
+      }
+    }
+  }
+
+  /**
+   * Estimate the on-disk tar size of `dir`, not following symlinks. Counts tar
+   * block overhead -- a 512-byte header per entry plus file content padded to
+   * 512-byte blocks -- so a swarm of empty files/directories (near-zero content
+   * but hundreds of MB of headers) can't slip past the pre-archive size cap.
+   * Also charges each member the long-name record GNU tar prepends when its
+   * stored path (`./<rel>`) overflows the ustar name/prefix fields, so long-
+   * named or deeply nested files can't undercount the estimate either.
+   *
+   * `seenInodes` maps `dev:ino` to the first archived path for that inode
+   * across the whole recursive walk: GNU tar (without `--hard-dereference`,
+   * not passed here) archives only the first path to a given inode with its
+   * content, and every subsequent hard link to that inode as a header-only
+   * link record (size 0) whose `linkname` is that first path. Without
+   * tracking it, a workspace with multiple hard links to the same large file
+   * would be charged that file's content once per link and could be rejected
+   * as oversize even though the real tar comfortably fits under the cap.
+   * The first path is also charged again on every repeat link: when it's
+   * over 100 bytes, GNU tar must emit a second long-name record for the
+   * `linkname` field (distinct from -- and in addition to -- any long-name
+   * record the repeat entry's own, possibly short, stored name needs).
+   * Verified against a real GNU tar 1.34 archive: a repeat hard link to a
+   * long first-archived path emits a GNUTYPE_LONGLINK ('K') record for the
+   * linkname on top of its own header, on top of an 'L' record if its own
+   * name is also long.
+   */
+  private async dirSizeBytes(dir: string, seenInodes: Map<string, string> = new Map()): Promise<number> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return 0;
+    }
+    let total = 0;
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      // Stored member name matches `tar -cf ... -C submissionDir .` output:
+      // './' + the POSIX-separated path relative to the workspace root, with a
+      // trailing '/' on directory members (GNU tar counts it toward the name).
+      const rel = './' + path.relative(this.submissionDir, full).split(path.sep).join('/');
+      if (entry.isSymbolicLink()) {
+        total += 512 + tarLongNameOverheadBytes(rel); // header only
+        continue;
+      }
+      // classifyDirent falls back to lstat on DT_UNKNOWN (some NFS/FUSE/
+      // overlay mounts), same as stripSymlinks above -- without it, both
+      // isDirectory() and isFile() report false for such an entry, and an
+      // ordinary file/directory would silently contribute 0 to the estimate,
+      // letting an oversized workspace reach the real `tar -cf` invocation
+      // before the post-archive size check catches it.
+      const kind = await this.classifyDirent(entry, full, path.relative(this.submissionDir, full));
+      if (kind === 'dir') {
+        total += 512 + tarLongNameOverheadBytes(rel + '/'); // directory header
+        total += await this.dirSizeBytes(full, seenInodes);
+      } else if (kind === 'file') {
+        let size = 0;
+        try {
+          const st = await fsp.stat(full);
+          size = st.size;
+          const inodeKey = `${st.dev}:${st.ino}`;
+          const firstRel = seenInodes.get(inodeKey);
+          if (firstRel !== undefined) {
+            // Header + long-name record for this entry's own stored name (if
+            // long) + long-link record for the linkname, which GNU tar sets
+            // to the first-archived path (if THAT is long).
+            total += 512 + tarLongNameOverheadBytes(rel) + tarLongNameOverheadBytes(firstRel);
+            continue;
+          }
+          seenInodes.set(inodeKey, rel);
+        } catch { /* vanished mid-walk; ignore */ }
+        total += 512 + Math.ceil(size / 512) * 512 + tarLongNameOverheadBytes(rel);
+      }
+    }
+    return total;
+  }
+
+  /**
+   * Remove the current run's read-only input files (tracked in
+   * `inputFileHashes`) so they are never captured in a session snapshot, then
+   * remove each directory tree that hosted one (e.g. `skill/`) OUTRIGHT --
+   * not merely when the removal left it empty. Read-only inputs are
+   * non-persistent infrastructure and their directories belong to that
+   * infrastructure: anything else found inside is something sandbox code
+   * planted next to them (e.g. `skill/evil.py`), and letting it ride the
+   * snapshot would restore it alongside the NEXT run's freshly staged
+   * read-only files, poisoning that run's skill/import resolution. Sweeping
+   * the whole tree also means no empty dir survives into the tar to come
+   * back as an unbaselined directory and burn a `.dirkeep` output slot every
+   * run. Trade-off, by design: nothing under a read-only input's directory
+   * persists, not even user-written files. Read-only inputs sitting directly
+   * in the workspace root get only the per-file removal -- the root is the
+   * user's own persistent workspace and is never swept.
+   */
+  private async removeReadOnlyInputs(): Promise<void> {
+    const infraDirs = new Set<string>();
+    for (const info of this.inputFileHashes.values()) {
+      if (info.readOnly && info.path) {
+        // Recursive: sandbox code could have replaced the read-only path with
+        // a directory (e.g. `rm foo.py; mkdir foo.py`). A non-recursive rm
+        // throws EISDIR on that -- `force` only swallows ENOENT, so it would
+        // otherwise leave that (now user-controlled) directory to persist into
+        // the snapshot under a path meant to be stripped as read-only
+        // infrastructure. stripSymlinks already ran before this, so there's no
+        // symlink left in `info.path` for a recursive removal to follow.
+        await fsp.rm(info.path, { recursive: true, force: true }).catch(() => { /* best effort */ });
+        // Topmost path component under the workspace root (`skill/a/b.py`
+        // -> `skill/`): the whole staged tree is infrastructure, so sweep
+        // from its top, catching siblings at every level.
+        const rel = path.relative(this.submissionDir, info.path);
+        const topSegment = rel.split(path.sep)[0];
+        if (topSegment && rel.includes(path.sep)) {
+          infraDirs.add(path.join(this.submissionDir, topSegment));
+        }
+      }
+    }
+    for (const dir of infraDirs) {
+      await fsp.rm(dir, { recursive: true, force: true }).catch(() => { /* best effort */ });
+    }
+  }
+
+  /**
+   * If `p` exists but is not a regular file (e.g. a directory a prior persisted
+   * run left where the current source/input must go), remove it so the fresh
+   * write can't fail with EISDIR or clobber through it. No-op when `p` is a
+   * regular file or absent -- so this is safe to call before every input write.
+   */
+  private async clearNonRegularCollision(p: string): Promise<void> {
+    let st: fs.Stats;
+    try {
+      st = await fsp.lstat(p);
+    } catch { return; /* nothing there; the write will create it */ }
+    if (st.isFile()) return;
+    // Never delete a directory that holds CURRENT-run inputs to make room
+    // for this file (a Content-Disposition rename can mint a file-vs-dir
+    // conflict the up-front prime() check couldn't see). Restored carry-over
+    // content is fair game -- replacing stale session state is this method's
+    // purpose -- but destroying a sibling input this request also staged
+    // would make the job silently run without it; reject instead.
+    const rel = path.relative(this.submissionDir, p);
+    const prefix = `${rel}/`;
+    for (const [key, info] of this.inputFileHashes) {
+      if (key.startsWith(prefix) && !info.restored) {
+        throw new ValidationError(`input '${rel}' conflicts with already-staged input '${key}' (file vs directory at the same path)`);
+      }
+    }
+    await fsp.rm(p, { recursive: true, force: true });
+    this.dropRestoredBaselines(rel);
+  }
+
+  /**
+   * Drop restored-baseline entries at `rel` and under `rel/` after their
+   * on-disk tree was removed by a collision cleanup. A leftover entry would
+   * make a file the run RECREATES at that path -- even with identical bytes
+   * -- look like an unchanged carry-over and be suppressed from the response,
+   * despite being generated by this run.
+   */
+  private dropRestoredBaselines(rel: string): void {
+    const prefix = `${rel}/`;
+    for (const [key, info] of [...this.inputFileHashes.entries()]) {
+      if (info.restored && (key === rel || key.startsWith(prefix))) {
+        this.inputFileHashes.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Serializes each input's FINAL PLACEMENT (ancestor-collision cleanup,
+   * parent mkdir/chmod, collision clear, write/rename, and inputFileHashes
+   * registration) across the parallel fileOps in prime(). Without the lock,
+   * two inputs nested under the same restored regular file (say a prior run
+   * left `data` as a file and this request stages `data/a.csv` and
+   * `data/b.csv`) can interleave: both lstat the stale `data` file, one
+   * replaces it with a directory and writes its input, and the other's stale
+   * "non-directory" verdict then recursively removes that fresh directory --
+   * erasing the sibling's already-written file. Registration lives INSIDE
+   * the section for the same reason: a sibling's file on disk but not yet in
+   * `inputFileHashes` would read as removable restored debris to another
+   * input's collision cleanup. Only fast metadata work and the final
+   * rename/small write run under the lock; download STREAMING (to the temp
+   * path) stays fully parallel.
+   */
+  private runStaged<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.dirPrepChain.then(fn, fn);
+    // Keep the chain alive whether or not this link rejects; the caller
+    // still observes the rejection through `run`.
+    this.dirPrepChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * Collision-clear + create + secure the parent chain for one input's final
+   * path. MUST run inside runStaged(): the check-then-remove decisions here
+   * are only sound while no sibling is concurrently placing files, and the
+   * final placement itself (write/rename + inputFileHashes registration)
+   * must be in the SAME critical section -- a sibling whose file is on disk
+   * but not yet registered would otherwise look like removable restored
+   * debris to this cleanup (see downloadAndWriteFile / writeFile).
+   */
+  private async prepareParentDirUnderLock(parent: string): Promise<void> {
+    await this.clearNonDirectoryAncestors(parent);
+    await fsp.mkdir(parent, { recursive: true });
+    await this.secureAncestors(parent);
+  }
+
+  /**
+   * Walk submissionDir -> `dir` and remove any ancestor that a restored session
+   * left as a non-directory (e.g. a regular file where an input now needs a
+   * parent dir), so the subsequent `mkdir(..., { recursive: true })` can't fail
+   * with ENOTDIR. No-op on a fresh workspace. Callers on the parallel input
+   * path must go through prepareParentDir, which serializes this check-then-
+   * remove against concurrent mkdir of the same ancestors.
+   */
+  private async clearNonDirectoryAncestors(dir: string): Promise<void> {
+    const rel = path.relative(this.submissionDir, dir);
+    if (!rel || rel === '..' || rel.startsWith('..' + path.sep)) return;
+    const parts = rel.split(path.sep).filter(Boolean);
+    let cursor = this.submissionDir;
+    for (const part of parts) {
+      cursor = path.join(cursor, part);
+      try {
+        const st = await fsp.lstat(cursor);
+        if (!st.isDirectory()) {
+          // Only restored carry-overs (or untracked debris) may be cleared to
+          // make room for a nested path. A CURRENT-run input file here means
+          // this request staged conflicting paths that slipped past the
+          // up-front check (Content-Disposition rename); deleting it would
+          // silently drop a requested input, so reject this file instead.
+          const rel = path.relative(this.submissionDir, cursor);
+          const tracked = this.inputFileHashes.get(rel);
+          if (tracked && !tracked.restored) {
+            throw new ValidationError(`input path under '${rel}' conflicts with already-staged input '${rel}' (file vs directory at the same path)`);
+          }
+          await fsp.rm(cursor, { recursive: true, force: true });
+          this.dropRestoredBaselines(rel);
+        }
+      } catch (err) {
+        if (err instanceof ValidationError) throw err;
+        /* doesn't exist yet; mkdir will create it */
+      }
+    }
+  }
+
+  /**
+   * Streams the response body to `tempPath`, computing its SHA-256 inline.
+   * Returns the hex digest. Final placement (collision clear + rename +
+   * perms + registration) happens in the caller, under the staging lock.
+   */
+  private async streamToTemp(response: Response, tempPath: string): Promise<string> {
     const body = response.body;
     if (!body) throw new Error('Response body is null');
 
@@ -1046,24 +2213,25 @@ export class Job {
     const fileStream = fs.createWriteStream(tempPath, { mode: SANDBOX_FILE_MODE });
     const reader = toNodeReadable(body);
     await pipeline(reader, hashTransform, fileStream);
-    await fsp.rename(tempPath, finalPath);
-    await this.applySandboxFilePermissions(finalPath);
     return hashStream.digest('hex');
   }
 
   async writeFile(file: TFile): Promise<void> {
     validateFilePath(file.name, this.submissionDir);
+    if (this.persistSession && isReservedSessionBasename(file.name)) {
+      throw new ValidationError(`input uses reserved session filename '${file.name}'`);
+    }
     const filePath = path.join(this.submissionDir, file.name);
 
     const content = Buffer.from(file.content ?? '', (file.encoding as BufferEncoding) ?? 'utf8');
-    const parentDir = path.dirname(filePath);
-    await fsp.mkdir(parentDir, { recursive: true });
-    await this.secureAncestors(parentDir);
-    await fsp.writeFile(filePath, content);
-    await this.applySandboxFilePermissions(filePath);
-
     const hash = crypto.createHash('sha256').update(content).digest('hex');
-    this.inputFileHashes.set(file.name, { hash, path: filePath });
+    await this.runStaged(async () => {
+      await this.prepareParentDirUnderLock(path.dirname(filePath));
+      await this.clearNonRegularCollision(filePath);
+      await fsp.writeFile(filePath, content);
+      await this.applySandboxFilePermissions(filePath);
+      this.inputFileHashes.set(file.name, { hash, path: filePath, staged: true });
+    });
   }
 
   async safeCall(
@@ -1243,6 +2411,12 @@ export class Job {
     if (inheritedKeep?.id && inheritedKeep.storage_session_id) {
       return this.handleInheritedDirkeep(keepPath, keepFullPath, inheritedKeep);
     }
+    // Restored empty-dir marker from a persistent session: it persists in the
+    // snapshot tar, so don't regenerate it as a fresh output (which would
+    // consume a max_output_files slot and crowd out genuinely new artifacts).
+    if (this.inputFileHashes.get(keepPath)?.restored) {
+      return { collected: false, truncated: false };
+    }
     return this.createDirkeepMarker(keepPath, keepFullPath);
   }
 
@@ -1421,6 +2595,17 @@ export class Job {
   }): { collected: boolean; truncated: boolean } | null {
     const { wasModified, inputFileInfo, existingFile, relativePath } = ctx;
     const isReadOnly = inputFileInfo?.readOnly === true;
+    // Persistent runs: the wrapper materializes the user source over the
+    // staged entry file for the run's duration and restores the wrapper
+    // bytes from atexit -- any exit that bypasses atexit (SIGKILL/timeout,
+    // os._exit, os.exec*) leaves the entry "modified" here. The entry is run
+    // infrastructure either way (it never persists, and a user file with its
+    // name is a documented reservation), so swallow it silently rather than
+    // surface wrapper-vs-source churn as a generated artifact that burns an
+    // output slot in exactly the failure cases persistence handles specially.
+    if (this.persistSession && inputFileInfo?.staged && relativePath === this.entryPointName) {
+      return { collected: true, truncated: false };
+    }
     if (wasModified && !isReadOnly) return null;
     if (!inputFileInfo) return null;
     if (!existingFile) return null;
@@ -1505,6 +2690,14 @@ export class Job {
       }
     }
 
+    /* Unchanged persistent-session carry-over: internal state that rides in the
+     * snapshot tar, not a user output. Skip it so it neither uploads nor
+     * consumes a max_output_files slot. A modified one falls through and is
+     * emitted as a normal generated output below. */
+    if (inputFileInfo?.restored && !existingFile && !wasModified) {
+      return { collected: false, truncated: false, stopLoop: false };
+    }
+
     const echoed = this.tryEchoUnchangedInput({
       wasModified,
       inputFileInfo,
@@ -1514,6 +2707,7 @@ export class Job {
     if (echoed) return { ...echoed, stopLoop: false };
 
     if (this.generatedFiles.length >= config.max_output_files) {
+      this.noteOutputTruncation(relativePath);
       return { collected: false, truncated: true, stopLoop: true };
     }
 
@@ -1572,26 +2766,8 @@ export class Job {
       return 'skipped';
     }
 
-    /** The PTC replay preamble injects a single tool-history fixture file at
-     * `<submissionDir>/_ptc_history.json` so user code can read deterministic
-     * cached results without going back to the service. It is runtime plumbing
-     * and must never echo back as a session output. The previous prefix-form
-     * (`_ptc_*`) silently ate any user file starting with `_ptc_`, which is a
-     * regression for non-replay workloads — match the exact basename instead.
-     * Tempfiles like `_ptc_pending.*` and `_ptc_counter.*` written by the bash
-     * preamble live in `/tmp` and never reach the submission dir, so they
-     * don't need walkDir-side filtering.
-     *
-     * NOTE: This MUST stay in sync with `PTC_HISTORY_FILENAME` in
-     * `services/codeapi/service/src/ptc-constants.ts`. The two workspaces are
-     * separate npm packages so we can't import directly; the filename literal
-     * is asserted-equal in `service/scripts/test-ptc-sentinel.ts` to catch
-     * accidental drift in CI. */
-    const PTC_HISTORY_FILENAME = '_ptc_history.json';
-    const isPtcReserved = (name: string): boolean => name === PTC_HISTORY_FILENAME;
-
     const nonDirkeepCount = entries.reduce(
-      (n, e) => (e.name === DIRKEEP || isPtcReserved(e.name) ? n : n + 1),
+      (n, e) => (e.name === DIRKEEP || this.isReservedOutputName(e.name) ? n : n + 1),
       0,
     );
 
@@ -1606,9 +2782,23 @@ export class Job {
      * `'skipped'` fall-through that suppresses marker creation. */
     let skippedHiddenDirs = 0;
 
-    for (const entry of entries) {
-      if (this.isOutputCapFull()) { truncated = true; break; }
-      if (isPtcReserved(entry.name)) continue;
+    for (let entryIdx = 0; entryIdx < entries.length; entryIdx++) {
+      const entry = entries[entryIdx];
+      if (this.isOutputCapFull()) {
+        // No slots left. Treat as truncation for the persistence gate ONLY
+        // if a genuine would-be OUTPUT remains among the unprocessed
+        // entries: readdir order could leave only infrastructure here
+        // (the entry file, reserved session artifacts, or hidden dirs that
+        // never surface as outputs), in which case nothing was actually
+        // hidden and blocking persistence would needlessly cost a max-output
+        // run its variable/file continuity.
+        if (await this.remainingHasOutputCandidate(entries, entryIdx, dir, inputByName)) {
+          this.noteOutputTruncation(path.relative(this.submissionDir, dir) || '.');
+        }
+        truncated = true;
+        break;
+      }
+      if (this.isReservedOutputName(entry.name)) continue;
 
       const fullPath = path.join(dir, entry.name);
       const relativePath = path.relative(this.submissionDir, fullPath);

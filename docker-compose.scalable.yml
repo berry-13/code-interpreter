@@ -143,6 +143,9 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=localdev
       - PORT=3112
+      - CODEAPI_PERSIST_SESSIONS=${CODEAPI_PERSIST_SESSIONS:-}
+      - CODEAPI_SESSION_STATE_MAX_BYTES=${CODEAPI_SESSION_STATE_MAX_BYTES:-}
+      - CODEAPI_SESSION_STATE_TTL_SECONDS=${CODEAPI_SESSION_STATE_TTL_SECONDS:-}
       # Note: No SANDBOX_ENDPOINT - API doesn't talk to sandbox directly
       # Note: No PYTHON_CONCURRENCY - API doesn't process jobs
     depends_on:
@@ -213,6 +216,9 @@ services:
       - LAUNCHER_RAM_MIB=2048
       - LAUNCHER_LOG_LEVEL=3
       # Sandbox config (passed through to microVM guest)
+      # Persistent sessions (opt-in): the co-located microVM guest reads these.
+      - CODEAPI_PERSIST_SESSIONS=${CODEAPI_PERSIST_SESSIONS:-}
+      - CODEAPI_SESSION_STATE_MAX_BYTES=${CODEAPI_SESSION_STATE_MAX_BYTES:-}
       - SANDBOX_LOG_LEVEL=INFO
       - SANDBOX_PACKAGES_DIRECTORY=/pkgs
       - SANDBOX_MAX_PROCESS_COUNT=100

@@ -71,6 +71,15 @@ describe('hardened sandbox-runner startup config', () => {
     expect(() => validateHardenedSandboxStartup()).toThrow('CODEAPI_EXECUTION_MANIFEST_PUBLIC_KEY');
   });
 
+  test('allows persistent-session runtime knobs in hardened mode', () => {
+    setValidHardenedConfig();
+    process.env.CODEAPI_PERSIST_SESSIONS = 'true';
+    process.env.CODEAPI_SESSION_STATE_MAX_BYTES = '104857600';
+    expect(() => validateHardenedSandboxStartup()).not.toThrow();
+    delete process.env.CODEAPI_PERSIST_SESSIONS;
+    delete process.env.CODEAPI_SESSION_STATE_MAX_BYTES;
+  });
+
   test('normalizes default ports when validating the sandbox forward target', () => {
     setValidHardenedConfig();
     config.egress_gateway_url = 'http://egress-gateway:80';

@@ -22,6 +22,22 @@ internalServiceAuth:
 
 hardenedSandboxMode: true
 
+# Persistent sessions (opt-in, OFF by default): each caller's /mnt/data
+# workspace (files + a dill-serialized Python namespace) is snapshotted to
+# object storage and restored on their next run. MUST be set here (not via
+# extraEnv, which rejects CODEAPI_-prefixed names) so the api, worker, AND
+# sandbox-runner all agree -- a sandbox without the flag reports every
+# continuation as a failed restore. See README "Persistent sessions" and
+# .env.example for the storage-lifecycle caveats.
+persistSessions:
+  enabled: false
+  # Max snapshot tar size in bytes (default 100 MiB). This is the only knob
+  # bounding snapshot size -- the gateway/ledger exempt the hidden snapshot
+  # from the per-file egress cap that sizes user output files.
+  stateMaxBytes: 104857600
+  # Idle expiry of the session's Redis pointer in seconds (default 7d).
+  stateTtlSeconds: 604800
+
 otel:
   enabled: false
   # OTLP/HTTP collector endpoint, e.g. "http://opentelemetry-collector.observability:4318".

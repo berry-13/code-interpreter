@@ -22,7 +22,10 @@ import { SANDBOX_READONLY_FILE_MODE, compatibilityModeForSkippedChown } from './
 interface DownloadInternals {
   submissionDir: string;
   files: TFile[];
-  inputFileHashes: Map<string, { hash: string; path: string; originalId?: string; originalSessionId?: string }>;
+  inputFileHashes: Map<
+    string,
+    { hash: string; path: string; originalId?: string; originalSessionId?: string; restored?: boolean }
+  >;
 }
 
 function asInternals(job: Job): DownloadInternals {
@@ -299,6 +302,37 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     /* Defensive: confirm we did not leave a partial / phantom file on
      * disk after exhausting retries. */
     await expect(fsp.access(path.join(tmpDir, 'should-not-exist.txt'))).rejects.toThrow();
+  });
+
+  it('discards a restored non-directory ancestor when a nested current input fails to download', async () => {
+    /* A prior persistent-session run left `data` as a plain file. This
+     * request's current input is nested under it (`data/file.csv`) -- an
+     * ancestor collision, not a same-path replacement -- and its download
+     * keeps 404-ing. The stale `data` file must still be discarded so the
+     * run doesn't see leftover bytes from a prior session in its place. */
+    await fsp.writeFile(path.join(tmpDir, 'data'), 'stale from a prior run');
+
+    const file: TFile = {
+      id: 'missing-nested-id',
+      storage_session_id: 'prev-session',
+      name: 'data/file.csv',
+    };
+    /* No route registered → listener returns 404 for every retry. */
+
+    const job = makeJob([file]);
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+    internals.inputFileHashes.set('data', {
+      hash: 'stale-hash',
+      path: path.join(tmpDir, 'data'),
+      restored: true,
+    });
+
+    const writtenName = await job.downloadAndWriteFile(file, 2, 1);
+
+    expect(writtenName).toBeNull();
+    await expect(fsp.access(path.join(tmpDir, 'data'))).rejects.toThrow();
+    expect(internals.inputFileHashes.has('data')).toBe(false);
   });
 
   it('rejects a server-supplied filename that escapes the submission dir', async () => {

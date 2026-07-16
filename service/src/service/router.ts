@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid';
 import { Router } from 'express';
 import type { Response } from 'express';
 import type { Readable } from 'stream';
+import type { Job, QueueEvents } from 'bullmq';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
 import { sessionAuth } from '../middleware/auth';
@@ -14,6 +15,13 @@ import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
 import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
+import {
+  SESSION_STATE_FILE_ID,
+  SESSION_STATE_RESTORE_MARKER,
+  SESSION_STATE_TAR_FILENAME,
+  isReservedSessionInputName,
+  sessionStatePointerKey,
+} from '../session-persist';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { isSyntheticPrincipalSource } from '../auth/synthetic';
@@ -110,6 +118,212 @@ function sendSessionKeyResolutionError(
 
 const router = Router();
 
+/* Atomically advance the session-state pointer (compare-and-swap). Advances
+ * when the key still holds the value this run restored from (`cur == ARGV[1]`),
+ * or when the key is absent AND this is a true first run (expected `''`).
+ * Returns whether the swap happened, so a run whose baseline was overtaken by
+ * a concurrent run doesn't roll the pointer back to stale state.
+ *
+ * A missing key must NOT satisfy a non-empty expectation: two continuations
+ * can restore snapshot A, the faster one advances the pointer to B, and B's
+ * key can then TTL-expire before the slower run finishes -- letting the
+ * slower run's CAS "succeed" against the absent key would publish its stale
+ * A-based snapshot over B's lineage, silently losing B's changes. The
+ * mid-run-lapse case this arm used to cover (a run that started seconds
+ * before SESSION_STATE_TTL_SECONDS elapsed) is instead handled where it
+ * belongs: claimPriorSnapshotRef floors the pointer's TTL at the max
+ * in-flight window when the claim is taken, so a pointer can no longer
+ * expire under a legitimately claimed run. A CAS that still finds the key
+ * missing is therefore genuinely stale (or a first run racing an expiry) and
+ * discarding its snapshot is the safe outcome. */
+const CAS_ADVANCE_SESSION_POINTER = `
+local cur = redis.call('GET', KEYS[1])
+if (cur == false and ARGV[1] == '') or cur == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0`;
+
+async function casAdvanceSessionPointer(
+  key: string,
+  expected: string | null,
+  next: string,
+  ttlSeconds: number,
+): Promise<boolean> {
+  const result = await connection.eval(
+    CAS_ADVANCE_SESSION_POINTER, 1, key, expected ?? '', next, String(ttlSeconds),
+  );
+  return result === 1;
+}
+
+/* Reads the session pointer and claims a ref on whatever snapshot it names, in
+ * one Redis round trip. A plain GET followed by a separate INCR (two round
+ * trips) leaves a window where a concurrent run's own finishing sequence --
+ * CAS-advance the pointer past this snapshot, then decrement its ref to zero
+ * and delete it -- can complete entirely in between: this run's GET would
+ * have already returned the now-deleted snapshot id, and its later INCR would
+ * claim a ref on an object that's gone, so its restore 404s and the run
+ * silently starts from an empty workspace. Folding both into one script
+ * closes the window: Redis serializes all commands from all clients, so
+ * either this claim lands before the other run's DECR (which then sees the
+ * live ref and skips the delete) or after its CAS-advance (in which case this
+ * run reads the already-advanced pointer, never claiming the stale id at
+ * all). */
+const CLAIM_PRIOR_SNAPSHOT_REF = `
+local cur = redis.call('GET', KEYS[1])
+if cur then
+  local ptrTtl = redis.call('TTL', KEYS[1])
+  if ptrTtl >= 0 and ptrTtl < tonumber(ARGV[2]) then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+  end
+  local refKey = 'snapshotrefs:' .. cur
+  redis.call('INCR', refKey)
+  redis.call('EXPIRE', refKey, ARGV[1])
+end
+return cur`;
+
+/** Returns the session pointer's current snapshot id (or null if unset),
+ *  having atomically claimed a ref on it in the same call.
+ *
+ *  The claim also FLOORS the pointer's own TTL at `pointerFloorSeconds`
+ *  (extending only when the remaining TTL is below it, never resetting a
+ *  healthy TTL): a pointer within seconds of SESSION_STATE_TTL_SECONDS
+ *  expiry could otherwise lapse while the claiming job is still queued or
+ *  running -- a second request arriving after that expiry would see no
+ *  prior snapshot, run cold, and CAS its cold state into the absent key,
+ *  making the original job's valid restored state lose its own CAS and be
+ *  discarded. The floor is the max in-flight job window, NOT a full TTL
+ *  refresh: a full refresh here would extend a possibly-dead pointer by the
+ *  whole SESSION_STATE_TTL on every attempt. The floor does still prolong a
+ *  dead pointer while retries keep arriving -- that case is handled by the
+ *  restore-failure streak (noteRestoreFailure), which RELEASES the pointer
+ *  after a few consecutive failed restores regardless of claim activity. */
+async function claimPriorSnapshotRef(
+  pointerKey: string,
+  refTtlSeconds: number,
+  pointerFloorSeconds: number,
+): Promise<string | null> {
+  const result = await connection.eval(
+    CLAIM_PRIOR_SNAPSHOT_REF, 1, pointerKey, String(refTtlSeconds), String(pointerFloorSeconds),
+  );
+  return typeof result === 'string' && result.length > 0 ? result : null;
+}
+
+/* Releases one ref. A plain DECR on a key that has already EXPIRED would mint
+ * a fresh counter at -1 and read as "last ref drained" -- but a missing key
+ * means the refcount is simply UNKNOWN. EXISTS+DECR in one script is atomic
+ * (Redis serializes scripts), and a missing key reports a positive remainder
+ * so the caller stays conservative and keeps the snapshot, the same stance
+ * the pointer-read failure path below takes. */
+const RELEASE_SNAPSHOT_REF = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 1 end
+return redis.call('DECR', KEYS[1])`;
+
+/* How long the `finally` block below keeps waiting for its own still-queued
+ * job before giving up and releasing the ref anyway -- past max run time +
+ * a generous queue-wait margin, so neither a crash nor a backed-up queue can
+ * hold a ref forever. */
+const SNAPSHOT_REF_TTL_SECONDS = Math.ceil(env.JOB_TIMEOUT / 1000) + 60;
+
+/* TTL on the `snapshotrefs:<id>` KEY itself -- deliberately LONGER than any
+ * single claim can legitimately be held. A claim is taken before the
+ * request's own JOB_TIMEOUT-bounded wait, and the finally block waits at
+ * most SNAPSHOT_REF_TTL_SECONDS more before releasing unconditionally, so a
+ * live claim spans at most ~(JOB_TIMEOUT + SNAPSHOT_REF_TTL_SECONDS), which
+ * this doubles past. The key outliving every live claim is what makes the
+ * refcount trustworthy: if it merely matched the claim TTL, a long-queued
+ * run's ref could expire while still outstanding, a later run's claim would
+ * recreate the key at a fresh count of 1, and draining that count to zero
+ * would delete a snapshot the still-queued run was about to restore. By the
+ * time this key can actually expire, every earlier claimant has already
+ * released or given up its wait. Each new claim's EXPIRE only ever pushes
+ * the deadline further out, never closer. */
+const SNAPSHOT_REF_KEY_TTL_SECONDS = 2 * SNAPSHOT_REF_TTL_SECONDS;
+
+/* Consecutive failed restores tolerated before the session pointer is
+ * released. One or two misses are treated as transient (file-server blip) and
+ * cost nothing but a skipped TTL refresh; a streak this long means the
+ * snapshot object is gone or corrupt, and keeping the pointer would brick the
+ * session -- especially since every new claim floors the pointer's TTL, so
+ * active retries alone would keep a dead pointer alive indefinitely. */
+const SESSION_RESTORE_FAILURE_LIMIT = 3;
+
+/* Keyed by the SNAPSHOT id, not the sessionKey: a streak must die with the
+ * pointer it indicts. Keyed by sessionKey, a stale count (pointer expired
+ * naturally at 1-2 failures) would survive into the session's NEXT lifetime
+ * -- a cold run publishes a fresh snapshot, then a single transient miss on
+ * it inherits the old count, crosses the limit, and RELEASE_DEAD_POINTER
+ * deletes the brand-new pointer. Snapshot-scoped keys can't leak across
+ * lifetimes, and orphans age out via their TTL. */
+function restoreFailureKey(snapshotSession: string): string {
+  return `sessionrestorefails:${snapshotSession}`;
+}
+
+/* Deletes the pointer only if it still names the snapshot whose restore kept
+ * failing -- a concurrent run that already advanced it must not be undone --
+ * AND no OTHER continuation currently holds a claim on that snapshot
+ * (KEYS[2] is its snapshotrefs counter; the caller's own ref is still held
+ * at this point, hence <= 1). Without the ref check, three transient blips
+ * under concurrency could delete the pointer while a run that restored the
+ * SAME snapshot successfully is still executing -- its later CAS would find
+ * the key missing and discard a perfectly valid snapshot, resetting a
+ * healthy session. Skipping the release is safe: the failure streak stays
+ * >= the limit, so any later failure with no other claims in flight
+ * releases it then. */
+const RELEASE_DEAD_POINTER = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  local refs = tonumber(redis.call('GET', KEYS[2]) or '0')
+  if refs <= 1 then
+    redis.call('DEL', KEYS[1])
+    return 1
+  end
+end
+return 0`;
+
+/**
+ * Records one failed restore of `priorSnapshotSession`. After
+ * SESSION_RESTORE_FAILURE_LIMIT consecutive failures the pointer is released
+ * (CAS-guarded), so the next run starts a fresh session instead of retrying a
+ * dead snapshot forever. The abandoned snapshot object itself is left to the
+ * bucket lifecycle policy, like any other orphan (see the KNOWN GAP note in
+ * session-persist.ts).
+ */
+async function noteRestoreFailure(sessionKey: string, priorSnapshotSession: string): Promise<void> {
+  const failKey = restoreFailureKey(priorSnapshotSession);
+  try {
+    const fails = await connection.incr(failKey);
+    await connection.expire(failKey, env.SESSION_STATE_TTL_SECONDS);
+    if (fails >= SESSION_RESTORE_FAILURE_LIMIT) {
+      const released = await connection.eval(
+        RELEASE_DEAD_POINTER,
+        2,
+        sessionStatePointerKey(sessionKey),
+        `snapshotrefs:${priorSnapshotSession}`,
+        priorSnapshotSession,
+      );
+      if (released === 1) {
+        logger.warn(`[${INSTANCE_ID}] Released session pointer after ${fails} consecutive failed restores`);
+        // Only clear the streak when the release actually happened -- a
+        // skipped release (other claims in flight) must keep the count at
+        // the limit so a later lone failure can still release.
+        await connection.del(failKey);
+      }
+    }
+  } catch (error) {
+    logger.error(`[${INSTANCE_ID}] Failed to record restore failure:`, error);
+  }
+}
+
+/** Fire-and-forget delete of a session's hidden snapshot object. */
+function deleteSessionSnapshot(outputSession: string): void {
+  axios.delete(
+    `${env.FILE_SERVER_URL}/sessions/${encodeURIComponent(outputSession)}/objects/${encodeURIComponent(SESSION_STATE_FILE_ID)}`,
+    { headers: internalServiceHeaders() },
+  ).catch((error) => {
+    logger.warn(`[${INSTANCE_ID}] Failed to delete session snapshot:`, getAxiosErrorDetails(error));
+  });
+}
+
 router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
   const principal = getPrincipalOrReject(req, res);
   if (!principal) return;
@@ -170,6 +384,18 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   const execution_id = nanoid();
   await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
 
+  // Persistent-session pointer bookkeeping (used across the injection, advance,
+  // and finally blocks). `snapshotRefKey` refcounts in-flight restores of the
+  // prior snapshot so a concurrent run can't delete it before this run primes.
+  let priorSnapshotSession: string | null = null;
+  let snapshotRefKey: string | null = null;
+  let pointerAdvanced = false;
+  // Hoisted out of the try block so `finally` can wait on the job's actual
+  // terminal state (not just this request's own wait) before releasing its
+  // snapshot ref -- see the finally block below.
+  let job: Job<t.JobData, t.JobResult, Jobs.execute> | undefined;
+  let queueEvents: QueueEvents | undefined;
+
   try {
     if (!isSyntheticRequest) {
       logger.info('Request received', {
@@ -183,12 +409,103 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       });
     }
 
+    /* isPyPlot is a static scan of THIS run's own source only -- it must stay
+     * that way. It was briefly broadened to also fire on any persistent-
+     * session continuation (to catch a restored `plt` alias used without a
+     * fresh `import matplotlib`), but createPayload() embeds isPyPlot-true
+     * code inside the matplotlib.py template. Routing EVERY continuation
+     * through that broke a literal `from __future__ import ...` in the
+     * user's own code: it becomes a SyntaxError once it's no longer the
+     * first statement of its compilation unit (matplotlib.py's own imports
+     * now precede it). That's still true regardless of where in the
+     * template the user code sits, so isPyPlot stays a per-run scan.
+     * Reverted; the restored-`plt`-without-reimport gap is a known, smaller
+     * limitation. (A related bug this broadening also hit -- user code
+     * running inside the template's function scope, so `x += 1` on a
+     * restored global raised UnboundLocalError -- is now fixed: user code
+     * runs at module scope, see matplotlib.py.) */
     const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
     const rawPayload = createPayload({
       req,
       isPyPlot,
       session_id,
     });
+
+    /* Persistent sessions (opt-in). Rendezvous on the caller's own auth-derived
+     * sessionKey via a Redis pointer to the previous run's output session:
+     *   - Mark the payload so the sandbox snapshots /mnt/data back to THIS run's
+     *     output session (the only session the egress grant lets it write).
+     *   - If a prior snapshot exists, inject it as a synthetic input file. Being
+     *     an input file, its storage_session_id flows into the manifest/grant
+     *     read_sessions + input_files, authorizing the sandbox to fetch it — no
+     *     file-server or Redis-auth change needed. Done before
+     *     prepareSandboxJobSecurity so it is covered by the signed manifest. */
+    // Reject refs to the hidden snapshot by its fixed storage ID (or any
+    // prefix that file-server's prefix matching would resolve to it): the
+    // snapshot upload creates a normal `upload:` cache entry under the
+    // caller's own session, so authorizeRequestedFiles would accept
+    // `id: codeapi-session-state` with a harmless-looking name and stage
+    // the internal workspace tar as an ordinary input -- bypassing the
+    // download/list routes that deliberately hide this artifact.
+    // DELIBERATELY outside the env.PERSIST_SESSIONS gate: snapshot objects
+    // written while the feature was enabled outlive a rollback (their
+    // `upload:` cache entries included), and the list/download routes keep
+    // hiding them unconditionally -- so the input-ref door must stay closed
+    // unconditionally too.
+    const hiddenSnapshotRef = (authorizedFiles ?? []).find(
+      f => typeof f.id === 'string' && isSessionStateFileId(f.id),
+    );
+    if (hiddenSnapshotRef) {
+      return res.status(400).json({ error: `File id '${hiddenSnapshotRef.id}' is reserved for session persistence` });
+    }
+
+    if (env.PERSIST_SESSIONS) {
+      // Reserve the persistence artifact NAMES only while the feature is on:
+      // the state tar (identified in the sandbox by name only, since egress
+      // masks file id/session) and the namespace pickle (+ its tempfile). A
+      // user input with any of these names would shadow restored state or be
+      // mistaken for the injected snapshot. With persistence off no marker
+      // is injected and nothing matches by name, so ordinary inputs that
+      // happen to use these names keep working exactly as before the
+      // feature existed.
+      const reservedInput = (authorizedFiles ?? []).find(f => isReservedSessionInputName(f.name));
+      if (reservedInput) {
+        return res.status(400).json({ error: `File name '${reservedInput.name}' is reserved when persistent sessions are enabled` });
+      }
+      rawPayload.persist_session = {
+        file_id: SESSION_STATE_FILE_ID,
+        filename: SESSION_STATE_TAR_FILENAME,
+      };
+      // Reads the pointer and claims a ref on the snapshot it names in one
+      // atomic call, so a concurrent run's finish sequence can't advance past
+      // and delete that snapshot in the gap between reading and claiming it
+      // (see claimPriorSnapshotRef). The key TTL strictly dominates the
+      // longest legitimate hold (see SNAPSHOT_REF_KEY_TTL_SECONDS) so expiry
+      // can't erase an outstanding ref, while still bounding a crashed
+      // handler's leak.
+      priorSnapshotSession = await claimPriorSnapshotRef(
+        sessionStatePointerKey(sessionKey),
+        SNAPSHOT_REF_KEY_TTL_SECONDS,
+        // Pointer TTL floor = the same max in-flight window, so the pointer
+        // can't expire under a job that just claimed it (see claim docs).
+        SNAPSHOT_REF_KEY_TTL_SECONDS,
+      );
+      if (priorSnapshotSession) {
+        snapshotRefKey = `snapshotrefs:${priorSnapshotSession}`;
+        // Presence marker only -- never the raw prior session id, which
+        // prepareSandboxEgress does not rewrite and would otherwise reach the
+        // sandbox unmasked (see SESSION_STATE_RESTORE_MARKER). The sandbox
+        // locates the snapshot via the injected file entry below, whose
+        // id/session ARE masked like every other file ref.
+        rawPayload.persist_session.restore_session_id = SESSION_STATE_RESTORE_MARKER;
+        rawPayload.files.push({
+          id: SESSION_STATE_FILE_ID,
+          storage_session_id: priorSnapshotSession,
+          name: SESSION_STATE_TAR_FILENAME,
+        });
+      }
+    }
+
     const sandboxSecurity = prepareSandboxJobSecurity({
       req,
       executionId: execution_id,
@@ -199,10 +516,10 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     });
 
     const queue = language === Languages.py ? pyQueue : otherQueue;
-    const queueEvents = language === Languages.py ? pyQueueEvents : otherQueueEvents;
+    queueEvents = language === Languages.py ? pyQueueEvents : otherQueueEvents;
     const queueName = language === Languages.py ? 'python' : 'other';
 
-    const job = await withSpan('codeapi.job.enqueue', {
+    job = await withSpan('codeapi.job.enqueue', {
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
@@ -237,13 +554,18 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       });
     }, 'PRODUCER');
     jobsSubmitted.inc({ language });
+    // Narrowed local bindings: `job`/`queueEvents` are `let ... | undefined` so
+    // `finally` can use them after any early return, but that means TS can't
+    // narrow them across closures below (they're captured, not re-checked).
+    const currentJob = job;
+    const currentQueueEvents = queueEvents;
 
     req.on('close', async () => {
       try {
-        await job.remove();
-        logger.info(`[${INSTANCE_ID}] Job ${job.id} removed due to client disconnect`);
+        await currentJob.remove();
+        logger.info(`[${INSTANCE_ID}] Job ${currentJob.id} removed due to client disconnect`);
       } catch (error) {
-        logger.error(`[${INSTANCE_ID}] Error removing job ${job.id} on client disconnect:`, error);
+        logger.error(`[${INSTANCE_ID}] Error removing job ${currentJob.id} on client disconnect:`, error);
       }
     });
 
@@ -251,7 +573,87 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
-    }, () => job.waitUntilFinished(queueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+    }, () => currentJob.waitUntilFinished(currentQueueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+
+    /* Track the restore-failure streak: a failed restore feeds it (releasing
+     * the pointer once the streak hits the limit); any healthy outcome for a
+     * run that had a prior snapshot resets it, so only CONSECUTIVE failures
+     * count and a transient blip between successes never accumulates. */
+    if (env.PERSIST_SESSIONS && priorSnapshotSession) {
+      if ((result as t.ExecuteResult)?.session_state_restore_failed) {
+        await noteRestoreFailure(sessionKey, priorSnapshotSession);
+      } else {
+        await connection.del(restoreFailureKey(priorSnapshotSession)).catch(() => { /* best effort */ });
+      }
+    }
+
+    /* Advance the persistent-session pointer only when the sandbox actually
+     * wrote a fresh snapshot to this run's output session. On a skip (oversize
+     * / error) we leave the pointer on the last good snapshot so continuity
+     * survives. TTL refresh means an active session never expires. */
+    if (env.PERSIST_SESSIONS && (result as t.ExecuteResult)?.session_state_persisted) {
+      try {
+        // Compare-and-swap the pointer: only advance if it still equals what
+        // this run restored from. If two runs for the same session overlap, both
+        // restore the same prior snapshot; without CAS the slower-to-finish run
+        // would advance the pointer to state that omits the other's changes
+        // (a rollback). With CAS, the run whose baseline is now stale simply
+        // does not advance -- its snapshot is discarded, not the newer one.
+        pointerAdvanced = await casAdvanceSessionPointer(
+          sessionStatePointerKey(sessionKey),
+          priorSnapshotSession,
+          session_id,
+          env.SESSION_STATE_TTL_SECONDS,
+        );
+        if (!pointerAdvanced) {
+          // A concurrent run already advanced the pointer; this run's snapshot is
+          // now orphaned and stale -- drop it (no other run references it).
+          logger.warn(`[${INSTANCE_ID}] Session pointer moved concurrently; discarding this run's snapshot`);
+          deleteSessionSnapshot(session_id);
+        }
+        // Deletion of the SUPERSEDED prior snapshot happens in `finally`, after
+        // this run releases its ref, so a concurrent run that still needs to
+        // restore it isn't left with a 404.
+      } catch (error) {
+        logger.error(`[${INSTANCE_ID}] Failed to advance session-state pointer:`, error);
+      }
+    } else if (
+      env.PERSIST_SESSIONS &&
+      priorSnapshotSession &&
+      !(result as t.ExecuteResult)?.session_state_restore_failed
+    ) {
+      // This run restored a prior snapshot but didn't write a fresh one (oversize
+      // workspace, upload failure, etc.). The comment above promises an active
+      // session's pointer never expires, but that's only true when a fresh
+      // snapshot advances it -- a session that stays over cap for longer than
+      // SESSION_STATE_TTL_SECONDS across consecutive skipped persists would
+      // otherwise have its pointer lapse and lose the last good snapshot even
+      // though it's still live. Refresh the TTL on the existing pointer instead.
+      // Reusing the CAS advance script with `next == expected == priorSnapshotSession`
+      // rewrites the same value while the key is live, without ever
+      // clobbering a pointer a concurrent run has since advanced (an
+      // already-expired key stays expired -- the CAS no longer recreates
+      // missing pointers for continuations, see its comment).
+      //
+      // EXCEPT after a FAILED restore (the guard above): if the snapshot
+      // object is truly gone (lifecycle cleanup) or corrupt, every retry
+      // fails, skips persist, and would land here -- refreshing would pin the
+      // dead pointer alive forever. Failed restores instead feed a failure
+      // streak (see noteRestoreFailure below) that RELEASES the pointer
+      // after a few consecutive misses, so the session recovers promptly
+      // even under active retries; a one-off transient miss merely skips
+      // one refresh and resets the streak on the next success.
+      try {
+        await casAdvanceSessionPointer(
+          sessionStatePointerKey(sessionKey),
+          priorSnapshotSession,
+          priorSnapshotSession,
+          env.SESSION_STATE_TTL_SECONDS,
+        );
+      } catch (error) {
+        logger.error(`[${INSTANCE_ID}] Failed to refresh session-state pointer TTL:`, error);
+      }
+    }
 
     if (!isSyntheticRequest) {
       logger.info('Execution completed', { session_id, user_id });
@@ -264,11 +666,59 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       return res.status(publicFailure.status).json(publicFailure.body);
     }
     return res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    // Release this run's ref on the prior snapshot and delete it only once the
+    // pointer has advanced past it AND no other in-flight run still holds a ref
+    // (which would otherwise 404 its restore). Runs regardless of success/error.
+    if (snapshotRefKey && priorSnapshotSession) {
+      if (job && queueEvents) {
+        // The wait above can reject (or this whole handler can throw) while the
+        // job itself is still queued/active -- e.g. the queue is backed up past
+        // JOB_TIMEOUT, so our own wait times out before the job even starts. If
+        // we released the ref anyway, a concurrent run that had already advanced
+        // the pointer could delete priorSnapshotSession before this still-queued
+        // job restores from it. Confirm the job has actually reached a terminal
+        // state first, waiting a bit longer if not -- safe to do here since the
+        // HTTP response was already sent above. Bounded by the same TTL margin
+        // as the ref key itself, so a stuck job can't hold this open forever.
+        const state = await job.getState().catch(() => 'unknown');
+        if (state !== 'completed' && state !== 'failed') {
+          await job.waitUntilFinished(queueEvents, SNAPSHOT_REF_TTL_SECONDS * 1000).catch(() => { /* released below regardless of outcome */ });
+        }
+      }
+      const remaining = Number(await connection.eval(RELEASE_SNAPSHOT_REF, 1, snapshotRefKey).catch(() => 1));
+      if (remaining <= 0 && priorSnapshotSession !== session_id) {
+        // We're the last in-flight referencer. Delete the prior snapshot only if
+        // the pointer no longer references it -- i.e. some run has advanced past
+        // it -- rather than keying on this run advancing. That covers the overlap
+        // where one run advances (but sees refs outstanding, so it skips the
+        // delete) and a later non-advancing run drains the final ref: without the
+        // live check that superseded snapshot would leak. The pointer only ever
+        // moves to fresh session ids and never back, so once it != the prior
+        // snapshot no future run can restore from it or re-take a ref, making the
+        // delete safe. A GET failure, or a missing key (pointer TTL lapsed
+        // without ever being replaced -- e.g. a continuation restored the prior
+        // snapshot and then failed to persist a replacement), both stay
+        // conservative (keep the snapshot): only a live pointer that actually
+        // names a *different* session proves supersession.
+        const currentPointer = await connection
+          .get(sessionStatePointerKey(sessionKey))
+          .catch(() => priorSnapshotSession);
+        if (currentPointer && currentPointer !== priorSnapshotSession) {
+          deleteSessionSnapshot(priorSnapshotSession);
+        }
+      }
+    }
   }
 });
 
 router.get('/download/:session_id/:fileId', downloadLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
+
+  // The hidden persistent-session snapshot is internal state, not a user file.
+  if (isSessionStateFileId(fileId)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   let exists = 0;
   const uploadKey = `upload:${req.sessionKey}${session_id}${fileId}`;
@@ -748,6 +1198,40 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
   }
 });
 
+/** Best-effort extraction of the stored file_id from any file-list detail-level
+ *  item (a bare `<session>/<id>.<ext>` string, `{ name }`, or `{ id }`). */
+function objectFileIdFromListItem(item: unknown): string | undefined {
+  if (item && typeof item === 'object' && typeof (item as { id?: unknown }).id === 'string') {
+    return (item as { id: string }).id;
+  }
+  const name = typeof item === 'string'
+    ? item
+    : (item && typeof item === 'object' ? (item as { name?: unknown }).name : undefined);
+  if (typeof name !== 'string') return undefined;
+  const base = name.split('/').filter(Boolean).pop() ?? name;
+  return base.replace(/\.[^.]+$/, '');
+}
+
+/**
+ * True when a route-param `:fileId` can refer to the hidden persistent-session
+ * snapshot. file-server's object GET/DELETE handlers resolve `:fileId` by
+ * PREFIX match against `<session>/<fileId>` (see file-server.ts), so it is not
+ * enough to block the bare id and the extension-qualified form: ANY strict
+ * prefix (`codeapi-session-stat`, `codeapi-s`, ...) also resolves to the
+ * stored `codeapi-session-state.tar` object there. Reject every prefix of the
+ * stored name, plus any `<id>.<ext>` spelling (mirroring
+ * `objectFileIdFromListItem` above). Over-blocking is harmless: real object
+ * ids are full-length nanoids, which can never be a strict prefix of the
+ * 21-char reserved id, and an exact-length collision is blocked by design.
+ */
+function isSessionStateFileId(fileId: string): boolean {
+  if (fileId.length === 0) return false;
+  return (
+    `${SESSION_STATE_FILE_ID}.tar`.startsWith(fileId) ||
+    fileId.replace(/\.[^.]+$/, '') === SESSION_STATE_FILE_ID
+  );
+}
+
 router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id } = req.params;
   const { detail = 'simple' } = req.query;
@@ -758,7 +1242,13 @@ router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.Authen
       headers: internalServiceHeaders({ 'Accept': 'application/json' })
     });
 
-    return res.status(200).json(response.data);
+    // Hide the hidden persistent-session snapshot object: it lives in the same
+    // output session as user artifacts but is internal state, not a downloadable
+    // file. (No-op unless persistence is enabled.)
+    const data = Array.isArray(response.data)
+      ? response.data.filter(item => objectFileIdFromListItem(item) !== SESSION_STATE_FILE_ID)
+      : response.data;
+    return res.status(200).json(data);
   } catch (error) {
     const errorDetails = getAxiosErrorDetails(error);
     logger.error(`[${INSTANCE_ID}] Error fetching file info for session ${session_id}:`, errorDetails);
@@ -784,6 +1274,10 @@ router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.Authen
 router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
 
+  if (isSessionStateFileId(fileId)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
   try {
     const response = await axios.get(
       `${env.FILE_SERVER_URL}/sessions/${session_id}/objects/${fileId}/metadata`,
@@ -806,6 +1300,11 @@ router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, sessionAuth, a
 
 router.delete('/files/:session_id/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
+
+  // The hidden snapshot object is not client-addressable.
+  if (isSessionStateFileId(fileId)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   try {
     const response = await axios.delete(

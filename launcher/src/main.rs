@@ -405,6 +405,8 @@ fn env_bool(name: &str, default: bool) -> bool {
 fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
     const ALLOW_EXACT: &[&str] = &[
         "CODEAPI_HARDENED_SANDBOX_MODE",
+        "CODEAPI_PERSIST_SESSIONS",
+        "CODEAPI_SESSION_STATE_MAX_BYTES",
         "EGRESS_GATEWAY_URL",
         "HOME",
         "NSJAIL_CONFIG",
@@ -640,6 +642,8 @@ mod tests {
         for key in [
             "EGRESS_GATEWAY_URL",
             "CODEAPI_HARDENED_SANDBOX_MODE",
+            "CODEAPI_PERSIST_SESSIONS",
+            "CODEAPI_SESSION_STATE_MAX_BYTES",
             "SANDBOX_DISABLE_NETWORKING",
             "SANDBOX_ALLOWED_LOCAL_NETWORK_PORT",
             "SANDBOX_FORWARD_TARGET",

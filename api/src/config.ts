@@ -82,6 +82,15 @@ export const config = {
   max_nesting_depth: safeInt(process.env.SANDBOX_MAX_NESTING_DEPTH, 10),
   max_path_length: safeInt(process.env.SANDBOX_MAX_PATH_LENGTH, 256),
   max_output_files: safeInt(process.env.SANDBOX_MAX_OUTPUT_FILES, 50),
+  /* Persistent sessions (opt-in, OFF by default). When enabled and the request
+   * carries a persist_session marker, prime() restores the prior workspace tar
+   * (files + a dill-serialized Python namespace) into /mnt/data, and after the
+   * run the workspace is snapshotted back to object storage under the caller's
+   * own sessionKey. The sandbox network posture is unchanged: the tar is
+   * read/written by the trusted runner (like input downloads / output uploads),
+   * never by user code. See service/src/config.ts for the matching knobs. */
+  persist_sessions: process.env.CODEAPI_PERSIST_SESSIONS === 'true',
+  session_state_max_bytes: safeInt(process.env.CODEAPI_SESSION_STATE_MAX_BYTES, 104857600),
   require_execution_manifest: requireExecutionManifest,
   execution_manifest_body_hash_required_after_seconds: sandboxStartedAtSeconds + safeInt(
     process.env.SANDBOX_EXECUTION_MANIFEST_BODY_HASH_LEGACY_GRACE_SECONDS,

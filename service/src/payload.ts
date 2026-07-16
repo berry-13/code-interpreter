@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import type * as t from './types';
-import { planLimits, languageConfig, resolveLanguage } from './config';
+import { planLimits, languageConfig, resolveLanguage, env } from './config';
+import { Languages } from './enum';
+import { wrapPythonForSessionPersistence } from './session-persist';
 
 export const templateCode = fs.readFileSync(path.join(__dirname, 'matplotlib.py'), 'utf8');
 
@@ -22,6 +24,9 @@ export function createPayload({
 
   let finalCode: string;
   if (isPyPlot === true) {
+    // 4-space indent: the user block sits directly inside the template's
+    // `if __name__ == "__main__":` (see matplotlib.py). Keep in sync with
+    // that nesting.
     const indentedUserCode = userCode.trim().split('\n').map(line => `    ${line}`).join('\n');
     finalCode = templateCode.replace(
       /# BEGIN USER CODE\n[\s\S]*?# END USER CODE/,
@@ -29,6 +34,14 @@ export function createPayload({
     );
   } else {
     finalCode = userCode;
+  }
+
+  /* Persistent sessions (opt-in): wrap Python so the run restores its prior
+   * global namespace and snapshots it back (via dill) around the user code.
+   * Other languages get file-only persistence (the workspace tar), so they
+   * need no code wrapping. See session-persist.ts for the wrapper's rationale. */
+  if (env.PERSIST_SESSIONS && language === Languages.py) {
+    finalCode = wrapPythonForSessionPersistence(finalCode, config.fileName);
   }
 
   const run_memory_limit = planLimits[req.planId ?? '']?.run_memory_limit ?? planLimits.default.run_memory_limit;

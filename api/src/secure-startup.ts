@@ -50,11 +50,20 @@ function forwardTargetHostPort(rawEndpoint: string): string {
   }
 }
 
+// CODEAPI_ vars are control-plane by convention and forbidden in the sandbox
+// guest, EXCEPT these runtime knobs (no secrets/tokens) that the sandbox itself
+// must read. Keep this list minimal and non-sensitive.
+const ALLOWED_CODEAPI_ENV = new Set([
+  'CODEAPI_HARDENED_SANDBOX_MODE',
+  'CODEAPI_PERSIST_SESSIONS',
+  'CODEAPI_SESSION_STATE_MAX_BYTES',
+]);
+
 function forbiddenEnvNames(): string[] {
   const forbidden: string[] = [];
   for (const [name, raw] of Object.entries(process.env)) {
     if (!nonEmpty(raw)) continue;
-    if (name === 'CODEAPI_HARDENED_SANDBOX_MODE') continue;
+    if (ALLOWED_CODEAPI_ENV.has(name)) continue;
     if (name.startsWith('CODEAPI_')) forbidden.push(name);
     if (name.startsWith('REDIS_')) forbidden.push(name);
     if (name.startsWith('AWS_')) forbidden.push(name);

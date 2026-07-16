@@ -54,7 +54,7 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-function currentUid(): number | undefined {
+export function currentUid(): number | undefined {
   return typeof process.getuid === 'function' ? process.getuid() : undefined;
 }
 

@@ -58,6 +58,14 @@ export function buildExecutionManifestClaims(args: {
 }): ExecutionManifestClaims {
   const now = args.nowSeconds ?? Math.floor(Date.now() / 1000);
   const inputFiles = collectManifestInputFiles(args.payload);
+  // Persistent sessions do hidden gateway I/O the caller's budgets don't see:
+  // a snapshot PUT and, on continuations, a restore GET. Those are EXEMPTED
+  // from the request/output-count budgets inside the egress ledger/gateway
+  // (keyed on SESSION_STATE_FILE_ID) rather than added to the public caps
+  // here: a raised cap hands the extra slot/request to whichever operation
+  // asks first, and user outputs upload BEFORE the snapshot PUT -- a run
+  // could exceed the configured visible cap and then fail the snapshot
+  // anyway, or charge the hidden allowance to user traffic.
   const readSessions = Array.from(new Set(inputFiles.map(file => file.session_id))).sort();
   const ctx = args.req.codeApiAuthContext;
   const identity = buildExecutionIdentity({
@@ -81,7 +89,14 @@ export function buildExecutionManifestClaims(args: {
     input_files: inputFiles,
     read_sessions: readSessions,
     output_session_id: args.outputSessionId,
-    max_upload_bytes: env.EXECUTION_MANIFEST_MAX_UPLOAD_BYTES,
+    // The hidden snapshot PUT can be as large as SESSION_STATE_MAX_BYTES, which
+    // may exceed the visible per-file cap; raise the per-file byte budget to fit
+    // it when persistence is on (opt-in, so a run also being allowed larger
+    // visible uploads is an accepted trade-off) -- otherwise snapshots above the
+    // normal cap always fail and strand the pointer.
+    max_upload_bytes: args.payload.persist_session
+      ? Math.max(env.EXECUTION_MANIFEST_MAX_UPLOAD_BYTES, env.SESSION_STATE_MAX_BYTES)
+      : env.EXECUTION_MANIFEST_MAX_UPLOAD_BYTES,
     max_output_files: env.EXECUTION_MANIFEST_MAX_OUTPUT_FILES,
     max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS,
     iat: now,
