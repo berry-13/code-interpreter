@@ -119,6 +119,16 @@ describe('normalizeRestoredModes', () => {
 describe('chownTreeToJobUid', () => {
   it('returns true when the chown genuinely succeeds', async () => {
     const job = makeJob();
+    // Target THIS process's own uid/gid: a no-op ownership change that
+    // succeeds without CAP_CHOWN, so the success path is exercised on an
+    // unprivileged CI runner too. Chowning to a different uid (the fallback
+    // identity's 65534) needs root and would spuriously fail in CI.
+    asInternals(job).jobIdentity = {
+      slot: 0,
+      uid: process.getuid?.() ?? 0,
+      gid: process.getgid?.() ?? 0,
+      perJobUid: true,
+    };
     const applied = await asInternals(job).chownTreeToJobUid(tmpDir);
     expect(applied).toBe(true);
   });
