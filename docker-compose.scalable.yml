@@ -179,6 +179,10 @@ services:
       - BASH_PACKAGE_VERSION=${BASH_PACKAGE_VERSION:-}
       - JAVA_VERSION=${JAVA_VERSION:-}
       - TEMURIN_BUILD=${TEMURIN_BUILD:-}
+      - PYTHON_SHA256=${PYTHON_SHA256:-}
+      - NODE_SHA256=${NODE_SHA256:-}
+      - BUN_SHA256=${BUN_SHA256:-}
+      - JAVA_SHA256=${JAVA_SHA256:-}
       - FORCE_REBUILD=${FORCE_REBUILD:-}
     volumes:
       - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/pkgs
