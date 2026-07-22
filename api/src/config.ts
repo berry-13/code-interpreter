@@ -91,6 +91,18 @@ export const config = {
    * never by user code. See service/src/config.ts for the matching knobs. */
   persist_sessions: process.env.CODEAPI_PERSIST_SESSIONS === 'true',
   session_state_max_bytes: safeInt(process.env.CODEAPI_SESSION_STATE_MAX_BYTES, 104857600),
+  /* Dynamic per-job dependency install (opt-in, OFF by default). When enabled,
+   * the runner installs request-declared, pinned packages during prime() with
+   * pip --only-binary=:all: (wheels only -> no build/setup.py code runs) into a
+   * per-job dir mounted READ-ONLY into the jail. The jail itself gains no
+   * network; only the trusted runner fetches from the allowlisted index. */
+  allow_dynamic_dependencies: process.env.CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES === 'true',
+  // `||` (not `??`): compose passes an empty string when the var is unset, and
+  // an empty index URL would break pip.
+  dependency_index_url: process.env.CODEAPI_DEPENDENCY_INDEX_URL || 'https://pypi.org/simple',
+  dependency_max_count: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_COUNT, 50),
+  dependency_install_timeout_ms: safeInt(process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS, 120000),
+  dependency_max_bytes: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_BYTES, 262144000),
   require_execution_manifest: requireExecutionManifest,
   execution_manifest_body_hash_required_after_seconds: sandboxStartedAtSeconds + safeInt(
     process.env.SANDBOX_EXECUTION_MANIFEST_BODY_HASH_LEGACY_GRACE_SECONDS,

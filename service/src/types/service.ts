@@ -122,12 +122,24 @@ export type ExecuteResponse = {
   files: FileRefs;
 };
 
+/**
+ * Request-declared runtime dependencies installed per-job before user code
+ * runs. MVP supports pip only; each entry is a pinned spec (`name==version`,
+ * optionally with one or more ` --hash=sha256:...`). `npm`/`bun` keys are
+ * reserved for the follow-up. Installation is gated by
+ * CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES and uses wheels only (no build scripts).
+ */
+export interface Dependencies {
+  pip?: string[];
+}
+
 export interface RequestBody {
   code: string;
   lang: string;
   args?: string[];
   user_id?: string;
   files?: RequestFile[];
+  dependencies?: Dependencies;
 }
 
 export type CreatePayload = { req: AuthenticatedRequest, session_id: string; isPyPlot?: boolean };
@@ -186,6 +198,12 @@ export interface PayloadBody {
    */
   tool_call_socket?: boolean;
   args?: string[];
+  /**
+   * Request-declared dependencies installed per-job by the sandbox before user
+   * code runs (pip wheels only for the MVP). Rides in the body so it is bound
+   * by the execution manifest's body hash.
+   */
+  dependencies?: Dependencies;
   /**
    * Extra environment variables to inject into the sandboxed process via nsjail -E.
    * NOTE: PTC replay mode delivers tool-result history as a payload file

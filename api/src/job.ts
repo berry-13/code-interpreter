@@ -8,6 +8,7 @@ import * as fsp from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { pipeline } from 'stream/promises';
+import { spawn } from 'child_process';
 import { Readable, Transform } from 'stream';
 import type { Logger } from 'pino';
 import type { NsJailResult } from './nsjail';
@@ -16,6 +17,7 @@ import { logger as rootLogger } from './logger';
 import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
+import type { ValidatedDependencies } from './dependencies';
 import { internalServiceHeaders } from './internal-service-auth';
 import { EGRESS_GRANT_HEADER } from './egress';
 import { injectTraceHeaders } from './telemetry';
@@ -114,6 +116,21 @@ function isReservedSessionBasename(name: string): boolean {
  *  user file, unlike SESSION_STATE_TAR_BASENAME (see comment above). */
 function isSessionStateInternalBasename(name: string): boolean {
   return pathSegments(name).some(segment => SESSION_STATE_INTERNAL_BASENAMES.has(segment));
+}
+
+/** Recursively sum regular-file sizes under `dir` (symlinks not followed). */
+async function dirSizeBytes(dir: string): Promise<number> {
+  let total = 0;
+  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      total += await dirSizeBytes(full);
+    } else if (entry.isFile()) {
+      total += await fsp.stat(full).then(s => s.size).catch(() => 0);
+    }
+  }
+  return total;
 }
 
 /**
@@ -784,9 +801,11 @@ export class Job {
   toolCallSocketEnabled: boolean;
   isSynthetic: boolean;
   outputSessionId: string;
+  dependencies?: ValidatedDependencies;
 
   private log: Logger;
   private submissionDir = '';
+  private depsDir: string | undefined;
   private workspaceLease: SandboxWorkspaceLease | undefined;
   private jobIdentity: SandboxJobIdentity | undefined;
   private generatedFiles: GeneratedFile[] = [];
@@ -840,6 +859,7 @@ export class Job {
     tool_call_socket_enabled?: boolean;
     is_synthetic?: boolean;
     persist_session?: { file_id: string; filename: string; restore_session_id?: string };
+    dependencies?: ValidatedDependencies;
   }) {
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
@@ -874,6 +894,7 @@ export class Job {
     this.toolCallSocketEnabled = opts.tool_call_socket_enabled === true;
     this.isSynthetic = opts.is_synthetic === true;
     this.persistSession = opts.persist_session;
+    this.dependencies = opts.dependencies;
   }
 
   async computeFileHash(filePath: string, noFollow = false): Promise<string> {
@@ -994,6 +1015,120 @@ export class Job {
       }
     }
     await Promise.all(fileOps);
+
+    await this.installDependencies();
+  }
+
+  /**
+   * Install request-declared pip dependencies into a per-job dir BEFORE the
+   * jail runs. Wheels only (`--only-binary=:all:`) so no package build/setup.py
+   * code executes at install time; the installer runs as the per-job UID with a
+   * minimal env (no inherited secrets), a wall-clock timeout, and a post-install
+   * size cap. A failure here throws, so `execute()` never runs user code against
+   * a partial environment. The result is mounted READ-ONLY into the jail
+   * (see safeCall / renderJobConfigOverlay); the jail itself gains no network.
+   */
+  private async installDependencies(): Promise<void> {
+    const pipSpecs = this.dependencies?.pip;
+    if (!pipSpecs || pipSpecs.length === 0) return;
+
+    const identity = this.sandboxIdentity();
+    const workspaceId = this.workspaceLease?.workspaceId ?? nanoid();
+    const parent = path.dirname(this.submissionDir);
+    const depsDir = path.join(parent, `deps_${workspaceId}`);
+    const reqPath = path.join(parent, `deps_req_${workspaceId}.txt`);
+
+    await fsp.mkdir(depsDir, { recursive: true, mode: 0o711 });
+    await applySandboxPathPermissions(depsDir, identity, 0o711);
+    this.depsDir = depsDir;
+
+    await fsp.writeFile(reqPath, pipSpecs.join('\n') + '\n', { mode: 0o600 });
+    await applySandboxPathPermissionsNoFollow(reqPath, identity, 0o400, 'file');
+
+    const requireHashes = pipSpecs.some(s => s.includes('--hash='));
+    const pipPath = path.join(this.runtime.pkgdir, 'bin', 'pip3');
+    const args = [
+      'install',
+      '--requirement', reqPath,
+      '--target', depsDir,
+      '--only-binary=:all:',
+      '--no-input',
+      '--disable-pip-version-check',
+      '--no-cache-dir',
+      '--index-url', config.dependency_index_url,
+    ];
+    if (requireHashes) args.push('--require-hashes');
+
+    if (!this.isSynthetic) {
+      this.log.info({ count: pipSpecs.length, requireHashes }, 'Installing pip dependencies');
+    }
+
+    try {
+      await this.runInstaller(pipPath, args, depsDir, identity);
+    } finally {
+      await fsp.rm(reqPath, { force: true }).catch(() => {});
+    }
+
+    const installedBytes = await dirSizeBytes(depsDir);
+    if (installedBytes > config.dependency_max_bytes) {
+      throw new ValidationError(
+        `installed dependencies (${installedBytes} bytes) exceed the limit of ${config.dependency_max_bytes} bytes`,
+      );
+    }
+    if (!this.isSynthetic) {
+      this.log.info({ bytes: installedBytes }, 'Dependencies installed');
+    }
+  }
+
+  private runInstaller(
+    pipPath: string,
+    args: string[],
+    depsDir: string,
+    identity: SandboxJobIdentity,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      // Minimal env: the installer inherits none of the runner's secrets, only
+      // what pip needs to run and reach the allowlisted index over HTTPS.
+      const env: Record<string, string> = {
+        PATH: `${path.join(this.runtime.pkgdir, 'bin')}:/usr/local/bin:/usr/bin:/bin`,
+        HOME: depsDir,
+        PIP_DISABLE_PIP_VERSION_CHECK: '1',
+        PYTHONDONTWRITEBYTECODE: '1',
+      };
+      const child = spawn(pipPath, args, {
+        cwd: depsDir,
+        env,
+        uid: identity.uid,
+        gid: identity.gid,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: config.dependency_install_timeout_ms,
+        killSignal: 'SIGKILL',
+      });
+
+      const MAX_LOG = 16 * 1024;
+      let errTail = '';
+      const capture = (chunk: Buffer): void => {
+        if (errTail.length < MAX_LOG) errTail += chunk.toString('utf8');
+      };
+      child.stdout?.on('data', capture);
+      child.stderr?.on('data', capture);
+
+      child.on('error', err => reject(new ValidationError(`dependency install failed to start: ${err.message}`)));
+      child.on('close', (code, signal) => {
+        if (code === 0) {
+          resolve();
+          return;
+        }
+        const reason = signal === 'SIGKILL'
+          ? 'dependency install timed out or was killed'
+          : `dependency install failed (exit ${code})`;
+        // Single-line: the service maps sandbox errors to the client by matching
+        // a one-line "Error from sandbox: ..." string, so newlines from pip's
+        // multi-line output would otherwise degrade to a generic 500.
+        const detail = errTail.slice(-1024).replace(/\s+/g, ' ').trim();
+        reject(new ValidationError(`${reason}: ${detail}`));
+      });
+    });
   }
 
   private fileEgressBaseUrl(): string {
@@ -2256,6 +2391,13 @@ export class Job {
       HOME: '/mnt/data',
     };
 
+    if (this.depsDir) {
+      // Dynamically installed deps live read-only at /mnt/deps; prepend so they
+      // take precedence over the baked-in site-packages. Set after spreading
+      // runtime.env_vars so this wins over any PYTHONPATH from the runtime .env.
+      envVars.PYTHONPATH = envVars.PYTHONPATH ? `/mnt/deps:${envVars.PYTHONPATH}` : '/mnt/deps';
+    }
+
     let extraPkgdirs: string[] | undefined;
     if (this.runtime.language === 'bash') {
       const linkTarget: { nodeModulesPath?: string } = {};
@@ -2276,6 +2418,7 @@ export class Job {
       identity: this.sandboxIdentity(),
       enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
       suppressSuccessLogs: this.isSynthetic,
+      depsDir: this.depsDir,
     });
   }
 
@@ -3011,6 +3154,17 @@ export class Job {
     let workspaceRemoved = true;
     const workspaceLease = this.workspaceLease;
     const jobIdentity = this.jobIdentity;
+
+    if (this.depsDir) {
+      const depsDir = this.depsDir;
+      try {
+        await fsp.rm(depsDir, { recursive: true, force: true });
+      } catch (error) {
+        this.log.error({ depsDir, err: error }, 'Failed to remove per-job dependency dir');
+      } finally {
+        this.depsDir = undefined;
+      }
+    }
 
     if (workspaceLease) {
       try {

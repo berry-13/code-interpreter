@@ -115,6 +115,43 @@ isolation than the default microVM mode. It is appropriate for local
 development and trusted use, not for executing untrusted code from people you
 don't trust; see the [Security disclaimer](#security-disclaimer) above.
 
+### Dynamic dependencies
+
+Beyond the runtimes baked into the packages volume, an exec request can
+declare extra Python packages to install just for that job. This is **off by
+default**; enable it with `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES=true`.
+
+```bash
+curl -X POST http://localhost:3112/v1/exec -H 'Content-Type: application/json' -d '{
+  "lang": "python",
+  "code": "import cowsay; cowsay.cow(\"hello\")",
+  "dependencies": { "pip": ["cowsay==6.1"] }
+}'
+```
+
+Each entry must be a pinned `name==version` spec and may carry one or more
+` --hash=sha256:...` options (when any package is hashed, all must be, and pip
+runs with `--require-hashes`). Installs happen **before** user code runs, in
+the trusted runner, using `pip --only-binary=:all:` — only prebuilt wheels are
+used, so **no package build or setup.py code executes at install time**. The
+result is mounted read-only into the sandbox on `PYTHONPATH`; the sandbox
+itself still has no network.
+
+How the security boundary is preserved, and its limits:
+
+- The sandbox gains no new capability — only the trusted runner fetches from
+  the index (`CODEAPI_DEPENDENCY_INDEX_URL`, default PyPI), so enabling this
+  requires the runner to have outbound HTTPS to that index.
+- Packages without a prebuilt wheel for the runtime (CPython + arch) are
+  rejected rather than built from source. Native/source-only packages are not
+  supported in this mode.
+- Limits: `CODEAPI_DEPENDENCY_MAX_COUNT`,
+  `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS`, `CODEAPI_DEPENDENCY_MAX_BYTES`.
+- Only trusted infrastructure runs `pip` (as the per-job UID, with a minimal
+  env); the untrusted user code runs afterward under the unchanged hardened
+  sandbox. Still, enable it only when you accept installing operator-allowed
+  packages from the configured index.
+
 ## LibreChat integration
 
 LibreChat talks to this service over HTTP. Point it at the **API** component,

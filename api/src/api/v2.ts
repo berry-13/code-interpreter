@@ -13,6 +13,7 @@ import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
 import { classifySandboxSafeError } from '../safe-error';
 import { withSpan } from '../telemetry';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
+import { resolveDependencies } from '../dependencies';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
@@ -44,6 +45,7 @@ export interface ExecuteRequestBody {
    *  `/mnt/data` back to `output_session_id/<file_id>`. Covered by the manifest
    *  body hash like every other field. */
   persist_session?: { file_id: string; filename: string; restore_session_id?: string };
+  dependencies?: { pip?: string[] };
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;
@@ -199,12 +201,18 @@ function getJob(
     );
   }
 
+  const dependencies = resolveDependencies(body.dependencies, rt.language, {
+    allow: config.allow_dynamic_dependencies,
+    maxCount: config.dependency_max_count,
+  });
+
   return new Job({
     session_id: session_id ?? null,
     runtime: rt,
     args: args ?? [],
     stdin: stdin ?? '',
     files: effectiveFiles,
+    dependencies,
     timeouts: {
       run: run_timeout ?? rt.timeouts.run,
       compile: compile_timeout ?? rt.timeouts.compile,
