@@ -20,12 +20,12 @@ export const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://codeapi.berr
 /**
  * LibreChat instance the "Open in LibreChat" page action points at.
  *
- * Defaults to the public demo, since LibreChat is self-hosted and readers of
- * these docs will not all have an instance. Point it at your own deployment
- * with `NEXT_PUBLIC_LIBRECHAT_URL`, or set it empty to drop the menu entry.
+ * Defaults to the public instance, since LibreChat is self-hosted and readers
+ * of these docs will not all have one. Point it at your own deployment with
+ * `NEXT_PUBLIC_LIBRECHAT_URL`, or set it empty to drop the menu entry.
  */
 export const libreChatUrl =
-  process.env.NEXT_PUBLIC_LIBRECHAT_URL ?? 'https://demo.librechat.ai';
+  process.env.NEXT_PUBLIC_LIBRECHAT_URL ?? 'https://chat.librechat.ai';
 
 export const gitConfig = {
   user: 'berry-13',
