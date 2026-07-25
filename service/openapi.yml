@@ -3,7 +3,7 @@ info:
   title: Code Interpreter API
   version: '2.0.0'
   description: |
-    Public HTTP API of the Code Interpreter service (internally `codeapi`) — the
+    Public HTTP API of the Code Interpreter service (internally `codeapi`), the
     component LibreChat talks to. It accepts code-execution requests, runs them
     in an isolated sandbox, and manages the files those runs read and produce.
 
@@ -14,11 +14,11 @@ info:
     **Authentication.** Two modes are supported, selected by
     `CODEAPI_AUTH_PROVIDER` on the service:
 
-    - `librechat-jwt` (default) — a short-lived EdDSA (Ed25519) JWT in
+    - `librechat-jwt` (default), a short-lived EdDSA (Ed25519) JWT in
       `Authorization: Bearer <token>`, signed by LibreChat and verified here.
       Tokens are capped at 300 s (`CODEAPI_JWT_MAX_TTL_SECONDS`) with 30 s of
       clock-skew tolerance.
-    - `none` — no authentication; the user id is taken from the `User-Id`
+    - `none`: no authentication; the user id is taken from the `User-Id`
       header, then the request body `user_id`, then `anonymous`. Refuses to
       start unless `CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true`.
 
@@ -69,9 +69,9 @@ components:
         Which resource a file belongs to, which in turn decides the storage
         namespace the service derives:
 
-        - `user` — user-private. Chat attachments and code-output artifacts.
-        - `agent` — shared across the users of one agent.
-        - `skill` — shared, and additionally scoped by `version`.
+        - `user`: user-private. Chat attachments and code-output artifacts.
+        - `agent`: shared across the users of one agent.
+        - `skill`: shared, and additionally scoped by `version`.
 
     RequestFile:
       type: object
@@ -87,7 +87,7 @@ components:
         resource_id:
           type: string
           description: |
-            Identity of the entity owning the file's storage session — the skill
+            Identity of the entity owning the file's storage session, the skill
             id for `kind: skill`, the agent id for `agent`. Informational for
             `user` (the namespace derives from the auth context instead).
             Distinct from `id`, which is the storage uuid.
@@ -126,7 +126,7 @@ components:
       type: object
       description: |
         Request-declared packages installed for this job only, before user code
-        runs. **Off by default** — enable with
+        runs. **Off by default**: enable with
         `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES=true`, otherwise a request carrying
         this field is rejected.
 
@@ -183,7 +183,7 @@ components:
     ExecResponse:
       type: object
       description: |
-        Note the flat shape — `stdout`/`stderr` sit at the top level, not nested
+        Note the flat shape, `stdout`/`stderr` sit at the top level, not nested
         under a `run` object.
       required: [session_id, stdout, stderr, files]
       properties:
@@ -228,7 +228,7 @@ components:
           description: |
             Only meaningful with `CODEAPI_PERSIST_SESSIONS=true`. True when this
             run wrote a fresh workspace snapshot; false when the snapshot was
-            skipped (for example, over `CODEAPI_SESSION_STATE_MAX_BYTES`) — the
+            skipped (for example, over `CODEAPI_SESSION_STATE_MAX_BYTES`): the
             run still succeeded and the previous state stays current.
         session_state_restore_failed:
           type: boolean
@@ -354,7 +354,7 @@ components:
           type: string
         id:
           type: string
-          description: Storage file id — pass this as `RequestFile.id` on `/exec`.
+          description: Storage file id, pass this as `RequestFile.id` on `/exec`.
         storage_session_id:
           type: string
         size:
@@ -484,7 +484,7 @@ paths:
         Rate limited to 20 requests per 30 s per principal by default
         (`MAX_REQUESTS` / `RATE_LIMIT_WINDOW`).
 
-        With `CODEAPI_PERSIST_SESSIONS=true` this route — and only this route —
+        With `CODEAPI_PERSIST_SESSIONS=true` this route (and only this route)
         continues the caller's previous run: files left in `/mnt/data` and, for
         Python, the global namespace are restored automatically.
       requestBody:
@@ -525,7 +525,7 @@ paths:
         '200':
           description: |
             The run completed. A non-zero `code` or a non-null `signal` means
-            the user's program failed — that is still a `200`, since the service
+            the user's program failed: that is still a `200`, since the service
             performed its job correctly.
           content:
             application/json:
@@ -557,7 +557,7 @@ paths:
         `tool_calls`; send the results back with that token to resume.
 
         Supports Python and Bash. **Persistent sessions do not apply to this
-        route** — even with `CODEAPI_PERSIST_SESSIONS=true`, programmatic runs
+        route**: even with `CODEAPI_PERSIST_SESSIONS=true`, programmatic runs
         get a cold workspace and namespace every time.
       requestBody:
         required: true
@@ -668,7 +668,7 @@ paths:
       summary: Upload files as one batch
       description: |
         Same contract as `/upload`, tuned for writing many files into a single
-        storage session in one request — the shape skill bundles use.
+        storage session in one request, the shape skill bundles use.
       requestBody:
         required: true
         content:
@@ -724,7 +724,7 @@ paths:
           required: true
           schema:
             type: string
-          description: Storage session id — for run outputs, the `session_id` from the exec response.
+          description: Storage session id, for run outputs, the `session_id` from the exec response.
         - name: detail
           in: query
           required: false
@@ -800,7 +800,7 @@ paths:
       tags: [Files]
       summary: Get file metadata
       description: |
-        Returns one object's metadata without its bytes — used for freshness
+        Returns one object's metadata without its bytes, used for freshness
         checks, so a caller can tell whether a previously uploaded bundle is
         still present before re-uploading it.
       parameters:

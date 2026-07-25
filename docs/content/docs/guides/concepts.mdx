@@ -1,6 +1,6 @@
 ---
 title: Core concepts
-description: The vocabulary the API uses — sessions, storage, principals, and what "isolated" actually means here.
+description: The vocabulary the API uses, sessions, storage, principals, and what "isolated" actually means here.
 icon: Lightbulb
 ---
 
@@ -32,11 +32,11 @@ run.
 
 | Field | Meaning |
 | --- | --- |
-| `session_id` | The top-level execution — one `/exec` invocation. Also the storage prefix for that run's **outputs**. |
+| `session_id` | The top-level execution: one `/exec` invocation. Also the storage prefix for that run's **outputs**. |
 | `storage_session_id` | Per-file. The storage session where a particular file's **bytes** actually live. |
 
 A file you uploaded earlier lives under the `storage_session_id` the upload
-returned. When you reference it on a later `/exec` call, you pass that value —
+returned. When you reference it on a later `/exec` call, you pass that value:
 not the id of the execution you are about to start.
 
 <Callout type="info">
@@ -51,7 +51,7 @@ it, never send it, and never see it.
 
 The service derives it server-side from the authenticated principal and the
 resource a file belongs to. Since it is derived rather than supplied, a caller
-cannot address another caller's namespace by guessing or forging an id — there
+cannot address another caller's namespace by guessing or forging an id: there
 is no field in which to forge it. It is also bound into the signed
 [execution manifest](/docs/developers/security-model#execution-manifests), so
 the sandbox cannot widen its own access after the fact.
@@ -69,7 +69,7 @@ decides the namespace the sessionKey derives:
 
 `version` is **required** when `kind` is `skill` and **rejected** for the other
 kinds. Because a skill's version counter is monotonic, editing a skill
-naturally invalidates the previous cache entry — the new version derives a
+naturally invalidates the previous cache entry: the new version derives a
 different sessionKey.
 
 Outputs are always `user`-scoped, regardless of the kinds of the inputs. A run
@@ -80,7 +80,7 @@ user's private namespace.
 
 Inside the sandbox, code runs in `/mnt/data`. That directory is:
 
-- **Fresh for every execution** by default — created, used, destroyed.
+- **Fresh for every execution** by default: created, used, destroyed.
 - **Writable**, unlike almost everything else in the sandbox.
 - **Where input files are staged**, under the `name` you gave them.
 - **Where output files are collected from** when the run finishes.
@@ -133,7 +133,7 @@ untrusted code from people you don't trust.
 </Tabs>
 
 In both modes the sandbox has **no network access**. Everything it needs from
-the outside — reading input files, writing outputs, calling tools — goes
+the outside (reading input files, writing outputs, calling tools) goes
 through the [egress gateway](/docs/developers/egress), which enforces a signed,
 scoped capability naming exactly which objects that specific run may touch.
 
@@ -149,7 +149,7 @@ The stack is several independently scalable services rather than one process:
 | **File server** | 3000 | S3-backed object storage for session files. |
 | **Tool call server** | 3033 | Routes tool calls from inside sandboxes back to the caller. |
 | **Egress gateway** | 3190 | The only network path out of a sandbox; enforces capabilities. |
-| **package_init** | — | One-shot job that installs language runtimes onto a shared volume. |
+| **package_init** | n/a | One-shot job that installs language runtimes onto a shared volume. |
 
 Plus Redis (job queue and session pointers) and S3-compatible storage (MinIO
 locally). See [Architecture](/docs/developers/architecture) for how they fit

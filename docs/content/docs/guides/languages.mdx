@@ -13,10 +13,10 @@ only what you need.
 
 | Language | `lang` value | Pinned version | Notes |
 | --- | --- | --- | --- |
-| Python | `py` | 3.14.4 | The richest runtime — see the package set below. |
+| Python | `py` | 3.14.4 | The richest runtime: see the package set below. |
 | Node.js | `node` | 24.15.0 | Runs `.js` with a curated offline npm set. |
 | Bun | `ts`, `js` | 1.3.14 | JavaScript and TypeScript, same offline package set. |
-| Bash | `bash` | — | Shell scripting. |
+| Bash | `bash` | n/a | Shell scripting. |
 | Java | `java` | 21.0.11 (Temurin) | JVM. |
 
 ## Choosing what to install
@@ -107,7 +107,7 @@ available offline:
 </Accordion>
 </Accordions>
 
-Matplotlib gets special handling — the service wraps plotting code so figures
+Matplotlib gets special handling: the service wraps plotting code so figures
 are captured and returned as files automatically. Just `savefig` and the image
 comes back in the response's `files` array.
 
@@ -120,7 +120,7 @@ Node and Bun share one curated offline set, pinned for reproducibility in
 `gray-matter`, `dayjs`, `winston`, `commander`, `yargs`, `handlebars`, and
 more.
 
-Bun handles both `.js` and `.ts` directly — no build step for TypeScript.
+Bun handles both `.js` and `.ts` directly: no build step for TypeScript.
 
 ## Overriding versions
 
@@ -142,9 +142,9 @@ Available: `PYTHON_VERSION`/`PYTHON_SHA256`, `NODE_VERSION`/`NODE_SHA256`,
 
 Two options, in increasing order of commitment:
 
-1. **[Dynamic dependencies](/docs/guides/dependencies)** — let a request declare
+1. **[Dynamic dependencies](/docs/guides/dependencies)**: let a request declare
    pinned pip packages installed just for that job. Off by default, wheels only.
-2. **Extend the package set** — edit `build-packages.sh` (Python) or
+2. **Extend the package set**: edit `build-packages.sh` (Python) or
    `javascript-packages.txt` (JS/TS) and rebuild the volume with
    `FORCE_REBUILD=true`. This bakes them in for every run.
 
@@ -162,5 +162,5 @@ image, and they are not part of the tested configuration.
 A request names a `lang`; the service maps it to a language and version range,
 and the sandbox runner picks the **newest installed runtime matching that
 range**. If nothing matches, the request fails with a `400` naming the
-unsupported language — usually meaning that runtime was excluded by
+unsupported language: usually meaning that runtime was excluded by
 `CODEAPI_LANGUAGES`.

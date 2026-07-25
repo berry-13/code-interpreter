@@ -50,7 +50,7 @@ sequenceDiagram
 <Step>
 ### Rate limiting
 
-`executionLimiter` — 20 requests per 30 s per principal by default, Redis-backed
+`executionLimiter`: 20 requests per 30 s per principal by default, Redis-backed
 so it holds across API replicas.
 </Step>
 
@@ -82,7 +82,7 @@ failure.
 ### File authorization
 
 `authorizeRequestedFiles` checks every referenced input against the caller's
-derived namespace. A reference the caller does not own fails here — before any
+derived namespace. A reference the caller does not own fails here: before any
 capability is minted.
 
 The hidden persistent-session snapshot is explicitly rejected if referenced by
@@ -102,7 +102,7 @@ A fresh `session_id` and `execution_id` are minted, and
 <Step>
 ### Payload construction
 
-`createPayload` builds the job. Notably `isPyPlot` — a static scan of *this
+`createPayload` builds the job. Notably `isPyPlot`: a static scan of *this
 run's own source* for `import matplotlib` or `import seaborn`. When true, the
 code is embedded in the matplotlib template so figures are captured.
 
@@ -120,8 +120,8 @@ known, smaller limitation.
 ### Persistence injection
 
 With `CODEAPI_PERSIST_SESSIONS=true`, the worker path marks the payload to
-snapshot `/mnt/data` back to this run's output session, and — if a prior
-snapshot exists — injects it as a **synthetic input file**.
+snapshot `/mnt/data` back to this run's output session, and (if a prior
+snapshot exists) injects it as a **synthetic input file**.
 
 Being an ordinary input file, its `storage_session_id` flows into the manifest's
 `read_sessions` and `input_files`, authorizing the fetch with no special case in
@@ -143,14 +143,14 @@ completion event and returns the result.
 
 The worker builds the security envelope:
 
-**Execution manifest claims** — principal, tenant, session key, the input files
+**Execution manifest claims**: principal, tenant, session key, the input files
 this run may read, the output session it may write, and budgets
 (`EXECUTION_MANIFEST_MAX_UPLOAD_BYTES`, `MAX_OUTPUT_FILES`, `MAX_REQUESTS`).
 
-**Egress grant** — an encrypted capability over the same scope, recorded in the
+**Egress grant**: an encrypted capability over the same scope, recorded in the
 Redis **egress ledger** with counters the gateway decrements.
 
-**Signature** — `buildSandboxExecuteRequest` computes
+**Signature**: `buildSandboxExecuteRequest` computes
 `executionManifestBodySha256(body)` and signs the claims together with that
 hash, `iat`, and `exp`.
 
@@ -181,7 +181,7 @@ key**, then expiry, not-before, and the body hash. A mismatch on any of these is
 rejected with one of: `missing_header`, `malformed`, `invalid_signature`,
 `expired`, `not_yet_valid`, `scope_mismatch`.
 
-The body hash is what makes the manifest non-transferable — a manifest signed
+The body hash is what makes the manifest non-transferable: a manifest signed
 for one request cannot be replayed onto a different one.
 </Step>
 
@@ -199,7 +199,7 @@ tool-call socket requires the manifest to both allow it *and* be body-bound.
 ### Workspace lease
 
 `workspace-isolation.ts` leases a fresh workspace under `/tmp/sandbox/ws_*` with
-mode `0711` — non-listable, but traversable, which NsJail's bind-mount setup
+mode `0711`: non-listable, but traversable, which NsJail's bind-mount setup
 requires.
 
 With `SANDBOX_PER_JOB_UIDS=true`, a distinct UID/GID from a pool based at
@@ -235,7 +235,7 @@ See [Dynamic dependencies](/docs/guides/dependencies).
 seccomp policy, cgroup limits, rlimits, and UID mapping. In microVM mode this
 all happens *inside* the libkrun guest, which the Rust launcher booted.
 
-`nsjail-setup-gate.ts` serialises setup with a watchdog —
+`nsjail-setup-gate.ts` serialises setup with a watchdog:
 `codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total` should stay at zero.
 </Step>
 
@@ -254,8 +254,8 @@ a new file created. Symlinks are stripped; permissions are restored.
 ### Snapshot
 
 With persistence on, `/mnt/data` is tarred and uploaded under the run's output
-session. Oversize snapshots (`CODEAPI_SESSION_STATE_MAX_BYTES`) are **skipped —
-the run still succeeds** — and the response reports
+session. Oversize snapshots (`CODEAPI_SESSION_STATE_MAX_BYTES`) are **skipped
+(the run still succeeds**) and the response reports
 `session_state_persisted: false`.
 </Step>
 
@@ -274,20 +274,20 @@ session pointer with a **compare-and-swap**.
 
 <Callout type="warn" title="First writer wins">
 Concurrent runs that restored the same snapshot race here. The first to finish
-and publish advances the session; the later finisher's snapshot is **discarded —
+and publish advances the session; the later finisher's snapshot is **discarded:
 never merged, never rolled back**. A refcount on in-flight restores stops a
 concurrent run from deleting a snapshot another run is still restoring from.
 </Callout>
 
 The pointer's TTL is refreshed on success. It is deliberately *not* refreshed
-when `session_state_restore_failed` is set — pinning a dead snapshot alive would
+when `session_state_restore_failed` is set: pinning a dead snapshot alive would
 brick the session, and letting the failure streak release the pointer is the
 intended pressure valve.
 
 ## Failure classification
 
 `api/src/safe-error.ts` decides what may be returned to a caller. Sandbox
-internals — paths, UIDs, host details — must not leak through error messages, so
+internals (paths, UIDs, host details) must not leak through error messages, so
 errors are classified into a safe public shape before crossing back.
 
 | Status | Meaning |
@@ -297,5 +297,5 @@ errors are classified into a safe public shape before crossing back.
 | `415` | Not `application/json`. |
 | `500` | Sandbox setup or execution failure. |
 
-A user program that crashes is **not** an error at this layer — it returns `200`
+A user program that crashes is **not** an error at this layer: it returns `200`
 with a non-zero `code` or a non-null `signal`.

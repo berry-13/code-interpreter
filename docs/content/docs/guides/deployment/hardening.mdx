@@ -39,7 +39,7 @@ CODEAPI_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY----
 ```
 
 If you deliberately want no authentication because something in front is
-handling it, you must say so explicitly — the service refuses to start
+handling it, you must say so explicitly, the service refuses to start
 otherwise:
 
 ```bash
@@ -67,7 +67,7 @@ openssl rand -base64 48
 ### 4. Generate your own manifest signing keypair
 
 The keypair inlined in the Compose files and in `values-local.yaml` is publicly
-known — it is the same one hardcoded in the unit tests.
+known: it is the same one hardcoded in the unit tests.
 
 ```bash
 openssl genpkey -algorithm ed25519 -out manifest-signing.pem
@@ -79,7 +79,7 @@ openssl pkey -in manifest-signing.pem -pubout -outform DER | base64    # publicK
 ```
 
 The **private** key goes to the worker only. The **public** key goes to the
-sandbox runner. Never mount the private key into the runner — the split is what
+sandbox runner. Never mount the private key into the runner: the split is what
 makes a compromised runner unable to mint its own manifests.
 
 ```bash
@@ -115,7 +115,7 @@ On Kubernetes, leave `networkPolicy.enabled=true`.
 
 On Kubernetes, `workerSandbox.seccomp.enabled=true` adds a node-level seccomp
 profile on top of NsJail's inner Kafel policy. It requires pre-installing the
-profile on every node at `/var/lib/kubelet/seccomp/profiles/nsjail.json` — see
+profile on every node at `/var/lib/kubelet/seccomp/profiles/nsjail.json`: see
 `seccomp/README.md` for the DaemonSet installer pattern.
 
 ### Apply AppArmor
@@ -132,7 +132,7 @@ next to should be other sandboxes.
 ### Set a storage lifecycle policy
 
 Abandoned [persistent sessions](/docs/guides/sessions#known-limitations) leave
-their last snapshot object in storage indefinitely — the Redis pointer expires,
+their last snapshot object in storage indefinitely: the Redis pointer expires,
 but that expiry does not delete the object it referenced. Configure a lifecycle
 or expiry policy on the bucket or prefix to reclaim it.
 
@@ -156,7 +156,7 @@ denial-of-service budget you are handing to untrusted code.
 [Dynamic dependencies](/docs/guides/dependencies) are **off by default**.
 Enabling them means the trusted runner fetches operator-allowed packages from
 your configured index at job time. Wheels only, so no install-time code
-executes — but it is still a supply-chain surface you are opting into. If you
+executes, but it is still a supply-chain surface you are opting into. If you
 enable it, consider pointing `CODEAPI_DEPENDENCY_INDEX_URL` at an internal
 mirror you control.
 
@@ -165,7 +165,7 @@ mirror you control.
 Once deployed, confirm the posture:
 
 ```bash
-# Auth is actually enforced — this should NOT return 200
+# Auth is actually enforced: this should NOT return 200
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://your-host/v1/exec \
   -H 'Content-Type: application/json' \
   -d '{"lang":"py","code":"print(1)"}'

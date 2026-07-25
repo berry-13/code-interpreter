@@ -88,8 +88,8 @@ openssl pkey -in jwt-codeapi.key -pubout -out jwt-codeapi.pub
 
 ### Configure LibreChat (the signer)
 
-LibreChat populates the required claims — `iss`, `aud`, `sub`, `jti`, `iat`,
-`nbf`, `exp`, `principal_source`, `auth_context_hash` — automatically.
+LibreChat populates the required claims (`iss`, `aud`, `sub`, `jti`, `iat`,
+`nbf`, `exp`, `principal_source`, `auth_context_hash`) automatically.
 
 ```bash title="LibreChat .env"
 LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1
@@ -142,8 +142,8 @@ unauthenticated access with extra steps.
 Instead of a single `CODEAPI_JWT_PUBLIC_KEY` + `CODEAPI_JWT_KID`, the verifier
 also accepts:
 
-- `CODEAPI_JWT_JWKS_JSON` — an inline JWKS document
-- `CODEAPI_JWT_PUBLIC_KEYS_DIR` — a directory of PEM files named by `kid`
+- `CODEAPI_JWT_JWKS_JSON` (an inline JWKS document
+- `CODEAPI_JWT_PUBLIC_KEYS_DIR`) a directory of PEM files named by `kid`
 
 Both let you serve several verifier keys at once, so you can introduce a new
 signing key before retiring the old one.
@@ -178,7 +178,7 @@ curl -sX POST http://codeapi-host:3112/v1/exec \
 ```
 
 If that returns `stdout: "connected\n"`, both sides agree. If it returns `401`,
-work through [the matching table](#what-must-match-on-both-sides) — issuer,
+work through [the matching table](#what-must-match-on-both-sides): issuer,
 audience, `kid`, and algorithm all have to line up exactly.
 
 See [Troubleshooting](/docs/guides/troubleshooting) for specific failure modes.

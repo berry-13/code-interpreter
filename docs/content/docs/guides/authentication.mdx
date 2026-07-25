@@ -7,7 +7,7 @@ icon: KeyRound
 Authentication decides one thing that matters enormously: **which principal a
 request runs as**. The principal is what the storage namespace derives from, so
 it is the boundary between one user's files and another's. Get it wrong and
-every caller shares one namespace — or worse, executes code with no identity at
+every caller shares one namespace, or worse, executes code with no identity at
 all.
 
 ## The three modes
@@ -31,7 +31,7 @@ LOCAL_MODE=true
 ```
 
 The default in every local Compose file. Every request is stamped with a fixed
-local principal — no header, no token, no check.
+local principal: no header, no token, no check.
 
 This means **anyone who can reach port 3112 can execute arbitrary code**. Bind
 it to loopback and nothing else.
@@ -125,7 +125,7 @@ survivable in `.env` files and Kubernetes secrets.
 CODEAPI_JWT_JWKS_JSON='{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"lc-codeapi-1","x":"..."}]}'
 ```
 
-An inline JWKS document. Serves several keys at once — the natural fit for
+An inline JWKS document. Serves several keys at once: the natural fit for
 rotation.
 
 </Tab>
@@ -161,7 +161,7 @@ key still verify.
 <Step>
 ### Wait out the old tokens
 
-At most `CODEAPI_JWT_MAX_TTL_SECONDS` — five minutes by default.
+At most `CODEAPI_JWT_MAX_TTL_SECONDS`: five minutes by default.
 </Step>
 <Step>
 ### Remove the old public key

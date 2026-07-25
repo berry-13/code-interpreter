@@ -5,7 +5,7 @@ icon: Server
 ---
 
 The repository ships several Compose files and a Helm chart. They are not
-alternatives to pick arbitrarily — each targets a specific situation.
+alternatives to pick arbitrarily: each targets a specific situation.
 
 ## Pick a path
 
@@ -17,7 +17,7 @@ alternatives to pick arbitrarily — each targets a specific situation.
   />
   <Card
     title="Without KVM"
-    description="Hosts with no usable /dev/kvm. Weaker isolation — read the caveat."
+    description="Hosts with no usable /dev/kvm. Weaker isolation: read the caveat."
     href="/docs/guides/deployment/without-kvm"
   />
   <Card
@@ -41,7 +41,7 @@ alternatives to pick arbitrarily — each targets a specific situation.
 | `docker-compose.nokvm.yml` | **Override** layered onto the default file to disable the microVM. |
 | `docker-compose.scalable.yml` | Multi-worker topology, closer to how the Helm chart lays things out. |
 | `docker-compose.scalable.nokvm.yml` | The no-KVM override for the scalable stack. |
-| `docker-compose.local-dev.yml` | Development conveniences — source mounts and faster rebuild loops. |
+| `docker-compose.local-dev.yml` | Development conveniences: source mounts and faster rebuild loops. |
 | `docker-compose.mac.yml` | macOS adjustments. |
 
 The `.nokvm.yml` files are overrides, not standalone stacks. Layer them:
@@ -60,7 +60,7 @@ CODEAPI_LANGUAGES=python docker compose up --build
 ```
 
 **No `/dev/kvm` on the host?** Layer the no-KVM override, and read
-[the isolation caveat](/docs/guides/deployment/without-kvm) — this is a real
+[the isolation caveat](/docs/guides/deployment/without-kvm): this is a real
 reduction in the security boundary, not a formality.
 
 **Running this for other people?** Use the

@@ -15,12 +15,12 @@ This builds every image from source and brings up nine services:
 | Service | Container | Published port | Role |
 | --- | --- | --- | --- |
 | `api` | `api` | `3112` | Public HTTP API |
-| `service-worker` | `service-worker` | — | Job consumer |
+| `service-worker` | `service-worker` | n/a | Job consumer |
 | `sandbox-runner` | `sandbox-runner` | `2000` | Executes code |
 | `file_server` | `file_server` | `13000` → 3000 | Object storage front end |
-| `tool_call_server` | `tool_call_server` | — | Tool call routing |
+| `tool_call_server` | `tool_call_server` | n/a | Tool call routing |
 | `egress_gateway` | `egress_gateway` | `3190` | Sandbox egress control |
-| `package_init` | `package_init` | — | One-shot runtime installer |
+| `package_init` | `package_init` | n/a | One-shot runtime installer |
 | `redis` | `redis` | `16379` → 6379 | Queue and session pointers |
 | `minio` | `minio` | `19000`, `19001` | S3-compatible storage |
 
@@ -76,7 +76,7 @@ docker compose -f docker-compose.scalable.yml up --build
 
 This separates the worker and sandbox into a scalable pair, mirroring how the
 Helm chart lays out the `worker-sandbox` pod. Use it when you want to exercise
-multi-worker behaviour — queue depth, job distribution, concurrency limits —
+multi-worker behaviour (queue depth, job distribution, concurrency limits)
 on a single host before deploying to Kubernetes.
 
 Its no-KVM companion is `docker-compose.scalable.nokvm.yml`:
@@ -101,9 +101,9 @@ configuration:
 
 | Variable | Local default | Must change in production |
 | --- | --- | --- |
-| `LOCAL_MODE` | `true` | **Yes** — this disables authentication entirely |
+| `LOCAL_MODE` | `true` | **Yes**: this disables authentication entirely |
 | `CODEAPI_INTERNAL_SERVICE_TOKEN` | `localdev-internal-service-token` | **Yes** |
-| `CODEAPI_EGRESS_GRANT_SECRET` | `localdev-egress-grant-secret-change-me-32b` | **Yes** — needs 32+ bytes |
+| `CODEAPI_EGRESS_GRANT_SECRET` | `localdev-egress-grant-secret-change-me-32b` | **Yes**: needs 32+ bytes |
 | `CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY` | a known test key | **Yes** |
 | `SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY` | the matching test key | **Yes** |
 | `REDIS_PASSWORD` | `localdev` | **Yes** |
@@ -112,7 +112,7 @@ configuration:
 <Callout type="error" title="These are publicly known values">
 The manifest keypair inlined in the Compose files is the same one hardcoded in
 the unit tests. Anyone can read it out of the repository. It exists so `docker
-compose up` works with zero setup — it provides no security whatsoever.
+compose up` works with zero setup: it provides no security whatsoever.
 </Callout>
 
 Work through [production hardening](/docs/guides/deployment/hardening) before

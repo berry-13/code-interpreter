@@ -1,6 +1,6 @@
 ---
 title: The egress model
-description: How anything gets out of a sandbox that has no network — the gateway, grants, and the ledger.
+description: How anything gets out of a sandbox that has no network, the gateway, grants, and the ledger.
 icon: DoorOpen
 ---
 
@@ -11,7 +11,7 @@ giving untrusted code a credential.
 ## The problem
 
 A sandbox needs to read its input files. The naive solution is to give it
-credentials for the file server — which hands untrusted code the ability to read
+credentials for the file server, which hands untrusted code the ability to read
 *any* file the service can reach.
 
 The gateway replaces that credential with a **capability**: a token that names
@@ -98,7 +98,7 @@ Require `CODEAPI_INTERNAL_SERVICE_TOKEN`:
 ```
 
 Grants are **encrypted** (prefix `ceg1`, AAD `codeapi-egress-grant:v1`), not
-merely signed — the sandbox cannot read its own grant, let alone alter it.
+merely signed, the sandbox cannot read its own grant, let alone alter it.
 
 Two consequences worth stating:
 
@@ -130,7 +130,7 @@ the counter.
 CODEAPI_EGRESS_LEDGER_REQUIRED=true   # default
 ```
 
-With this on, a grant with no live ledger entry is refused outright — so a
+With this on, a grant with no live ledger entry is refused outright, so a
 grant captured from a finished execution is worthless.
 
 Mutations run through a dedicated Redis connection pool (32 connections by
@@ -148,7 +148,7 @@ because they are compare-and-swap operations under concurrency.
 The persistent-session workspace snapshot is written through the same gateway,
 but it is **not** a user output file. The gateway and ledger exempt it from
 `EGRESS_GATEWAY_MAX_FILE_BYTES` and enforce a grant cap derived from
-`CODEAPI_SESSION_STATE_MAX_BYTES` instead — which is why that is the only knob
+`CODEAPI_SESSION_STATE_MAX_BYTES` instead, which is why that is the only knob
 bounding snapshot size.
 </Callout>
 
@@ -163,7 +163,7 @@ its budget, and cannot reach the tool call server directly.
 
 Callback tokens are minted by trusted components via
 `POST /internal/ptc-callback-token`, so the sandbox never holds a
-credential — only a capability that the gateway resolves on its behalf.
+credential: only a capability that the gateway resolves on its behalf.
 
 ## Persistent-session restores
 
@@ -183,7 +183,7 @@ restore succeeded, which drives the pointer-TTL logic described in
 
 A signed grant would be readable by the sandbox, exposing the ids of every file
 in scope, the session key, and the tenant and user ids. None of that is
-information untrusted code needs. Encrypting the grant keeps it opaque — the
+information untrusted code needs. Encrypting the grant keeps it opaque: the
 sandbox holds a token it can present but not inspect.
 
 ## Failure modes
@@ -198,4 +198,4 @@ sandbox holds a token it can present but not inspect.
 | `scope_mismatch` | The requested object is not in scope. |
 
 Budget exhaustion and revocation are reported by the ledger rather than as grant
-errors, since the grant itself is still valid — it has simply run out.
+errors, since the grant itself is still valid: it has simply run out.

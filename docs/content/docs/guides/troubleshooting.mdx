@@ -33,7 +33,7 @@ kvm-ok 2>/dev/null || egrep -c '(vmx|svm)' /proc/cpuinfo
 CODEAPI_AUTH_PROVIDER=none requires CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true
 ```
 
-Working as intended — running with no authentication has to be stated twice on
+Working as intended: running with no authentication has to be stated twice on
 purpose. If you meant it, set both. If you did not, configure
 [JWT mode](/docs/guides/authentication#jwt-eddsa-mode).
 
@@ -71,7 +71,7 @@ The usual causes, in order of likelihood:
 
 1. `iss` or `aud` mismatch between signer and verifier.
 2. The `kid` in the token is not one the verifier knows.
-3. The token expired — the cap is 300 seconds.
+3. The token expired: the cap is 300 seconds.
 4. `CODEAPI_JWT_ALLOWED_ALGS` does not include the signing algorithm.
 
 Decode the token to see what it actually claims:
@@ -97,7 +97,7 @@ curl -s http://localhost:2000/api/v2/runtimes | jq '[.[].language]'
 ```
 
 If your language is missing, it was excluded by `CODEAPI_LANGUAGES`. Add it and
-restart — only the missing runtime is installed.
+restart: only the missing runtime is installed.
 
 Also check you are sending the right value: `py` (not `python`), `js`, `ts`,
 `node`, `bash`, `java`.
@@ -131,7 +131,7 @@ printing them.
 
 ### The sandbox cannot reach the network
 
-Working as intended — the sandbox has **no network access at all**. Everything
+Working as intended: the sandbox has **no network access at all**. Everything
 it needs goes through the [egress gateway](/docs/developers/egress) under a
 signed capability.
 
@@ -144,7 +144,7 @@ the sandbox) or add it to the baked-in set.
 ### `File not found` on download
 
 1. **Wrong session id.** Use the `session_id` from the exec response, or the
-   `storage_session_id` from the upload response — they are
+   `storage_session_id` from the upload response: they are
    [different things](/docs/guides/concepts#session_id-versus-storage_session_id).
 2. **Wrong principal.** File routes are scoped to the authenticated caller.
    A different user, or a different tenant, will not find it.
@@ -158,7 +158,7 @@ The file exceeded `MAX_FILE_SIZE` (25 MiB default).
 ### An output file 403s when I download it
 
 Check for `inherited: true` on the ref. That marks an unchanged passthrough of
-an input you already own — re-downloading it with the end user's session key
+an input you already own: re-downloading it with the end user's session key
 will fail, and is wasted work anyway. Skip those refs.
 
 ### Files vanish between runs
@@ -173,11 +173,11 @@ Expected without persistence. Each execution gets a fresh workspace. Enable
 Check, in order:
 
 1. `CODEAPI_PERSIST_SESSIONS=true` on **all** components.
-2. The language is Python — other languages get file persistence only.
+2. The language is Python: other languages get file persistence only.
 3. You are calling `/v1/exec`, **not** `/v1/exec/programmatic`. The programmatic
    routes [never persist](/docs/guides/sessions#known-limitations).
 4. `session_state_persisted` in the previous response. If false, the snapshot
-   was skipped — usually oversize.
+   was skipped: usually oversize.
 5. `session_state_restore_failed` in this response. If true, the snapshot could
    not be read.
 
@@ -189,7 +189,7 @@ serialized and are dropped with a warning. Data structures restore reliably.
 ### Two conversations are sharing state
 
 Also by design, and worth knowing before you ship it. Continuity is scoped to
-the authenticated user, not the conversation — no conversation id reaches the
+the authenticated user, not the conversation: no conversation id reaches the
 service. See [the limitation](/docs/guides/sessions#known-limitations).
 
 ### Storage keeps growing
@@ -202,7 +202,7 @@ object is not deleted. Set a lifecycle policy on the bucket or prefix.
 ### Jobs queue up
 
 Check `codeapi_bullmq_queue_jobs`. If it climbs steadily, add worker capacity
-or raise per-worker concurrency — see
+or raise per-worker concurrency: see
 [scaling](/docs/guides/operations#scaling).
 
 ### The first run after a deploy is slow
@@ -212,7 +212,7 @@ Cold start: runtimes page in, caches are empty. Normal.
 ### Every Python run is slow
 
 Scientific imports are expensive. If `PYTHON_CONCURRENCY=1` and Python work
-dominates, workers serialise on it — raise it if memory allows, and watch
+dominates, workers serialise on it: raise it if memory allows, and watch
 `codeapi_sandbox_execution_duration_seconds` for contention.
 
 ## Diagnostics
@@ -239,4 +239,4 @@ curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
 ## Getting help
 
 Open a GitHub issue with reproduction steps. For suspected security issues,
-**do not open a public issue** — contact the maintainers privately.
+**do not open a public issue**: contact the maintainers privately.

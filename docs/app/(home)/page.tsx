@@ -11,7 +11,7 @@ const features = [
   {
     icon: FileCode2,
     title: 'Files in and out',
-    body: 'Callers upload inputs, code reads and writes them, artifacts come back — through S3-compatible storage, namespaced per user.',
+    body: 'Callers upload inputs, code reads and writes them, artifacts come back, through S3-compatible storage, namespaced per user.',
   },
   {
     icon: Wrench,

@@ -55,7 +55,7 @@ curl -sX POST http://localhost:3112/v1/upload \
 }
 ```
 
-Keep both the `storage_session_id` and each file's `id` — you need both to
+Keep both the `storage_session_id` and each file's `id`: you need both to
 reference the file later.
 
 <Callout type="info" title="The service chooses the storage session">
@@ -69,7 +69,7 @@ caller from addressing another's files.
 | Field | Required | Purpose |
 | --- | --- | --- |
 | `file` | Yes | One or more file parts. Repeat for multiple. |
-| `kind` | Yes | `user`, `agent`, or `skill` — see [file kinds](/docs/guides/concepts#file-kinds). |
+| `kind` | Yes | `user`, `agent`, or `skill`: see [file kinds](/docs/guides/concepts#file-kinds). |
 | `id` | For shared kinds | Resource id owning the storage session. |
 | `version` | For `skill` | Required when `kind=skill`, rejected otherwise. |
 | `read_only` | No | `true` marks these as infrastructure inputs that must never be emitted back as outputs, even if code modifies them on disk. |
@@ -90,7 +90,7 @@ Exceeding the size limit returns `413`; the rate limit returns `429` with a
 ### Batch uploads
 
 `POST /v1/upload/batch` has the same contract, tuned for writing many files into
-a single storage session in one request — the shape skill bundles use.
+a single storage session in one request: the shape skill bundles use.
 
 ## Using files in a run
 
@@ -129,7 +129,7 @@ directory, so code opens it by bare filename.
 <Callout type="warn" title="Two different session ids">
 `storage_session_id` is where the file's bytes live. It is **not** the
 `session_id` of the execution you are starting. Mixing them up is the most
-common file-handling error — see [core concepts](/docs/guides/concepts#session_id-versus-storage_session_id).
+common file-handling error: see [core concepts](/docs/guides/concepts#session_id-versus-storage_session_id).
 </Callout>
 
 ## Collecting outputs
@@ -146,7 +146,7 @@ Anything the run leaves in `/mnt/data` comes back in the response's `files`:
 }
 ```
 
-For output files the `storage_session_id` equals the run's `session_id` — a run
+For output files the `storage_session_id` equals the run's `session_id`: a run
 writes its outputs under its own execution session.
 
 ### The `inherited` flag
@@ -155,7 +155,7 @@ Some refs carry `inherited: true`. That means the ref is an unchanged
 passthrough of an input you already own, not something the run created.
 
 Skip post-processing those. Re-downloading a skill- or agent-scoped input with
-the end user's session key will `403`, and it is wasted work regardless — the
+the end user's session key will `403`, and it is wasted work regardless: the
 bytes are already persisted where they came from.
 
 ### The `modified_from` field
@@ -189,7 +189,7 @@ curl -sX DELETE http://localhost:3112/v1/files/{session_id}/{fileId}
 
 The metadata route exists for freshness checks: read `lastModified` to decide
 whether a previously uploaded bundle is still present before re-uploading it.
-Without it, every priming call falls through to a fresh upload — a lot of
+Without it, every priming call falls through to a fresh upload: a lot of
 needless egress at scale.
 
 ## Access control
@@ -199,7 +199,7 @@ the storage namespace from your identity and the resource kind; requesting a
 session that derives to a different namespace fails rather than returning
 someone else's data.
 
-This is why there is no "list all my sessions" endpoint — the caller is expected
+This is why there is no "list all my sessions" endpoint: the caller is expected
 to track the session ids it received.
 
 ## Complete example

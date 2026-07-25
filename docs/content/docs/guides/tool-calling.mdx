@@ -6,7 +6,7 @@ icon: Wrench
 
 Normal `/v1/exec` runs a program to completion. **Programmatic tool calling**
 lets the program stop partway, ask the caller to run a tool, and continue with
-whatever comes back — a loop between untrusted code and your trusted
+whatever comes back: a loop between untrusted code and your trusted
 environment.
 
 ## The shape of it
@@ -117,7 +117,7 @@ A program can pause many times; keep looping while `status` is
 
 ## Reporting a tool failure
 
-Do not fabricate a result when your tool fails — say so:
+Do not fabricate a result when your tool fails, say so:
 
 ```json
 {
@@ -144,7 +144,7 @@ Python and Bash. Set `language` to `"python"` (the default) or `"bash"`.
 
 ## Files
 
-Files work exactly as on `/v1/exec` — pass a `files` array of references and
+Files work exactly as on `/v1/exec`: pass a `files` array of references and
 collect outputs from the final response. See
 [Working with files](/docs/guides/files).
 
@@ -154,7 +154,7 @@ collect outputs from the final response. See
 Even with `CODEAPI_PERSIST_SESSIONS=true`, programmatic runs get a **cold
 workspace and namespace every time**. These routes build their payload through
 a separate path that never sets the persistence marker. Only the plain
-`/v1/exec` route persists — see
+`/v1/exec` route persists: see
 [Persistent sessions](/docs/guides/sessions#known-limitations).
 </Callout>
 
@@ -169,14 +169,14 @@ Other constraints:
 
 ## The security model
 
-Tool calls leave the sandbox the same way everything else does — through the
+Tool calls leave the sandbox the same way everything else does: through the
 [egress gateway](/docs/developers/egress), under the run's signed capability.
 The sandbox cannot invent a tool call for a tool that was not declared, cannot
 exceed its request budget, and cannot reach the tool call server directly.
 
 The tool call server holds paused sessions in Redis and routes results back to
 the right execution. When `CODEAPI_INTERNAL_SERVICE_TOKEN` is set, its
-session-management routes require it — [and stay unauthenticated when it is
+session-management routes require it: [and stay unauthenticated when it is
 not](/docs/guides/authentication#internal-service-authentication).
 
 ## Related

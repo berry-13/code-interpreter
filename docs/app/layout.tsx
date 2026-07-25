@@ -10,8 +10,8 @@ const inter = Inter({
 
 export const metadata: Metadata = {
   title: {
-    default: `${appName} — sandboxed code execution for LibreChat`,
-    template: `%s — ${appName}`,
+    default: `${appName} (sandboxed code execution for LibreChat`,
+    template: `%s) ${appName}`,
   },
   description:
     'Self-hostable service that runs untrusted, model-generated code in an isolated microVM sandbox, with file storage and tool calling.',

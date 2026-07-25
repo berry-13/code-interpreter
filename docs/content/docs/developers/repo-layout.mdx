@@ -50,7 +50,7 @@ icon: FolderTree
 | `docs/` | This documentation site | Next.js + Fumadocs |
 | `build-packages.sh` | Runtime and package installer | Bash |
 
-## `service/src` — the trusted tier
+## `service/src`: the trusted tier
 
 One codebase, several entry points. Which one runs is chosen by the Dockerfile
 target.
@@ -73,7 +73,7 @@ target.
 | `execution-manifest.ts` | Signing and verifying execution manifests. |
 | `execution-manifest-claims.ts` | The claim shape. |
 | `egress-grant.ts` | Minting and parsing encrypted egress grants. |
-| `egress-ledger.ts` | Redis-backed grant ledger — budgets, revocation, counters. |
+| `egress-ledger.ts` | Redis-backed grant ledger: budgets, revocation, counters. |
 | `egress-gateway-client.ts` | Client used by trusted components. |
 | `internal-service-auth.ts` | Component-to-component shared-token auth. |
 | `session-key.ts` | Deriving the storage namespace from auth context. |
@@ -103,13 +103,13 @@ target.
 `http-limits.ts`, `lifecycle.ts` (startup and graceful shutdown),
 `redis-options.ts`, `types/`, `enum/`.
 
-## `api/src` — the sandbox runner
+## `api/src`: the sandbox runner
 
 | File | Responsibility |
 | --- | --- |
 | `index.ts` | Entry point. |
 | `api/v2.ts` | The `/api/v2` routes: `execute`, `runtimes`, `health`. |
-| `job.ts` | The big one — the whole job lifecycle: staging, fetching, running, collecting, uploading. |
+| `job.ts` | The big one, the whole job lifecycle: staging, fetching, running, collecting, uploading. |
 | `nsjail.ts` | Builds the NsJail invocation and the Kafel seccomp policy. |
 | `nsjail-setup-gate.ts` | Serialises sandbox setup, with a watchdog. |
 | `workspace-isolation.ts` | Per-job workspaces, UID pools, permissions, the reaper. |
@@ -128,7 +128,7 @@ target.
 mount table, UID/GID mapping, and default cgroup limits. Per-execution
 overrides are passed as CLI arguments by `nsjail.ts`.
 
-## `launcher/` — the microVM launcher
+## `launcher/`: the microVM launcher
 
 A single `main.rs` binding libkrun's C API through FFI:
 
@@ -139,7 +139,7 @@ krun_create_ctx() → krun_set_vm_config() → krun_set_root()
 ```
 
 It also installs a seccomp filter of its own before entering the guest.
-Deliberately tiny — it runs adjacent to untrusted code, so there is little of it
+Deliberately tiny: it runs adjacent to untrusted code, so there is little of it
 to get wrong. Built with `opt-level = "s"`, LTO, and stripped.
 
 ## Docker images
@@ -157,12 +157,12 @@ to get wrong. Built with `opt-level = "s"`, LTO, and stripped.
 
 ## Where the docs live
 
-- `docs/` — this site (Next.js + Fumadocs). Content in `docs/content/docs`.
-- `service/openapi.yml` — the public API spec, rendered into the
+- `docs/`: this site (Next.js + Fumadocs). Content in `docs/content/docs`.
+- `service/openapi.yml`: the public API spec, rendered into the
   [API reference](/docs/reference/api/execution/exec/post).
-- `api/openapi.yaml` — the internal runner spec, rendered into the
+- `api/openapi.yaml`: the internal runner spec, rendered into the
   [sandbox API reference](/docs/developers/sandbox-api/execution/execute/post).
-- `helm/codeapi/README.md`, `apparmor/README.md`, `seccomp/README.md` —
+- `helm/codeapi/README.md`, `apparmor/README.md`, `seccomp/README.md`:
   component-level notes kept next to the code.
 
 The two OpenAPI specs are the source of truth for their reference sections; the

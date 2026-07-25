@@ -1,6 +1,6 @@
 # Code Interpreter
 
-Sandboxed code execution service for LibreChat — runs untrusted,
+Sandboxed code execution service for LibreChat: runs untrusted,
 model-generated code with real isolation, file storage, and tool calling.
 
 **📖 [Documentation](https://codeapi.berry13.com)** ·
@@ -38,7 +38,7 @@ LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1
 ```
 
 The local Docker Compose files run with `LOCAL_MODE=true`, which needs no
-further setup. For anything else, configure JWT authentication — see
+further setup. For anything else, configure JWT authentication, see
 [Connecting LibreChat](https://codeapi.berry13.com/docs/guides/librechat).
 
 ## Components
@@ -48,27 +48,27 @@ storage, plus a one-shot runtime installer:
 
 | Component            | Port | Role                                                           |
 | -------------------- | ---- | -------------------------------------------------------------- |
-| **API**              | 3112 | Public HTTP entry point — authenticates, validates, enqueues   |
+| **API**              | 3112 | Public HTTP entry point: authenticates, validates, enqueues   |
 | **Worker**           | 3113 | Consumes jobs, mints signed capabilities, drives the sandbox   |
 | **Sandbox runner**   | 2000 | Executes code under NsJail, inside a microVM                   |
 | **File server**      | 3000 | S3-backed session file storage                                 |
 | **Tool call server** | 3033 | Routes tool calls from sandboxes back to callers               |
 | **Egress gateway**   | 3190 | The only network path out of a sandbox                         |
-| **package_init**     | —    | One-shot job installing language runtimes onto a shared volume |
+| **package_init**     | n/a    | One-shot job installing language runtimes onto a shared volume |
 
 See [Architecture](https://codeapi.berry13.com/docs/developers/architecture)
 for how they fit together and why the split exists.
 
 ## Security
 
-This service exists to run arbitrary, untrusted code — treat every deployment
+This service exists to run arbitrary, untrusted code: treat every deployment
 decision accordingly.
 
-In its full hardened configuration — MicroVM mode (`kvmEnabled: true`, so
+In its full hardened configuration (MicroVM mode (`kvmEnabled: true`, so
 sandboxed code runs under a separate guest kernel) with NsJail inside the
 guest, seccomp filtering, the egress gateway in front of all sandbox-originated
 traffic, network policies applied, signed execution manifests, and
-`hardenedSandboxMode` left on — it is reasonably secure and designed with
+`hardenedSandboxMode` left on) it is reasonably secure and designed with
 defense in depth.
 
 **NsJail-only mode shares the host kernel** and provides meaningfully weaker
@@ -81,7 +81,7 @@ hardening defaults on, run the stack on isolated infrastructure with least
 privilege, keep hosts patched, and deploy responsibly.
 
 Before exposing this to real users, work through
-[production hardening](https://codeapi.berry13.com/docs/guides/deployment/hardening) —
+[production hardening](https://codeapi.berry13.com/docs/guides/deployment/hardening),
 the development defaults disable authentication and ship publicly known secrets.
 
 If you believe you have found a vulnerability, please report it privately
@@ -89,11 +89,11 @@ rather than opening a public issue (see [CONTRIBUTING](CONTRIBUTING.md)).
 
 ## Documentation
 
--   [Guides](https://codeapi.berry13.com/docs/guides/quickstart) —
-    install, configure, integrate, operate
--   [API reference](https://codeapi.berry13.com/docs/reference) —
+-   [Guides](https://codeapi.berry13.com/docs/guides/quickstart)
+    (install, configure, integrate, operate
+-   [API reference](https://codeapi.berry13.com/docs/reference))
     every endpoint, generated from the OpenAPI specs
--   [Developers](https://codeapi.berry13.com/docs/developers/architecture) —
+-   [Developers](https://codeapi.berry13.com/docs/developers/architecture),
     architecture, security model, contributing
 
 The site lives in [`docs/`](docs) and is published to GitHub Pages on every push
@@ -113,7 +113,7 @@ to `main`. Component-level notes also live next to the code in
 
 This repository is published from an internal monorepo; changes land here as
 sync commits. Pull requests are welcome and are imported with attribution
-preserved — see [CONTRIBUTING](CONTRIBUTING.md) and the
+preserved, see [CONTRIBUTING](CONTRIBUTING.md) and the
 [contributing guide](https://codeapi.berry13.com/docs/developers/contributing).
 
 ## License

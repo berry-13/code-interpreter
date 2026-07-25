@@ -5,7 +5,7 @@ icon: Network
 ---
 
 The service is deliberately several processes rather than one. The split is
-not about scale — it is about **privilege**. Each boundary exists so that
+not about scale: it is about **privilege**. Each boundary exists so that
 compromising one component does not hand an attacker the capabilities of
 another.
 
@@ -55,8 +55,8 @@ flowchart TB
 | **File server** | `service/src/file-server.ts` | 3000 | Trusted | S3-backed object storage. |
 | **Tool call server** | `service/src/tool-call-server.ts` | 3033 | Trusted | Routes tool calls between sandbox and caller. |
 | **Egress gateway** | `service/src/egress-gateway.ts` | 3190 | Trusted | The single network path out of a sandbox; enforces capabilities. |
-| **package_init** | `docker/Dockerfile.package-init` | — | Build-time | Installs language runtimes onto a shared volume. |
-| **Launcher** | `launcher/` (Rust) | — | Untrusted-adjacent | Boots the libkrun microVM and execs into the guest. |
+| **package_init** | `docker/Dockerfile.package-init` | n/a | Build-time | Installs language runtimes onto a shared volume. |
+| **Launcher** | `launcher/` (Rust) | n/a | Untrusted-adjacent | Boots the libkrun microVM and execs into the guest. |
 
 Plus Redis (queue, session pointers, egress ledger) and S3-compatible object
 storage.
@@ -68,7 +68,7 @@ manifest private key**.
 
 If they were one process, every request-handling bug would be adjacent to the
 signing key. Splitting them means the component parsing untrusted JSON from the
-internet cannot mint execution capabilities — it can only ask, over a queue, for
+internet cannot mint execution capabilities: it can only ask, over a queue, for
 one to be minted.
 
 ## Why the sandbox runner holds only a public key
@@ -78,13 +78,13 @@ with a public key; it cannot **sign** them.
 
 A fully compromised runner therefore cannot mint a new manifest granting itself
 access to other users' files. It is limited to whatever the manifest it was
-handed already authorises — which is scoped to one execution, one set of input
+handed already authorises, which is scoped to one execution, one set of input
 files, one output session, with expiry.
 
 <Callout type="info">
 There is a legacy HMAC fallback (`executionManifestSecret`) for non-split
 deployments, where one secret both signs and verifies. Never mount that into
-the sandbox runner — doing so hands it the ability to mint manifests and
+the sandbox runner: doing so hands it the ability to mint manifests and
 collapses this whole property.
 </Callout>
 
@@ -95,7 +95,7 @@ storage, or the internet.
 
 The one exception is a single host port forwarded to the egress gateway
 (`SANDBOX_ALLOWED_LOCAL_NETWORK_PORT`). Every request through it carries an
-**egress grant** — an encrypted, scoped capability naming exactly which files
+**egress grant**: an encrypted, scoped capability naming exactly which files
 this run may read, which session it may write to, and how many requests, bytes,
 and output files it is allowed.
 
@@ -129,7 +129,7 @@ The worker:
 
 - builds the payload, wrapping the user's code where needed (the matplotlib
   template, the persistence wrapper, the tool-call preamble);
-- builds the **execution manifest claims** — principal, session key, input
+- builds the **execution manifest claims**: principal, session key, input
   files, output session, budgets;
 - mints an **egress grant** and records it in the Redis **egress ledger**;
 - signs the manifest with the Ed25519 private key, binding a SHA-256 of the
@@ -147,7 +147,7 @@ The runner:
 - leases an isolated workspace and a per-job UID;
 - fetches input files through the egress gateway using the grant;
 - installs per-job dependencies, if enabled, in the **trusted runner** context;
-- runs the code under NsJail — inside the microVM guest when KVM is on;
+- runs the code under NsJail: inside the microVM guest when KVM is on;
 - collects `/mnt/data`, uploads new files through the gateway;
 - returns stdout, stderr, exit status, and file refs.
 </Step>
@@ -169,7 +169,7 @@ version.
 
 | Queue | Default concurrency | Why |
 | --- | --- | --- |
-| `python-queue` | `PYTHON_CONCURRENCY=1` | Python jobs are heavy — scientific imports alone cost real memory and CPU. |
+| `python-queue` | `PYTHON_CONCURRENCY=1` | Python jobs are heavy: scientific imports alone cost real memory and CPU. |
 | `other-queue` | `OTHER_CONCURRENCY=8` | Bash, JS, TS, and Java runs are comparatively cheap. |
 
 Separating them stops a burst of pandas work from starving trivial Bash runs.
@@ -184,7 +184,7 @@ Separating them stops a burst of pandas work from starving trivial Bash runs.
 | **Sandbox workspace** | `/tmp/sandbox/ws_*` on the runner, one per execution, destroyed after. |
 
 Everything durable lives in Redis or object storage, so workers are
-interchangeable — a persistent session can resume on any worker, and no
+interchangeable: a persistent session can resume on any worker, and no
 affinity is needed.
 
 ## The runtime split: two codebases
@@ -192,9 +192,9 @@ affinity is needed.
 The repository holds two TypeScript codebases that ship together but run
 apart:
 
-- **`service/`** — API, worker, file server, tool call server, egress gateway.
+- **`service/`**: API, worker, file server, tool call server, egress gateway.
   Node/Bun, built with Rollup.
-- **`api/`** — the sandbox runner. Bun, and the component that talks to NsJail.
+- **`api/`**: the sandbox runner. Bun, and the component that talks to NsJail.
 
 They share wire types by convention rather than a published package, because
 they always deploy as a set. Several comments in the code note that a field

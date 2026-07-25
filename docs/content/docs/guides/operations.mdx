@@ -6,7 +6,7 @@ icon: Activity
 
 ## Health endpoints
 
-Each component exposes its own probes. They are not interchangeable — the API
+Each component exposes its own probes. They are not interchangeable: the API
 being healthy says nothing about whether the sandbox runner can execute code.
 
 | Component | Endpoint | Purpose |
@@ -19,7 +19,7 @@ being healthy says nothing about whether the sandbox runner can execute code.
 | Egress gateway | `GET /live`, `GET /health`, `GET /ready` on port `3190` | Liveness and readiness |
 
 The sandbox runner's health check reports whether it can still create and tear
-down sandbox workspaces — the thing that actually breaks under resource
+down sandbox workspaces: the thing that actually breaks under resource
 pressure. The Compose file uses `GET /api/v2/runtimes` as its container
 healthcheck, which additionally confirms runtimes were discovered.
 
@@ -42,10 +42,10 @@ Prometheus operator.
 | --- | --- | --- |
 | `codeapi_jobs_submitted_total` | counter | Work arriving |
 | `codeapi_jobs_completed_total` | counter | Work finishing |
-| `codeapi_jobs_failed_total` | counter | Failures — alert on the rate |
+| `codeapi_jobs_failed_total` | counter | Failures: alert on the rate |
 | `codeapi_job_processing_duration_seconds` | histogram | End-to-end job latency |
 | `codeapi_active_jobs` | gauge | In-flight work |
-| `codeapi_bullmq_queue_jobs` | gauge | **Queue depth — the key scaling signal** |
+| `codeapi_bullmq_queue_jobs` | gauge | **Queue depth: the key scaling signal** |
 | `codeapi_worker_running` | gauge | Worker liveness |
 
 ### Sandbox metrics
@@ -55,7 +55,7 @@ Prometheus operator.
 | `codeapi_sandbox_executions_total` | counter | Executions by outcome |
 | `codeapi_sandbox_execution_duration_seconds` | histogram | Time inside the sandbox |
 | `codeapi_sandbox_active_executions` | gauge | Concurrent executions vs. `SANDBOX_MAX_CONCURRENT_JOBS` |
-| `codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total` | counter | **Sandbox setup wedging — should stay at zero** |
+| `codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total` | counter | **Sandbox setup wedging: should stay at zero** |
 
 ### File and tool-call metrics
 
@@ -81,7 +81,7 @@ labelled by route and status, on the API and file server;
 | --- | --- |
 | `codeapi_bullmq_queue_jobs` rising steadily | Not enough worker capacity. |
 | `codeapi_jobs_failed_total` rate increasing | Something is broken, not just slow. |
-| `codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total` above zero | Sandbox setup is wedging — investigate immediately. |
+| `codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total` above zero | Sandbox setup is wedging: investigate immediately. |
 | `codeapi_sandbox_active_executions` pinned at the max | Runners are saturated; jobs are queueing behind them. |
 | `codeapi_tool_call_timeouts_total` rising | Callers are not answering tool calls in time. |
 | Any readiness probe flapping | Usually Redis or object storage connectivity. |
@@ -112,7 +112,7 @@ Per-worker concurrency:
 | `SANDBOX_MAX_CONCURRENT_JOBS` | `8` | Concurrent executions per sandbox runner |
 
 <Callout type="info" title="Why Python gets its own queue">
-Python jobs are heavier — scientific imports alone cost real memory and CPU.
+Python jobs are heavier: scientific imports alone cost real memory and CPU.
 They run on a separate queue with a lower default concurrency so a burst of
 pandas work cannot starve cheap Bash and JS runs.
 </Callout>
@@ -128,26 +128,26 @@ Stateless; scale on CPU and request rate. The chart templates an HPA
 
 ### File server
 
-Scale on file throughput. Usually not the bottleneck — the heavy lifting is in
+Scale on file throughput. Usually not the bottleneck: the heavy lifting is in
 object storage.
 
 ### Redis and object storage
 
 Shared dependencies. Redis holds the job queue, session pointers, and the
 egress ledger. Object storage holds files and, when enabled, session snapshots.
-Neither is scaled by this chart in any serious way — use a managed service in
+Neither is scaled by this chart in any serious way: use a managed service in
 production.
 
 ## Capacity planning
 
 Roughly:
 
-- **Memory per sandbox** — `LAUNCHER_RAM_MIB` (2048 default) per concurrent
+- **Memory per sandbox**: `LAUNCHER_RAM_MIB` (2048 default) per concurrent
   microVM, plus runner overhead.
-- **CPU per sandbox** — `LAUNCHER_VCPUS` (2 default) per concurrent microVM.
-- **Disk for runtimes** — a few GB per node for the packages volume, depending
+- **CPU per sandbox**: `LAUNCHER_VCPUS` (2 default) per concurrent microVM.
+- **Disk for runtimes**: a few GB per node for the packages volume, depending
   on `CODEAPI_LANGUAGES`.
-- **Object storage** — driven by file retention and, if enabled, persistent
+- **Object storage**: driven by file retention and, if enabled, persistent
   session snapshots at up to `CODEAPI_SESSION_STATE_MAX_BYTES` each.
 
 The Helm defaults request `500m` CPU / `1Gi` memory and limit at `2000m` / `3Gi`
@@ -179,7 +179,7 @@ otel:
 
 Trace context propagates from the API through the worker into the sandbox
 execution, so a slow request can be attributed to a specific stage. If you
-enable it with network policies on, allow the collector — the chart's
+enable it with network policies on, allow the collector: the chart's
 `networkPolicy.otel` block does this.
 
 ## Upgrades

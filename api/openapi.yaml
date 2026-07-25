@@ -3,11 +3,11 @@ info:
   title: Sandbox Runner API
   version: '2.0.0'
   description: |
-    **Internal API — not for public exposure.**
+    **Internal API, not for public exposure.**
 
     This is the HTTP surface of the sandbox runner (`api/`, the `sandbox-runner`
     container), the component that actually executes untrusted code inside
-    NsJail — and, in the default hardened configuration, inside a libkrun
+    NsJail, and, in the default hardened configuration, inside a libkrun
     microVM whose guest kernel is separate from the host's.
 
     Only the service worker calls it, over the cluster-internal network on port
@@ -16,13 +16,13 @@ info:
     and this component verifies.
 
     - **Execution manifest** (`execution_manifest`, or the
-      `X-CodeAPI-Execution-Manifest` header) — an Ed25519-signed statement of
+      `X-CodeAPI-Execution-Manifest` header): an Ed25519-signed statement of
       what this execution is allowed to be. The worker signs with the private
       key; the runner holds only the public key, so compromising a runner does
       not let it mint new manifests. The manifest binds a SHA-256 of the request
       body, so no field can be altered after signing.
-    - **Egress grant** (`egress_grant`, or the `X-CodeAPI-Egress-Grant` header)
-      — an encrypted, scoped capability naming exactly which files this run may
+    - **Egress grant** (`egress_grant`, or the `X-CodeAPI-Egress-Grant` header):
+       an encrypted, scoped capability naming exactly which files this run may
       read and where it may write. The egress gateway enforces it.
 
     Both ride in the JSON body rather than headers by default: skill-heavy
@@ -207,7 +207,7 @@ components:
           type: boolean
           description: |
             `true` when the ref is an unchanged passthrough of an input the
-            caller already owns. Callers should skip post-processing these —
+            caller already owns. Callers should skip post-processing these:
             the bytes are already persisted at their origin.
         entity_id:
           type: string
@@ -325,7 +325,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ExecuteResponse'
         '400':
-          description: Validation failed — unknown runtime, malformed files, or bad limits.
+          description: Validation failed, unknown runtime, malformed files, or bad limits.
           content:
             application/json:
               schema:
@@ -357,7 +357,7 @@ paths:
       tags: [Operations]
       summary: List installed runtimes
       description: |
-        Runtimes are discovered from `SANDBOX_PACKAGES_DIRECTORY` at startup —
+        Runtimes are discovered from `SANDBOX_PACKAGES_DIRECTORY` at startup,
         the volume the `package_init` job populates. Which languages appear
         depends on `CODEAPI_LANGUAGES` at deploy time.
       responses:

@@ -42,7 +42,7 @@ Here is the concrete difference:
 
 | Layer | MicroVM mode | NsJail-only mode |
 | --- | --- | --- |
-| Guest kernel | Separate kernel inside libkrun | **None — host kernel is shared** |
+| Guest kernel | Separate kernel inside libkrun | **None: host kernel is shared** |
 | Namespaces | Applied, inside the guest | Applied, on the host |
 | seccomp-bpf filter | Applied | Applied |
 | cgroups v2 limits | Applied | Applied |
@@ -73,7 +73,7 @@ infrastructure.
 - Anything multi-tenant.
 
 If you need to run untrusted code and your host cannot do KVM, the answer is a
-host that can — not this override.
+host that can: not this override.
 
 ## Checking which mode you are in
 

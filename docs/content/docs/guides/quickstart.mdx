@@ -4,16 +4,16 @@ description: Bring up the full stack locally and run your first sandboxed progra
 icon: Rocket
 ---
 
-This gets you a complete, working stack on one machine — API, worker, sandbox
-runner, file server, tool-call server, egress gateway, Redis, and MinIO — and
+This gets you a complete, working stack on one machine (API, worker, sandbox
+runner, file server, tool-call server, egress gateway, Redis, and MinIO) and
 then runs code in it.
 
 ## Requirements
 
 <Callout type="info">
 The default stack boots the sandbox inside a **libkrun microVM** and maps
-`/dev/kvm` into the sandbox container. If your host has no usable `/dev/kvm` —
-cheap VPSes, LXC containers, nested virtualisation without KVM passthrough —
+`/dev/kvm` into the sandbox container. If your host has no usable `/dev/kvm`
+(cheap VPSes, LXC containers, nested virtualisation without KVM passthrough)
 Docker will fail to start that container. Jump to
 [running without KVM](/docs/guides/deployment/without-kvm), or use the
 `--nokvm` override shown below.
@@ -33,7 +33,7 @@ On first start the one-shot `package_init` service downloads the language
 runtimes into `./data/pkgs`, so nothing needs to be installed on the host. That
 volume is reused on later starts and already-installed runtimes are skipped.
 
-To install only a subset of languages — much faster, and usually what you want
+To install only a subset of languages, much faster, and usually what you want
 locally:
 
 ```bash
@@ -76,7 +76,7 @@ curl -sX POST http://localhost:3112/v1/exec \
 
 <Callout type="info" title="Non-zero exit codes are still HTTP 200">
 The API returns `200` whenever it successfully ran the program. If the user's
-code crashed, that shows up as a non-zero `code` or a non-null `signal` — not
+code crashed, that shows up as a non-zero `code` or a non-null `signal`: not
 as an HTTP error. Check those fields, not just the status code.
 </Callout>
 

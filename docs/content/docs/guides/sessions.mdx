@@ -1,6 +1,6 @@
 ---
 title: Persistent sessions
-description: Make runs continue each other — files and Python variables carry across calls, with no client change.
+description: Make runs continue each other, files and Python variables carry across calls, with no client change.
 icon: History
 ---
 
@@ -8,7 +8,7 @@ By default every execution is one-shot: a fresh workspace is created, the code
 runs, and everything is discarded.
 
 Set `CODEAPI_PERSIST_SESSIONS=true` and runs continue each other automatically.
-**No client change is required** — the same `/v1/exec` call now resumes where
+**No client change is required**: the same `/v1/exec` call now resumes where
 the last one left off.
 
 ```bash
@@ -29,7 +29,7 @@ curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
   -d '{"lang":"py","code":"import pandas as pd\ndf = pd.DataFrame({\"a\":[1,2,3]})\nprint(len(df))"}'
 # stdout: "3\n"
 
-# Second call — df is still there
+# Second call: df is still there
 curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
   -d '{"lang":"py","code":"print(df.sum().to_dict())"}'
 # stdout: "{'a': 6}\n"
@@ -38,7 +38,7 @@ curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
 ## How it works
 
 At the end of a run the `/mnt/data` workspace is tarred and uploaded to object
-storage under the caller's own `sessionKey` — derived server-side from
+storage under the caller's own `sessionKey`: derived server-side from
 authentication and already bound into the signed execution manifest. The next
 run restores it before user code executes.
 
@@ -66,8 +66,8 @@ sequenceDiagram
 
 Continuity is keyed on the `sessionKey`, so nothing new is sent by the client
 and **one user can never read another's state**. State lives in shared object
-storage, so it survives across a horizontally scaled, affinity-free worker pool
-— run 2 does not need to land on the same worker as run 1.
+storage, so it survives across a horizontally scaled, affinity-free worker pool:
+ run 2 does not need to land on the same worker as run 1.
 
 The sandbox network posture is unchanged: the snapshot is written and read by
 the trusted runner, exactly like input downloads and output uploads. User code
@@ -93,14 +93,14 @@ share one namespace.**
 
 Overlapping runs that restored the same snapshot race on a compare-and-swap:
 the **first** to finish and publish advances the session, and the later
-finisher's snapshot is discarded — never merged, never rolled back. First
+finisher's snapshot is discarded, never merged, never rolled back. First
 successful write wins, not last.
 
 </Accordion>
 
 <Accordion title="Variable snapshots are best-effort">
 
-Data restores reliably — arrays, DataFrames, dicts, ordinary objects. Open
+Data restores reliably: arrays, DataFrames, dicts, ordinary objects. Open
 handles, sockets, threads, and some native objects cannot be serialized and are
 **dropped with a warning**; the rest is preserved.
 
@@ -110,7 +110,7 @@ File persistence underneath is unaffected by a partial variable snapshot.
 
 <Accordion title="Not a warm kernel">
 
-The interpreter still cold-starts on each call — re-import, re-restore. This
+The interpreter still cold-starts on each call: re-import, re-restore. This
 saves you re-deriving state, not startup latency.
 
 Non-Python languages get **file persistence only**; there is no variable
@@ -134,7 +134,7 @@ persists.**
 
 The Redis pointer mapping a session to its snapshot expires on its own
 (`CODEAPI_SESSION_STATE_TTL_SECONDS`) when nobody calls back. But **expiry only
-removes the Redis key — it does not delete the snapshot tar in object storage.**
+removes the Redis key: it does not delete the snapshot tar in object storage.**
 Deletion runs only on explicit supersession by a newer run of the same session.
 
 A session that is never revisited leaves its last snapshot in storage
@@ -150,12 +150,12 @@ bucket or prefix until an in-process cleanup sweep exists.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CODEAPI_SESSION_STATE_MAX_BYTES` | `104857600` (100 MiB) | Snapshot cap. Oversize snapshots are **skipped — the run still succeeds**, and the previous state stays current. |
+| `CODEAPI_SESSION_STATE_MAX_BYTES` | `104857600` (100 MiB) | Snapshot cap. Oversize snapshots are **skipped: the run still succeeds**, and the previous state stays current. |
 | `CODEAPI_SESSION_STATE_TTL_SECONDS` | `604800` (7 days) | Idle expiry of the Redis pointer, refreshed on every run. An active session's pointer never lapses. |
 
 <Callout type="info">
 In hardened mode the snapshot upload is exempt from
-`EGRESS_GATEWAY_MAX_FILE_BYTES` — that cap sizes *user output files*. The
+`EGRESS_GATEWAY_MAX_FILE_BYTES`: that cap sizes *user output files*. The
 gateway and egress ledger let the hidden snapshot use a grant cap derived from
 `CODEAPI_SESSION_STATE_MAX_BYTES` directly, so that is the **only** knob
 bounding snapshot size.
@@ -177,7 +177,7 @@ your product, leave this off.
 
 ## Deciding whether to enable it
 
-Good fit when users work iteratively on data — load a dataset once, explore it
+Good fit when users work iteratively on data: load a dataset once, explore it
 across several messages.
 
 Poor fit when users run many independent one-shot snippets (pure overhead),

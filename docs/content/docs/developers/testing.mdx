@@ -83,7 +83,7 @@ See `tests/readme.md`.
 <Callout type="warn">
 When you change the seccomp policy, mount table, or limits, run these. A policy
 edit that silently permits something is exactly the failure they exist to
-catch — and the kind unit tests will not notice.
+catch, and the kind unit tests will not notice.
 </Callout>
 
 ## Integration scripts
@@ -140,8 +140,8 @@ flow described in [Contributing](/docs/developers/contributing).
 ## Writing tests
 
 **Keep security tests behavioural.** The manifest and grant suites assert on
-*outcomes* — that an expired manifest is rejected, that a mutated body fails the
-hash check — rather than on internal representation. That way a refactor of the
+*outcomes* (that an expired manifest is rejected, that a mutated body fails the
+hash check) rather than on internal representation. That way a refactor of the
 encoding does not silently weaken the check.
 
 **Cover the failure path first.** For anything in the security core, the

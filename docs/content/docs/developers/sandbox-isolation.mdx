@@ -1,6 +1,6 @@
 ---
 title: Sandbox isolation
-description: The layers that contain untrusted code — microVM, namespaces, seccomp, cgroups, and the filesystem.
+description: The layers that contain untrusted code, microVM, namespaces, seccomp, cgroups, and the filesystem.
 icon: Lock
 ---
 
@@ -11,7 +11,7 @@ on its own; each exists to contain the failure of the one above it.
 
 | Layer | Mechanism | Contains |
 | --- | --- | --- |
-| **Hypervisor** | libkrun microVM with its own guest kernel | Kernel exploits — they hit the guest, not the host |
+| **Hypervisor** | libkrun microVM with its own guest kernel | Kernel exploits: they hit the guest, not the host |
 | **Namespaces** | PID, mount, network, user, IPC, UTS, cgroup | Process and filesystem visibility |
 | **Seccomp-bpf** | A Kafel policy built in `nsjail.ts` | Dangerous syscalls, kernel-control socket families |
 | **cgroups v2** | Memory, swap, PID limits | Resource exhaustion |
@@ -22,7 +22,7 @@ on its own; each exists to contain the failure of the one above it.
 
 ## The microVM boundary
 
-When `KVM_ENABLED=true`, `launcher/src/main.rs` — a small Rust binary — boots a
+When `KVM_ENABLED=true`, `launcher/src/main.rs` (a small Rust binary) boots a
 libkrun microVM and execs into it:
 
 ```rust
@@ -42,7 +42,7 @@ NsJail then runs **inside** that guest. Untrusted code faces the guest kernel, s
 a kernel-level exploit compromises a disposable VM whose entire purpose was to
 run that one job.
 
-No privileged mode and no Linux capabilities are required — only access to
+No privileged mode and no Linux capabilities are required: only access to
 `/dev/kvm`. On Kubernetes a device plugin can provide that without a hostPath
 (`workerSandbox.kvmDevicePlugin`).
 
@@ -54,7 +54,7 @@ operates against the **host** kernel. See
 
 ## NsJail configuration
 
-`api/config/sandbox.cfg` holds the static policy — namespace flags, the mount
+`api/config/sandbox.cfg` holds the static policy: namespace flags, the mount
 table, UID/GID mapping, default cgroup limits. Per-execution values (timeouts,
 memory, the seccomp policy, environment) are passed as CLI arguments by
 `api/src/nsjail.ts`.
@@ -66,23 +66,23 @@ clone_newcgroup: true
 mount_proc: false       # procfs mounted explicitly, not implicitly
 
 cgroup_mem_max: 536870912
-cgroup_mem_swap_max: 0  # no swap — memory limits cannot be evaded
+cgroup_mem_swap_max: 0  # no swap: memory limits cannot be evaded
 cgroup_pids_max: 64
 ```
 
 `chroot` is used rather than `pivot_root`, for compatibility with the
-`RuntimeDefault` seccomp profile — `pivot_root` would otherwise force
+`RuntimeDefault` seccomp profile: `pivot_root` would otherwise force
 `Unconfined` at the container level.
 
 The per-job `/mnt/data` bind is appended as a config overlay rather than passed
 via NsJail's `-B` flag, because the CLI form cannot carry `noexec`, `nosuid`,
-and `nodev` — flags that matter on the one writable mount in the sandbox.
+and `nodev`: flags that matter on the one writable mount in the sandbox.
 
 ## The seccomp policy
 
 Built in `api/src/nsjail.ts` as a Kafel policy string, in two tiers.
 
-### `KILL` — the process dies with SIGSYS
+### `KILL`: the process dies with SIGSYS
 
 <Accordions>
 <Accordion title="Process introspection and memory">
@@ -95,11 +95,11 @@ Built in `api/src/nsjail.ts` as a Kafel policy string, in two tiers.
 `finit_module`, `delete_module`, `reboot`
 </Accordion>
 
-<Accordion title="Mounting — both APIs">
+<Accordion title="Mounting, both APIs">
 `mount`, `umount2`, `pivot_root`, and the Linux 5.2+ mount API:
 `move_mount`, `open_tree`, `fsopen`, `fsmount`, `fspick`.
 
-The new mount API is orthogonal to `mount(2)` — `open_tree` + `move_mount` can
+The new mount API is orthogonal to `mount(2)`: `open_tree` + `move_mount` can
 replicate a bind mount on their own, so blocking the old call alone would be
 insufficient.
 </Accordion>
@@ -130,20 +130,20 @@ socket(domain) { domain == AF_VSOCK }
 ioctl(fd, request) { (request & 0xFF00) == KVM_IOCTL_MAGIC }
 ```
 
-`AF_VSOCK` reaches the host hypervisor on KVM-based runners — the guest sees
+`AF_VSOCK` reaches the host hypervisor on KVM-based runners: the guest sees
 virtio-vsock. An audit found a VSOCK `socket()` succeeding and `connect()`
 hanging rather than returning `ENETUNREACH`, so it is killed explicitly and
 coverage sees `SIGSYS` rather than an ambiguous denial.
 </Accordion>
 </Accordions>
 
-### `ERRNO` — the call fails, the process survives
+### `ERRNO`: the call fails, the process survives
 
 Some things must fail *gracefully*, because language runtimes probe for them at
 startup and would die on `SIGSYS`.
 
 ```
-ERRNO(38) { clone3 }                       # ENOSYS — runtimes fall back to clone
+ERRNO(38) { clone3 }                       # ENOSYS: runtimes fall back to clone
 ERRNO(1)  { io_uring_setup, io_uring_enter, io_uring_register,
             sched_setaffinity, vmsplice, ... }
 ```
@@ -154,7 +154,7 @@ ERRNO(1)  { io_uring_setup, io_uring_enter, io_uring_register,
 clone(flags) { (flags & CLONE_NAMESPACE_FLAGS) != 0 }
 ```
 
-**Signalling the NsJail monitor** — PID 1 of the sandbox's PID namespace:
+**Signalling the NsJail monitor**, PID 1 of the sandbox's PID namespace:
 
 ```
 kill(pid)               { pid == 0 || pid == 1 || pid == 0xFFFFFFFF }
@@ -174,7 +174,7 @@ fan-out would catch the monitor.
 runtimes probing with `kill(pid, 0)` get a familiar error instead of dying.
 
 `pidfd_send_signal` targets a pidfd rather than a numeric pid, so it cannot be
-filtered by destination — and a pidfd to PID 1 is obtainable via
+filtered by destination, and a pidfd to PID 1 is obtainable via
 `openat("/proc/1")` since Linux 5.4. It is refused outright; no supported
 runtime uses it.
 
@@ -186,7 +186,7 @@ socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK
 ```
 
 `AF_NETLINK` and `AF_KEY` are kernel-control interfaces. `AF_ALG` is the kernel
-crypto API and `AF_RXRPC` the RxRPC family — both named in past kernel
+crypto API and `AF_RXRPC` the RxRPC family: both named in past kernel
 vulnerabilities.
 
 The policy ends `USE sandbox DEFAULT ALLOW`: an explicit deny-list over a
@@ -203,7 +203,7 @@ than relying on the bundled table.
 ## Filesystem layout
 
 ```
-/mnt/data/          Working directory — bind mount, writable, noexec/nosuid/nodev
+/mnt/data/          Working directory: bind mount, writable, noexec/nosuid/nodev
 /tmp/               tmpfs (20 MB), writable
 /usr/               Host /usr, read-only bind
 /bin  -> /usr/bin   merged-usr symlinks
@@ -222,9 +222,9 @@ mounted `noexec`.
 Several `/proc` entries are masked with bind mounts over `/dev/null` because
 they leak host information:
 
-- `/proc/cgroups`, `/proc/1/cgroup` — cgroup topology and the total cgroup count
+- `/proc/cgroups`, `/proc/1/cgroup` (cgroup topology and the total cgroup count
   across the host
-- `/proc/self/maps` — ASLR layout (further mitigated by seccomp blocking
+- `/proc/self/maps`) ASLR layout (further mitigated by seccomp blocking
   `ptrace` and `bpf`)
 
 With `clone_newnet: true`, `/proc/net` reflects only the sandbox's empty network
@@ -240,7 +240,7 @@ SANDBOX_JOB_GID_BASE=200000
 
 `api/src/workspace-isolation.ts` leases a distinct UID/GID per concurrent job
 from a pool. Two jobs on the same runner are then isolated by ordinary
-filesystem permissions as well as by namespaces — a second, independent
+filesystem permissions as well as by namespaces: a second, independent
 mechanism for the same property.
 
 Workspaces are created at mode `0711`: not listable, but traversable, which
@@ -263,7 +263,7 @@ Without per-job UIDs, everything runs as `nobody` (65534).
 | `SANDBOX_OUTPUT_MAX_SIZE` | 65536 | stdout/stderr truncation |
 | `SANDBOX_MAX_CONCURRENT_JOBS` | 8 | Concurrent executions per runner |
 
-`cgroup_mem_swap_max: 0` matters more than it looks — with swap available, a
+`cgroup_mem_swap_max: 0` matters more than it looks, with swap available, a
 memory limit can be evaded by pushing pages out.
 
 `SANDBOX_LIMIT_OVERRIDES` accepts a JSON object of per-runtime overrides, for
@@ -282,15 +282,15 @@ a healthy deployment.
 Two further layers, both off by default because they need node-level
 installation:
 
-- **seccomp profile** — `seccomp/` ships a profile applied at the container
+- **seccomp profile**: `seccomp/` ships a profile applied at the container
   level, on top of NsJail's inner Kafel policy. Enable with
   `workerSandbox.seccomp.enabled=true`; it must be pre-installed on every node
   at `/var/lib/kubelet/seccomp/profiles/nsjail.json`.
-- **AppArmor** — `apparmor/sandbox-nsjail` constrains the sandbox runner
+- **AppArmor**: `apparmor/sandbox-nsjail` constrains the sandbox runner
   process itself.
 
 Without the custom profile, KVM-mode pods use `RuntimeDefault` and non-KVM pods
-are forced to `Unconfined` by NsJail's `pivot_root` requirement — part of why
+are forced to `Unconfined` by NsJail's `pivot_root` requirement: part of why
 the `chroot` choice above exists.
 
 ## What is deliberately not claimed

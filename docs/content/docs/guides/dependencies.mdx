@@ -1,6 +1,6 @@
 ---
 title: Dynamic dependencies
-description: Letting a request install pinned pip packages for one job — how it works, and the trade-off you accept by enabling it.
+description: Letting a request install pinned pip packages for one job, how it works, and the trade-off you accept by enabling it.
 icon: PackagePlus
 ---
 
@@ -41,13 +41,13 @@ more ` --hash=sha256:...` options:
 
 <Callout type="info">
 When **any** package carries a hash, **all** of them must, and pip runs with
-`--require-hashes`. It is all or nothing by design — a partially hashed list
+`--require-hashes`. It is all or nothing by design: a partially hashed list
 would give a false sense of integrity.
 </Callout>
 
 ## How the security boundary survives
 
-Installs happen **before** user code runs, in the trusted runner — not inside
+Installs happen **before** user code runs, in the trusted runner, not inside
 the sandbox:
 
 ```mermaid
@@ -66,7 +66,7 @@ The properties that matter:
   no network at all.
 - **No install-time code executes.** `pip --only-binary=:all:` means wheels
   only, so no `setup.py` and no build scripts run. This is the single most
-  important property — arbitrary code execution at install time would happen in
+  important property: arbitrary code execution at install time would happen in
   the *trusted* context, which would be far worse than anything the sandbox can
   do.
 - **The result is read-only to the sandbox.** The per-job directory is mounted
@@ -103,7 +103,7 @@ Enabling this means:
    network path from a trusted component to the internet, where none existed
    before.
 2. **You are installing operator-allowed packages from that index at job time.**
-   Wheels only, so no install-time code runs — but the package contents then
+   Wheels only, so no install-time code runs, but the package contents then
    execute inside the sandbox as part of the user's program.
 3. **Availability now depends on the index.** An index outage becomes a job
    failure for requests that use it.

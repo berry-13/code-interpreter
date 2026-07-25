@@ -1,6 +1,6 @@
 ---
 title: Kubernetes
-description: Deploying with the Helm chart — the supported path for production self-hosting.
+description: Deploying with the Helm chart, the supported path for production self-hosting.
 icon: Ship
 ---
 
@@ -21,7 +21,7 @@ job, network policies, and optionally Redis and MinIO.
 `executionManifest.privateKey` and `executionManifest.publicKey` are empty in
 `values.yaml`, and `helm install` / `helm upgrade` **fails fast** when
 `workerSandbox.enabled=true` (the default) and either is unset. This is
-deliberate — a shipped default keypair would be a publicly known signing key.
+deliberate: a shipped default keypair would be a publicly known signing key.
 </Callout>
 
 The worker signs every sandbox execute request with an Ed25519 private key. The
@@ -50,7 +50,7 @@ file.
 
 <Callout type="warn">
 `values-local.yaml` carries a **test-only keypair** for minikube development.
-It is publicly known — the same keypair is hardcoded in the unit tests. Never
+It is publicly known: the same keypair is hardcoded in the unit tests. Never
 use it outside local development.
 </Callout>
 
@@ -160,7 +160,7 @@ workerSandbox:
 
   # Defense in depth on top of NsJail's inner Kafel policy. Requires the
   # profile pre-installed on every node at
-  # /var/lib/kubelet/seccomp/profiles/nsjail.json — see seccomp/README.md.
+  # /var/lib/kubelet/seccomp/profiles/nsjail.json (see seccomp/README.md).
   seccomp:
     enabled: false
 ```
@@ -222,7 +222,7 @@ workerSandbox:
 ```
 
 The chart templates HPAs for the API and worker tiers. Queue-depth autoscaling
-(KEDA-style) is intentionally left to your platform — scale
+(KEDA-style) is intentionally left to your platform: scale
 `workerSandbox.replicaCount` on Redis queue depth if you need it.
 
 ### Network policies
@@ -238,7 +238,7 @@ networkPolicy:
         kubernetes.io/metadata.name: observability
 ```
 
-Enabled by default. These are a meaningful part of the security posture —
+Enabled by default. These are a meaningful part of the security posture:
 they are what keeps the sandbox tier from reaching anything except the egress
 gateway. Leave them on.
 
@@ -273,7 +273,7 @@ Deliberately not templated, because they belong to your platform:
 
 - External ingress or service mesh (`api.ingress` covers the simple case)
 - Queue-depth autoscaling
-- Cloud-IAM secret delivery — the `extraEnv` hooks on every component cover it
+- Cloud-IAM secret delivery: the `extraEnv` hooks on every component cover it
 
 ## Next
 

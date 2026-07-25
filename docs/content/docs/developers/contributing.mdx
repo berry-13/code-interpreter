@@ -8,7 +8,7 @@ icon: GitPullRequest
 
 This repository is published from an internal ClickHouse monorepo, which is the
 source of truth. Every change that lands internally is mirrored here as a
-snapshot commit on the `sync/main` branch — spot them by the
+snapshot commit on the `sync/main` branch, spot them by the
 `Source: ClickHouse/ai@<sha>` trailer. A maintainer merges the resulting sync
 pull request to release it to `main`.
 
@@ -33,7 +33,7 @@ your attribution being lost.
 
 Read [Architecture](/docs/developers/architecture) and
 [Security model](/docs/developers/security-model). The component split is not
-arbitrary — most boundaries exist to hold a specific security property, and a
+arbitrary: most boundaries exist to hold a specific security property, and a
 change that looks like a simplification often removes one.
 
 Two examples of things that look redundant and are not:
@@ -63,7 +63,7 @@ See [Testing](/docs/developers/testing).
 ## Code conventions
 
 **Comment density is high, deliberately.** Many comments record *why* a
-non-obvious choice was made, often citing the bug that motivated it — the
+non-obvious choice was made, often citing the bug that motivated it: the
 `isPyPlot` scan, the body-hash binding, the `pidfd_send_signal` refusal. When
 you change that code, update the comment; when you make a similar decision,
 write one.
@@ -81,7 +81,7 @@ field, change both sides in the same change.
 <Accordion title="The seccomp policy">
 
 `api/src/nsjail.ts`. Adding a syscall to the allow-list widens the kernel
-attack surface. Removing one can break a language runtime at startup — several
+attack surface. Removing one can break a language runtime at startup: several
 entries are `ERRNO` rather than `KILL` precisely because runtimes probe for them.
 
 Run the `tests/` isolation probes.
@@ -110,7 +110,7 @@ split exists because conflating them broke authorization for every shared-kind
 
 The compare-and-swap pointer advance, the snapshot refcount, and the TTL-refresh
 rules all interact. Read the comments in `service/src/session-persist.ts` and
-the pointer logic in the `/exec` handler before changing any of them — the
+the pointer logic in the `/exec` handler before changing any of them: the
 "do not refresh the TTL on a failed restore" rule in particular is load-bearing.
 
 </Accordion>
@@ -128,12 +128,12 @@ classifier.
 
 This site lives in `docs/`. Content is MDX under `docs/content/docs`:
 
-- `content/docs/guides/` — user-facing
-- `content/docs/developers/` — internals
-- `content/docs/reference/api/` — **generated**, do not edit
+- `content/docs/guides/` (user-facing
+- `content/docs/developers/`) internals
+- `content/docs/reference/api/`: **generated**, do not edit
 
 The API reference is generated from `service/openapi.yml` and
-`api/openapi.yaml` at build time. To change it, **edit the spec** — the
+`api/openapi.yaml` at build time. To change it, **edit the spec**: the
 generated MDX is gitignored and regenerated on every build.
 
 ```bash
@@ -156,7 +156,7 @@ maintainers privately so a fix can ship before the details are public.
 
 Useful detail for a bug report:
 
-- Deployment mode — Compose or Helm, `KVM_ENABLED` on or off
+- Deployment mode: Compose or Helm, `KVM_ENABLED` on or off
 - Which component logged the error
 - The relevant configuration, with secrets redacted
 - A minimal reproducing request

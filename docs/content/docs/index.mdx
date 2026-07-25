@@ -1,16 +1,16 @@
 ---
 title: Code Interpreter
-description: Sandboxed code execution for LibreChat — run untrusted, model-generated code with real isolation, file storage, and tool calling.
+description: Sandboxed code execution for LibreChat, run untrusted, model-generated code with real isolation, file storage, and tool calling.
 icon: House
 ---
 
-Code Interpreter (internally **`codeapi`** — the prefix on its environment
+Code Interpreter (internally **`codeapi`**: the prefix on its environment
 variables, container images, and Helm chart) is a self-hostable service that
 executes untrusted code safely. It is what sits behind LibreChat's code
 interpreter feature: a model writes a program, this service runs it in a
 sandbox, and the output and any files it produced come back.
 
-It is built for the case where the code is genuinely untrusted — written by a
+It is built for the case where the code is genuinely untrusted: written by a
 language model, on behalf of a user you may not know, doing whatever it likes.
 
 <Cards>
@@ -42,7 +42,7 @@ language model, on behalf of a user you may not know, doing whatever it likes.
   each in a fresh isolated workspace with CPU, memory, PID, and wall-clock
   limits enforced by the kernel.
 - **Handles files.** Callers upload files, code reads them, code writes new ones,
-  and the results come back as downloadable artifacts — all through
+  and the results come back as downloadable artifacts: all through
   S3-compatible object storage, scoped per user.
 - **Supports tool calling.** Sandboxed programs can pause, call back into
   caller-provided tools, and resume with the results.
@@ -65,10 +65,10 @@ appropriate for local development and trusted code. It is **not** appropriate
 for executing untrusted code from people you don't trust.
 </Callout>
 
-In its full hardened configuration — microVM mode, seccomp filtering, the
+In its full hardened configuration (microVM mode, seccomp filtering, the
 egress gateway in front of all sandbox-originated traffic, network policies
 applied, signed execution manifests, and `CODEAPI_HARDENED_SANDBOX_MODE` left
-on — the service is designed with defense in depth and is reasonably secure.
+on) the service is designed with defense in depth and is reasonably secure.
 
 No software is 100% secure. Sandbox escapes, kernel vulnerabilities, and
 misconfiguration are real risks for any code-execution system. Keep the

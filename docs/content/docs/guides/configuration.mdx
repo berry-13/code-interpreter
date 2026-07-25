@@ -10,7 +10,7 @@ template to copy from.
 
 <Callout type="info">
 Variables are read by different components. A variable set on the API does
-nothing on the sandbox runner and vice versa — the **Component** column below
+nothing on the sandbox runner and vice versa: the **Component** column below
 says where each one belongs. The Compose and Helm files already route them
 correctly.
 </Callout>
@@ -52,7 +52,7 @@ See [Authentication](/docs/guides/authentication) for the full setup.
 
 <Callout type="error">
 The manifest keypair inlined in the Compose files and `values-local.yaml` is
-publicly known — the same one is hardcoded in the unit tests. Replace it. See
+publicly known: the same one is hardcoded in the unit tests. Replace it. See
 [production hardening](/docs/guides/deployment/hardening).
 </Callout>
 
@@ -61,9 +61,9 @@ publicly known — the same one is hardcoded in the unit tests. Replace it. See
 | Variable | Default | Description |
 | --- | --- | --- |
 | `EXECUTION_MANIFEST_TTL_SECONDS` | `300` | Manifest validity window. |
-| `EXECUTION_MANIFEST_MAX_UPLOAD_BYTES` | — | Upload budget granted to one execution. |
-| `EXECUTION_MANIFEST_MAX_OUTPUT_FILES` | — | Output file count budget. |
-| `EXECUTION_MANIFEST_MAX_REQUESTS` | — | Total gateway requests one execution may make. |
+| `EXECUTION_MANIFEST_MAX_UPLOAD_BYTES` | n/a | Upload budget granted to one execution. |
+| `EXECUTION_MANIFEST_MAX_OUTPUT_FILES` | n/a | Output file count budget. |
+| `EXECUTION_MANIFEST_MAX_REQUESTS` | n/a | Total gateway requests one execution may make. |
 | `SANDBOX_REQUIRE_EGRESS_MANIFEST` | `true` | Runner refuses unsigned execute requests. |
 | `CODEAPI_EGRESS_LEDGER_REQUIRED` | `true` | Gateway requires a live ledger entry per grant. |
 
@@ -87,7 +87,7 @@ publicly known — the same one is hardcoded in the unit tests. Replace it. See
 | `MINIO_ACCESS_KEY` | `minioadmin` | Access key. |
 | `MINIO_SECRET_KEY` | `minioadmin` | Secret key. |
 | `MINIO_BUCKET` | `test-bucket` | Bucket name. |
-| `MINIO_NO_PORT` | `false` | Omit an explicit port — for gateways that must not receive one. |
+| `MINIO_NO_PORT` | `false` | Omit an explicit port: for gateways that must not receive one. |
 | `FILE_SERVER_PORT` | `3000` | File server listen port. |
 
 Despite the names, any S3-compatible endpoint works; the file server also
@@ -97,7 +97,7 @@ supports IRSA authentication on EKS.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `KVM_ENABLED` | `true` | microVM mode. `false` is NsJail-only — [weaker isolation](/docs/guides/deployment/without-kvm). |
+| `KVM_ENABLED` | `true` | microVM mode. `false` is NsJail-only: [weaker isolation](/docs/guides/deployment/without-kvm). |
 | `KVM_DEVICE_PATH` | `/dev/kvm` | Device to map in. |
 | `SANDBOX_PACKAGES_DIRECTORY` | `/pkgs` | Where runtimes are mounted inside the runner. |
 | `SANDBOX_MAX_CONCURRENT_JOBS` | `8` | Parallel executions per runner. |
@@ -117,8 +117,8 @@ supports IRSA authentication on EKS.
 | `SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS` | `3600` | Age after which orphaned workspaces are reclaimed. |
 | `SANDBOX_EXECUTE_BODY_LIMIT` | `50mb` | Max execute request body. |
 | `SANDBOX_LOG_LEVEL` | `INFO` | Log verbosity. |
-| `SANDBOX_ALLOWED_LOCAL_NETWORK_PORT` | `0` | The single host port the sandbox may reach — the egress gateway. |
-| `SANDBOX_FORWARD_TARGET` | — | Where that port forwards to. |
+| `SANDBOX_ALLOWED_LOCAL_NETWORK_PORT` | `0` | The single host port the sandbox may reach: the egress gateway. |
+| `SANDBOX_FORWARD_TARGET` | n/a | Where that port forwards to. |
 
 ### microVM launcher
 

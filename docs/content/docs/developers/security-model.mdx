@@ -62,7 +62,7 @@ export interface ExecutionManifestSigner {
 ```
 
 A compromised runner can verify manifests. It cannot create them. So it is
-confined to whatever it was already handed — one execution, one set of input
+confined to whatever it was already handed: one execution, one set of input
 files, one output session, with an expiry.
 
 <Callout type="error" title="Never mount the HMAC secret into the runner">
@@ -83,7 +83,7 @@ public key).
 
 ### Body binding
 
-The manifest carries `execute_body_sha256` — a hash of the request body it was
+The manifest carries `execute_body_sha256`, a hash of the request body it was
 signed for:
 
 ```ts
@@ -94,7 +94,7 @@ body.execution_manifest = signExecutionManifestWithKey(
 ```
 
 This makes manifests **non-transferable**. A manifest captured from one request
-cannot be replayed onto another — changing any field invalidates the hash.
+cannot be replayed onto another: changing any field invalidates the hash.
 
 ### Verification failures
 
@@ -154,7 +154,7 @@ A secret shorter than 32 bytes is rejected with `weak_secret`.
 
 ## The egress ledger
 
-A signed capability alone cannot express "you have used 3 of your 10 uploads" —
+A signed capability alone cannot express "you have used 3 of your 10 uploads",
 so counters live server-side in Redis. `service/src/egress-ledger.ts` maintains
 one record per grant:
 
@@ -171,8 +171,8 @@ one record per grant:
 This gives three properties a stateless token cannot:
 
 1. **Budgets are actually enforced** across requests, not just declared.
-2. **Revocation works** — a grant can be killed mid-execution.
-3. **Replay is bounded** — a captured grant is still subject to counters that
+2. **Revocation works**: a grant can be killed mid-execution.
+3. **Replay is bounded**: a captured grant is still subject to counters that
    have already been consumed.
 
 ```bash
@@ -211,7 +211,7 @@ so there is no field in which to forge one.
 | `skill` | Resource id **and** `version` | Each revision is its own namespace |
 
 Because a skill's version counter is monotonic, editing a skill invalidates the
-previous cache entry naturally — the new version derives a different key.
+previous cache entry naturally: the new version derives a different key.
 
 Outputs are **always** user-private, hardcoded regardless of input kinds. A run
 reading a shared skill bundle still writes into the requesting user's own
@@ -243,7 +243,7 @@ not serve traffic quietly.
 ## Error handling as a boundary
 
 `api/src/safe-error.ts` classifies which errors may cross back to a caller.
-Sandbox internals — paths, UIDs, host details, stack traces — are informative to
+Sandbox internals (paths, UIDs, host details, stack traces) are informative to
 an attacker, so errors are mapped to a safe public shape before leaving the
 runner.
 
@@ -259,7 +259,7 @@ Stated plainly, because they inform how you should deploy:
   backwards compatibility.
 - **The HMAC manifest fallback is weaker than the keypair** and must never
   reach the runner.
-- **Persistent sessions are per user, not per conversation** — two conversations
+- **Persistent sessions are per user, not per conversation**: two conversations
   by one user share a namespace.
 - **Abandoned session snapshots are not garbage-collected**; use a storage
   lifecycle policy.
@@ -269,5 +269,5 @@ Stated plainly, because they inform how you should deploy:
 
 ## Reporting a vulnerability
 
-Please report privately rather than opening a public issue — see
+Please report privately rather than opening a public issue: see
 `CONTRIBUTING.md` for the contact route.
