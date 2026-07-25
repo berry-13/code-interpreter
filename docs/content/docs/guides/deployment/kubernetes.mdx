@@ -1,0 +1,291 @@
+---
+title: Kubernetes
+description: Deploying with the Helm chart — the supported path for production self-hosting.
+icon: Ship
+---
+
+The chart lives at `helm/codeapi` and deploys the whole stack: API, worker +
+sandbox pods, file server, tool call server, egress gateway, the package-init
+job, network policies, and optionally Redis and MinIO.
+
+## Prerequisites
+
+- Kubernetes 1.24+, Helm 3.x, `kubectl`
+- Nodes with `/dev/kvm` for microVM mode (or see
+  [running without KVM](/docs/guides/deployment/without-kvm))
+- A `StorageClass` for the packages PVC
+
+## Signing keys are required
+
+<Callout type="error" title="The chart ships no default keypair">
+`executionManifest.privateKey` and `executionManifest.publicKey` are empty in
+`values.yaml`, and `helm install` / `helm upgrade` **fails fast** when
+`workerSandbox.enabled=true` (the default) and either is unset. This is
+deliberate — a shipped default keypair would be a publicly known signing key.
+</Callout>
+
+The worker signs every sandbox execute request with an Ed25519 private key. The
+sandbox runner receives only the public verifier, so compromising a runner does
+not give an attacker the ability to mint new manifests.
+
+```bash
+# Generate the Ed25519 private key (PEM)
+openssl genpkey -algorithm ed25519 -out manifest-signing.pem
+
+# Extract the public key (PEM)
+openssl pkey -in manifest-signing.pem -pubout -out manifest-signing.pub.pem
+
+# base64-encoded DER values for the chart
+PRIVATE_KEY=$(openssl pkey -in manifest-signing.pem -outform DER | base64)
+PUBLIC_KEY=$(openssl pkey -in manifest-signing.pem -pubout -outform DER | base64)
+
+helm install codeapi ./helm/codeapi \
+  --set executionManifest.privateKey="$PRIVATE_KEY" \
+  --set executionManifest.publicKey="$PUBLIC_KEY"
+```
+
+For production, prefer external secrets management (Vault, AWS Secrets Manager,
+Sealed Secrets) or deploy-time `--set` over committing key material to a values
+file.
+
+<Callout type="warn">
+`values-local.yaml` carries a **test-only keypair** for minikube development.
+It is publicly known — the same keypair is hardcoded in the unit tests. Never
+use it outside local development.
+</Callout>
+
+## Local development on minikube
+
+<Steps>
+
+<Step>
+
+### Start the cluster
+
+```bash
+minikube start --cpus=4 --memory=8192
+```
+
+</Step>
+
+<Step>
+
+### Build the images inside minikube
+
+```bash
+eval $(minikube docker-env)
+
+docker build -t codeapi-api:latest              -f service/Dockerfile.api .
+docker build -t codeapi-worker:latest           -f service/Dockerfile.worker .
+docker build -t codeapi-sandbox-runner:latest   -f api/Dockerfile .
+docker build -t codeapi-file-server:latest      -f service/Dockerfile --target production .
+docker build -t codeapi-tool-call-server:latest -f service/Dockerfile.tool-call-server --target production .
+docker build -t codeapi-package-init:latest     -f docker/Dockerfile.package-init .
+```
+
+</Step>
+
+<Step>
+
+### Deploy
+
+```bash
+cd helm/codeapi
+helm dependency update      # pulls the Redis subchart
+helm install codeapi . -f values-local.yaml
+```
+
+</Step>
+
+<Step>
+
+### Reach the API
+
+```bash
+kubectl port-forward svc/codeapi-api 3112:3112
+curl http://localhost:3112/v1/health
+```
+
+</Step>
+
+</Steps>
+
+## Language packages
+
+The chart includes a **package-init Job** that runs as a Helm `pre-install`
+hook. It installs the language runtimes into the packages PVC before worker
+pods start, so this happens automatically on `helm install`.
+
+```bash
+# Watch it
+kubectl get jobs -l app.kubernetes.io/component=package-init
+kubectl logs job/codeapi-package-init
+
+# Force a rebuild
+helm upgrade codeapi ./helm/codeapi \
+  --set workerSandbox.packages.initJob.forceRebuild=true
+```
+
+To populate the PVC from a prebuilt directory instead of downloading:
+
+```bash
+kubectl run pvc-populator --image=alpine --command -- sleep 3600 \
+  --overrides='{"spec":{"containers":[{"name":"pvc-populator","image":"alpine","command":["sleep","3600"],"volumeMounts":[{"name":"packages","mountPath":"/packages"}]}],"volumes":[{"name":"packages","persistentVolumeClaim":{"claimName":"codeapi-packages"}}]}}'
+
+kubectl wait --for=condition=ready pod/pvc-populator --timeout=60s
+kubectl cp ./data/pkgs/. pvc-populator:/packages/
+kubectl delete pod pvc-populator
+kubectl rollout restart deployment/codeapi-sandbox-runner
+```
+
+## Key values
+
+### Sandbox isolation
+
+```yaml
+workerSandbox:
+  replicaCount: 3
+  # libkrun microVM with its own kernel + NsJail inside. Needs /dev/kvm on the
+  # node. No privileged mode and no Linux capabilities are required.
+  kvmEnabled: true
+
+  launcher:
+    vcpus: 2
+    ramMib: 2048
+
+  # Non-privileged KVM access via a device plugin you deploy separately.
+  kvmDevicePlugin:
+    enabled: false
+    resourceName: ""   # e.g. devices.kubevirt.io/kvm
+
+  # Defense in depth on top of NsJail's inner Kafel policy. Requires the
+  # profile pre-installed on every node at
+  # /var/lib/kubelet/seccomp/profiles/nsjail.json — see seccomp/README.md.
+  seccomp:
+    enabled: false
+```
+
+<Callout type="info">
+When `seccomp.enabled` is false, KVM-mode pods fall back to `RuntimeDefault`
+(still better than nothing) and non-KVM pods use `Unconfined`, which NsJail's
+`pivot_root` requires. Turning the profile on is a meaningful hardening step
+and worth the node-level install.
+</Callout>
+
+Use `workerSandbox.sandboxRunner` scheduling overrides to place only the
+untrusted-code tier on KVM-capable nodes:
+
+```yaml
+workerSandbox:
+  sandboxRunner:
+    nodeSelector:
+      codeapi.io/kvm: "true"
+    tolerations:
+      - key: codeapi.io/untrusted
+        operator: Exists
+        effect: NoSchedule
+```
+
+### Authentication
+
+Outside local mode the API verifies JWTs. Configure the verifier through
+environment variables on the api component:
+
+```yaml
+api:
+  extraEnv:
+    - name: CODEAPI_AUTH_PROVIDER
+      value: librechat-jwt
+    - name: CODEAPI_JWT_PUBLIC_KEY
+      valueFrom:
+        secretKeyRef:
+          name: codeapi-jwt-verifier
+          key: public-key
+    - name: CODEAPI_JWT_KID
+      value: my-key-id
+```
+
+`CODEAPI_JWT_PUBLIC_KEYS_DIR` (a mounted directory of PEM files named by kid)
+and `CODEAPI_JWT_JWKS_JSON` (inline JWKS) are also supported for key rotation.
+See [Authentication](/docs/guides/authentication).
+
+### Autoscaling
+
+```yaml
+api:
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+
+workerSandbox:
+  replicaCount: 3
+```
+
+The chart templates HPAs for the API and worker tiers. Queue-depth autoscaling
+(KEDA-style) is intentionally left to your platform — scale
+`workerSandbox.replicaCount` on Redis queue depth if you need it.
+
+### Network policies
+
+```yaml
+networkPolicy:
+  enabled: true
+  otel:
+    enabled: true
+    port: 4318
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: observability
+```
+
+Enabled by default. These are a meaningful part of the security posture —
+they are what keeps the sandbox tier from reaching anything except the egress
+gateway. Leave them on.
+
+### TLS to Redis
+
+Set `REDIS_TLS=true` via `extraEnv` on each component when your Redis requires
+TLS.
+
+## Operations
+
+```bash
+# Status
+kubectl get pods
+kubectl logs deployment/codeapi-api
+kubectl logs deployment/codeapi-service-worker
+kubectl logs deployment/codeapi-sandbox-runner
+
+# Scale the execution tier
+kubectl scale deployment/codeapi-sandbox-runner --replicas=10
+
+# Roll out new images after a rebuild
+kubectl rollout restart deployment/codeapi-service-worker
+kubectl rollout restart deployment/codeapi-sandbox-runner
+
+# Remove everything
+helm uninstall codeapi
+```
+
+## What the chart leaves to you
+
+Deliberately not templated, because they belong to your platform:
+
+- External ingress or service mesh (`api.ingress` covers the simple case)
+- Queue-depth autoscaling
+- Cloud-IAM secret delivery — the `extraEnv` hooks on every component cover it
+
+## Next
+
+<Cards>
+  <Card
+    title="Production hardening"
+    description="The checklist to work through before real traffic."
+    href="/docs/guides/deployment/hardening"
+  />
+  <Card
+    title="Operations"
+    description="Health checks, metrics, and scaling behaviour."
+    href="/docs/guides/operations"
+  />
+</Cards>

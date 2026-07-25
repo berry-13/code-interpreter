@@ -1,0 +1,162 @@
+---
+title: Contributing
+description: How this repository is maintained, how changes land, and what to know before opening a PR.
+icon: GitPullRequest
+---
+
+## How this repository is maintained
+
+This repository is published from an internal ClickHouse monorepo, which is the
+source of truth. Every change that lands internally is mirrored here as a
+snapshot commit on the `sync/main` branch — spot them by the
+`Source: ClickHouse/ai@<sha>` trailer. A maintainer merges the resulting sync
+pull request to release it to `main`.
+
+That has three practical consequences:
+
+- **Pull requests are welcome.** CI runs on every PR. A maintainer reviews your
+  change, imports it into the internal repository, and it arrives back with the
+  next sync PR. Attribution is preserved with a `Co-authored-by:` trailer, and
+  your PR is closed with a reference to the sync containing it.
+- **`main` accepts no direct pushes.** It advances only by merging sync pull
+  requests; branch rules enforce this with no exceptions.
+- **History is snapshot-based.** Commits here intentionally do not mirror the
+  internal commit history, so `git log` will not read like a normal project's.
+
+<Callout type="info">
+If a change of yours appears in `main` under someone else's commit with your
+`Co-authored-by:` trailer, that is the sync process working as designed, not
+your attribution being lost.
+</Callout>
+
+## Before you start
+
+Read [Architecture](/docs/developers/architecture) and
+[Security model](/docs/developers/security-model). The component split is not
+arbitrary — most boundaries exist to hold a specific security property, and a
+change that looks like a simplification often removes one.
+
+Two examples of things that look redundant and are not:
+
+- The worker and sandbox runner could share a signing secret instead of a
+  keypair. That would remove the property that a compromised runner cannot mint
+  manifests.
+- Egress grants could be signed rather than encrypted. That would expose every
+  in-scope file id to untrusted code for no functional gain.
+
+## Development setup
+
+See [Building from source](/docs/developers/building). The short version:
+
+```bash
+CODEAPI_LANGUAGES=python docker compose up --build
+```
+
+## What CI enforces
+
+- `api/` unit tests (Bun)
+- `service/` unit tests (Bun)
+- `spec-guard.c` compiles with `-Wall -Wextra -Werror` and passes a smoke test
+
+See [Testing](/docs/developers/testing).
+
+## Code conventions
+
+**Comment density is high, deliberately.** Many comments record *why* a
+non-obvious choice was made, often citing the bug that motivated it — the
+`isPyPlot` scan, the body-hash binding, the `pidfd_send_signal` refusal. When
+you change that code, update the comment; when you make a similar decision,
+write one.
+
+**Prettier** is configured at the root and run by `pre-commit`.
+
+**Wire types between `service/` and `api/`** are shared by convention, not by a
+published package, because the two always deploy together. Several comments note
+that a rename there is a hard rename with no back-compat alias. If you rename a
+field, change both sides in the same change.
+
+## Changes that need extra care
+
+<Accordions>
+<Accordion title="The seccomp policy">
+
+`api/src/nsjail.ts`. Adding a syscall to the allow-list widens the kernel
+attack surface. Removing one can break a language runtime at startup — several
+entries are `ERRNO` rather than `KILL` precisely because runtimes probe for them.
+
+Run the `tests/` isolation probes.
+
+</Accordion>
+
+<Accordion title="Manifest or grant formats">
+
+Both carry a version field. Changing a format needs a rollout story: components
+upgrade independently, so a mixed-version fleet must keep working. The existing
+body-versus-header capability handling is the pattern to follow.
+
+</Accordion>
+
+<Accordion title="Session key derivation">
+
+`service/src/session-key.ts` defines the boundary between users' files.
+Changing the derivation changes every existing key, which invalidates caches and
+can make previously accessible files unreachable. The `resource_id` versus `id`
+split exists because conflating them broke authorization for every shared-kind
+`/exec`.
+
+</Accordion>
+
+<Accordion title="The persistent-session path">
+
+The compare-and-swap pointer advance, the snapshot refcount, and the TTL-refresh
+rules all interact. Read the comments in `service/src/session-persist.ts` and
+the pointer logic in the `/exec` handler before changing any of them — the
+"do not refresh the TTL on a failed restore" rule in particular is load-bearing.
+
+</Accordion>
+
+<Accordion title="Error messages leaving the runner">
+
+`api/src/safe-error.ts` decides what a caller may see. Sandbox paths, UIDs, and
+host details are useful to an attacker. New error paths should go through the
+classifier.
+
+</Accordion>
+</Accordions>
+
+## Documentation
+
+This site lives in `docs/`. Content is MDX under `docs/content/docs`:
+
+- `content/docs/guides/` — user-facing
+- `content/docs/developers/` — internals
+- `content/docs/reference/api/` — **generated**, do not edit
+
+The API reference is generated from `service/openapi.yml` and
+`api/openapi.yaml` at build time. To change it, **edit the spec** — the
+generated MDX is gitignored and regenerated on every build.
+
+```bash
+cd docs
+npm install
+npm run dev
+```
+
+Keeping the specs accurate matters more than usual here, since they are both the
+contract and the published documentation.
+
+## Reporting issues
+
+Open a GitHub issue with reproduction steps.
+
+<Callout type="error" title="Security issues">
+For suspected security issues, **do not open a public issue.** Contact the
+maintainers privately so a fix can ship before the details are public.
+</Callout>
+
+Useful detail for a bug report:
+
+- Deployment mode — Compose or Helm, `KVM_ENABLED` on or off
+- Which component logged the error
+- The relevant configuration, with secrets redacted
+- A minimal reproducing request

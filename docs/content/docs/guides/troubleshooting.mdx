@@ -1,0 +1,242 @@
+---
+title: Troubleshooting
+description: Concrete failure modes, what causes them, and how to confirm the diagnosis.
+icon: CircleHelp
+---
+
+## Startup problems
+
+### The sandbox container will not start
+
+```
+Error response from daemon: error gathering device information ... /dev/kvm: no such file or directory
+```
+
+The host has no usable `/dev/kvm`. Either use a host that does, or layer the
+no-KVM override and accept
+[the weaker isolation](/docs/guides/deployment/without-kvm):
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.nokvm.yml up
+```
+
+Confirm the host's capability:
+
+```bash
+ls -l /dev/kvm
+kvm-ok 2>/dev/null || egrep -c '(vmx|svm)' /proc/cpuinfo
+```
+
+### The service refuses to start with an auth error
+
+```
+CODEAPI_AUTH_PROVIDER=none requires CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true
+```
+
+Working as intended — running with no authentication has to be stated twice on
+purpose. If you meant it, set both. If you did not, configure
+[JWT mode](/docs/guides/authentication#jwt-eddsa-mode).
+
+### `helm install` fails on missing keys
+
+The chart ships **no default execution-manifest keypair** and fails fast rather
+than starting insecure. [Generate one](/docs/guides/deployment/kubernetes#signing-keys-are-required).
+
+### package_init never finishes
+
+It downloads and installs the runtimes; the first run takes a while, especially
+with all languages selected.
+
+```bash
+docker compose logs -f package_init
+kubectl logs -f job/codeapi-package-init
+```
+
+If it fails on a checksum, you likely overrode a runtime version without setting
+the matching `*_SHA256`. Either set it or drop the override.
+
+To start over:
+
+```bash
+FORCE_REBUILD=true docker compose up package_init
+```
+
+## Execution problems
+
+### Every request returns 401
+
+Work through the matching table in
+[Connecting LibreChat](/docs/guides/librechat#what-must-match-on-both-sides).
+The usual causes, in order of likelihood:
+
+1. `iss` or `aud` mismatch between signer and verifier.
+2. The `kid` in the token is not one the verifier knows.
+3. The token expired — the cap is 300 seconds.
+4. `CODEAPI_JWT_ALLOWED_ALGS` does not include the signing algorithm.
+
+Decode the token to see what it actually claims:
+
+```bash
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq
+```
+
+### Every request returns 404
+
+Almost always a missing `/v1` on the base URL:
+
+```bash
+LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1   # not .../3112
+```
+
+### `Unsupported language`
+
+The runtime is not installed. Check what actually exists:
+
+```bash
+curl -s http://localhost:2000/api/v2/runtimes | jq '[.[].language]'
+```
+
+If your language is missing, it was excluded by `CODEAPI_LANGUAGES`. Add it and
+restart — only the missing runtime is installed.
+
+Also check you are sending the right value: `py` (not `python`), `js`, `ts`,
+`node`, `bash`, `java`.
+
+### The code returns a non-zero exit code, and I get HTTP 200
+
+Correct behaviour. A `200` means the service ran the program successfully. The
+program's own failure shows in `code` (non-zero) or `signal` (non-null), with
+detail in `stderr`. Check those fields, not the HTTP status.
+
+### Runs are killed with SIGKILL
+
+Almost always a limit:
+
+| Cause | Field | Fix |
+| --- | --- | --- |
+| Out of memory | `signal: "SIGKILL"` | Raise `SANDBOX_RUN_MEMORY_LIMIT` or `LAUNCHER_RAM_MIB` |
+| Wall-clock timeout | `message` mentions a time limit | Raise `SANDBOX_RUN_TIMEOUT` |
+| CPU-time limit | `signal: "SIGXCPU"` | Raise `SANDBOX_RUN_CPU_TIME` |
+| Too many processes | fork failures in `stderr` | Raise `SANDBOX_MAX_PROCESS_COUNT` |
+| File too large | `signal: "SIGXFSZ"` | Raise `SANDBOX_MAX_FILE_SIZE` |
+
+Raise them deliberately. Each one is a denial-of-service budget you are handing
+to untrusted code.
+
+### Output is truncated
+
+`SANDBOX_OUTPUT_MAX_SIZE` (65536 by default) caps stdout and stderr. Write large
+results to a file in `/mnt/data` and collect them as artifacts instead of
+printing them.
+
+### The sandbox cannot reach the network
+
+Working as intended — the sandbox has **no network access at all**. Everything
+it needs goes through the [egress gateway](/docs/developers/egress) under a
+signed capability.
+
+If your code needs a package, use
+[dynamic dependencies](/docs/guides/dependencies) (the *runner* fetches it, not
+the sandbox) or add it to the baked-in set.
+
+## File problems
+
+### `File not found` on download
+
+1. **Wrong session id.** Use the `session_id` from the exec response, or the
+   `storage_session_id` from the upload response — they are
+   [different things](/docs/guides/concepts#session_id-versus-storage_session_id).
+2. **Wrong principal.** File routes are scoped to the authenticated caller.
+   A different user, or a different tenant, will not find it.
+3. **Genuinely expired.** Check the upload cache TTL and any storage lifecycle
+   policy you configured.
+
+### Uploads return 413
+
+The file exceeded `MAX_FILE_SIZE` (25 MiB default).
+
+### An output file 403s when I download it
+
+Check for `inherited: true` on the ref. That marks an unchanged passthrough of
+an input you already own — re-downloading it with the end user's session key
+will fail, and is wasted work anyway. Skip those refs.
+
+### Files vanish between runs
+
+Expected without persistence. Each execution gets a fresh workspace. Enable
+[persistent sessions](/docs/guides/sessions) if you want continuity.
+
+## Persistent session problems
+
+### Variables do not carry over
+
+Check, in order:
+
+1. `CODEAPI_PERSIST_SESSIONS=true` on **all** components.
+2. The language is Python — other languages get file persistence only.
+3. You are calling `/v1/exec`, **not** `/v1/exec/programmatic`. The programmatic
+   routes [never persist](/docs/guides/sessions#known-limitations).
+4. `session_state_persisted` in the previous response. If false, the snapshot
+   was skipped — usually oversize.
+5. `session_state_restore_failed` in this response. If true, the snapshot could
+   not be read.
+
+### Some variables restore and others do not
+
+By design. Open handles, sockets, threads, and some native objects cannot be
+serialized and are dropped with a warning. Data structures restore reliably.
+
+### Two conversations are sharing state
+
+Also by design, and worth knowing before you ship it. Continuity is scoped to
+the authenticated user, not the conversation — no conversation id reaches the
+service. See [the limitation](/docs/guides/sessions#known-limitations).
+
+### Storage keeps growing
+
+Abandoned sessions leak their last snapshot: the Redis pointer expires but the
+object is not deleted. Set a lifecycle policy on the bucket or prefix.
+
+## Performance problems
+
+### Jobs queue up
+
+Check `codeapi_bullmq_queue_jobs`. If it climbs steadily, add worker capacity
+or raise per-worker concurrency — see
+[scaling](/docs/guides/operations#scaling).
+
+### The first run after a deploy is slow
+
+Cold start: runtimes page in, caches are empty. Normal.
+
+### Every Python run is slow
+
+Scientific imports are expensive. If `PYTHON_CONCURRENCY=1` and Python work
+dominates, workers serialise on it — raise it if memory allows, and watch
+`codeapi_sandbox_execution_duration_seconds` for contention.
+
+## Diagnostics
+
+```bash
+# Which components are unhealthy?
+curl -s localhost:3112/v1/health
+curl -s localhost:2000/api/v2/health
+curl -s localhost:3190/ready
+
+# What runtimes exist?
+curl -s localhost:2000/api/v2/runtimes | jq
+
+# Verbose sandbox logs
+SANDBOX_LOG_LEVEL=DEBUG docker compose up sandbox-runner
+
+# Is the sandbox really network-isolated?
+curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"import urllib.request;urllib.request.urlopen(\"https://example.com\",timeout=5)"}' \
+  | jq -r '.stderr'
+# expect a network failure
+```
+
+## Getting help
+
+Open a GitHub issue with reproduction steps. For suspected security issues,
+**do not open a public issue** — contact the maintainers privately.

@@ -1,2 +1,6 @@
 node_modules
 data/
+# The docs site follows the Next.js/Fumadocs 2-space convention, not this
+# repo's root tabWidth: 4. Left to its own formatting so the pre-commit hook
+# does not reflow it.
+docs/

@@ -1,0 +1,219 @@
+---
+title: Operating the service
+description: Health checks, metrics, scaling behaviour, and what to watch in production.
+icon: Activity
+---
+
+## Health endpoints
+
+Each component exposes its own probes. They are not interchangeable — the API
+being healthy says nothing about whether the sandbox runner can execute code.
+
+| Component | Endpoint | Purpose |
+| --- | --- | --- |
+| API | `GET /v1/health` | Liveness |
+| Worker | `GET /health`, `GET /ready` on port `3113` | Liveness and readiness |
+| Sandbox runner | `GET /api/v2/health` on port `2000` | Workspace subsystem health |
+| File server | `GET /health`, `GET /ready` on port `3000` | Liveness and storage readiness |
+| Tool call server | `GET /health` on port `3033` | Liveness |
+| Egress gateway | `GET /live`, `GET /health`, `GET /ready` on port `3190` | Liveness and readiness |
+
+The sandbox runner's health check reports whether it can still create and tear
+down sandbox workspaces — the thing that actually breaks under resource
+pressure. The Compose file uses `GET /api/v2/runtimes` as its container
+healthcheck, which additionally confirms runtimes were discovered.
+
+```bash
+# Is the whole path working end to end?
+curl -s localhost:3112/v1/health
+curl -s localhost:2000/api/v2/runtimes | jq 'length'
+```
+
+## Metrics
+
+Every component exposes Prometheus metrics at `GET /metrics`.
+
+On Kubernetes the chart templates a `PodMonitor`; enable it alongside your
+Prometheus operator.
+
+### Job and execution metrics
+
+| Metric | Type | What it tells you |
+| --- | --- | --- |
+| `codeapi_jobs_submitted_total` | counter | Work arriving |
+| `codeapi_jobs_completed_total` | counter | Work finishing |
+| `codeapi_jobs_failed_total` | counter | Failures — alert on the rate |
+| `codeapi_job_processing_duration_seconds` | histogram | End-to-end job latency |
+| `codeapi_active_jobs` | gauge | In-flight work |
+| `codeapi_bullmq_queue_jobs` | gauge | **Queue depth — the key scaling signal** |
+| `codeapi_worker_running` | gauge | Worker liveness |
+
+### Sandbox metrics
+
+| Metric | Type | What it tells you |
+| --- | --- | --- |
+| `codeapi_sandbox_executions_total` | counter | Executions by outcome |
+| `codeapi_sandbox_execution_duration_seconds` | histogram | Time inside the sandbox |
+| `codeapi_sandbox_active_executions` | gauge | Concurrent executions vs. `SANDBOX_MAX_CONCURRENT_JOBS` |
+| `codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total` | counter | **Sandbox setup wedging — should stay at zero** |
+
+### File and tool-call metrics
+
+| Metric | Type |
+| --- | --- |
+| `codeapi_file_uploads_total`, `codeapi_file_downloads_total` | counter |
+| `codeapi_tool_calls_total` | counter |
+| `codeapi_tool_call_timeouts_total` | counter |
+| `codeapi_tool_call_active_sessions` | gauge |
+| `codeapi_ptc_replay_continuations_total` | counter |
+| `codeapi_ptc_replay_lock_contention_total` | counter |
+| `codeapi_ptc_replay_state_oversize_total` | counter |
+
+### HTTP metrics
+
+`codeapi_http_requests_total` and `codeapi_http_request_duration_seconds`,
+labelled by route and status, on the API and file server;
+`codeapi_sandbox_http_*` on the sandbox runner.
+
+## What to alert on
+
+| Signal | Why it matters |
+| --- | --- |
+| `codeapi_bullmq_queue_jobs` rising steadily | Not enough worker capacity. |
+| `codeapi_jobs_failed_total` rate increasing | Something is broken, not just slow. |
+| `codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total` above zero | Sandbox setup is wedging — investigate immediately. |
+| `codeapi_sandbox_active_executions` pinned at the max | Runners are saturated; jobs are queueing behind them. |
+| `codeapi_tool_call_timeouts_total` rising | Callers are not answering tool calls in time. |
+| Any readiness probe flapping | Usually Redis or object storage connectivity. |
+
+## Scaling
+
+The tiers scale independently, and they do not scale for the same reasons.
+
+### Workers and sandboxes
+
+This is the tier that saturates first. Scale it on **queue depth**.
+
+```bash
+# Kubernetes
+kubectl scale deployment/codeapi-sandbox-runner --replicas=10
+
+# or via Helm
+helm upgrade codeapi ./helm/codeapi \
+  --set workerSandbox.replicaCount=10
+```
+
+Per-worker concurrency:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PYTHON_CONCURRENCY` | `1` | Concurrent Python jobs per worker |
+| `OTHER_CONCURRENCY` | `8` | Concurrent non-Python jobs per worker |
+| `SANDBOX_MAX_CONCURRENT_JOBS` | `8` | Concurrent executions per sandbox runner |
+
+<Callout type="info" title="Why Python gets its own queue">
+Python jobs are heavier — scientific imports alone cost real memory and CPU.
+They run on a separate queue with a lower default concurrency so a burst of
+pandas work cannot starve cheap Bash and JS runs.
+</Callout>
+
+Raising `PYTHON_CONCURRENCY` beyond 1 is reasonable when jobs are light and
+memory is plentiful. Watch `codeapi_sandbox_execution_duration_seconds` for
+contention as you do.
+
+### The API tier
+
+Stateless; scale on CPU and request rate. The chart templates an HPA
+(`api.autoscaling.enabled`). Two replicas is a sensible floor for availability.
+
+### File server
+
+Scale on file throughput. Usually not the bottleneck — the heavy lifting is in
+object storage.
+
+### Redis and object storage
+
+Shared dependencies. Redis holds the job queue, session pointers, and the
+egress ledger. Object storage holds files and, when enabled, session snapshots.
+Neither is scaled by this chart in any serious way — use a managed service in
+production.
+
+## Capacity planning
+
+Roughly:
+
+- **Memory per sandbox** — `LAUNCHER_RAM_MIB` (2048 default) per concurrent
+  microVM, plus runner overhead.
+- **CPU per sandbox** — `LAUNCHER_VCPUS` (2 default) per concurrent microVM.
+- **Disk for runtimes** — a few GB per node for the packages volume, depending
+  on `CODEAPI_LANGUAGES`.
+- **Object storage** — driven by file retention and, if enabled, persistent
+  session snapshots at up to `CODEAPI_SESSION_STATE_MAX_BYTES` each.
+
+The Helm defaults request `500m` CPU / `1Gi` memory and limit at `2000m` / `3Gi`
+per worker-sandbox pod.
+
+## Rate limits
+
+Applied per principal on the API, backed by Redis so they hold across replicas:
+
+| Operation | Default |
+| --- | --- |
+| Executions | 20 per 30 s |
+| Uploads | 30 per 5 min |
+| Downloads | 60 per min |
+| File list / metadata | 120 per min |
+
+Rejections return `429` with `RateLimit-Limit`, `RateLimit-Remaining`, and
+`Retry-After`. See [configuration](/docs/guides/configuration#rate-limits).
+
+## Tracing
+
+OpenTelemetry tracing is available and off by default:
+
+```yaml
+otel:
+  enabled: true
+  exporterOtlpEndpoint: "http://collector.observability:4318"
+```
+
+Trace context propagates from the API through the worker into the sandbox
+execution, so a slow request can be attributed to a specific stage. If you
+enable it with network policies on, allow the collector — the chart's
+`networkPolicy.otel` block does this.
+
+## Upgrades
+
+The components are designed to roll independently:
+
+- Capability formats accept both body and header forms during rolling upgrades.
+- Manifest verification tolerates the mixed-version window.
+
+Order that minimises surprises: **file server and tool call server → egress
+gateway → sandbox runners → workers → API**. Dependencies come up before the
+things that call them.
+
+<Callout type="warn">
+Rolling out a persistent-session flag change to only part of the fleet produces
+a documented skew case: a worker expecting a restore talking to a runner with
+persistence disabled reports `session_state_restore_failed` rather than
+silently discarding the run's changes. Roll the flag across the whole fleet
+together.
+</Callout>
+
+## Log locations
+
+```bash
+# Docker Compose
+docker compose logs -f api
+docker compose logs -f service-worker
+docker compose logs -f sandbox-runner
+
+# Kubernetes
+kubectl logs -f deployment/codeapi-api
+kubectl logs -f deployment/codeapi-service-worker
+kubectl logs -f deployment/codeapi-sandbox-runner
+```
+
+Set `SANDBOX_LOG_LEVEL=DEBUG` for verbose sandbox output when diagnosing
+execution problems.

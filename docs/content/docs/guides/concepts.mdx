@@ -1,0 +1,156 @@
+---
+title: Core concepts
+description: The vocabulary the API uses — sessions, storage, principals, and what "isolated" actually means here.
+icon: Lightbulb
+---
+
+A handful of terms recur throughout the API and the configuration. Getting them
+straight early saves a lot of confusion later, because two of them are spelled
+similarly and mean different things.
+
+## Executions and sessions
+
+Every call to `/v1/exec` is one **execution**. The service mints a fresh
+`session_id` for it and returns that id in the response.
+
+That id does double duty:
+
+1. It identifies the execution.
+2. It is the **storage prefix** for any files the run produced.
+
+So when you want to download an artifact from a run, the `session_id` you got
+back from `/v1/exec` is the path segment you use:
+
+```
+GET /v1/download/{session_id}/{fileId}
+```
+
+### `session_id` versus `storage_session_id`
+
+These are different, and the distinction matters when you pass files *into* a
+run.
+
+| Field | Meaning |
+| --- | --- |
+| `session_id` | The top-level execution — one `/exec` invocation. Also the storage prefix for that run's **outputs**. |
+| `storage_session_id` | Per-file. The storage session where a particular file's **bytes** actually live. |
+
+A file you uploaded earlier lives under the `storage_session_id` the upload
+returned. When you reference it on a later `/exec` call, you pass that value —
+not the id of the execution you are about to start.
+
+<Callout type="info">
+The two were historically conflated in this codebase, which caused real
+authorization bugs. They are now deliberately separate fields on the wire.
+</Callout>
+
+## The sessionKey, and why you never send one
+
+Storage is namespaced by a value called the **sessionKey**. You never construct
+it, never send it, and never see it.
+
+The service derives it server-side from the authenticated principal and the
+resource a file belongs to. Since it is derived rather than supplied, a caller
+cannot address another caller's namespace by guessing or forging an id — there
+is no field in which to forge it. It is also bound into the signed
+[execution manifest](/docs/developers/security-model#execution-manifests), so
+the sandbox cannot widen its own access after the fact.
+
+## File kinds
+
+Every file belongs to a resource, and the `kind` field says which. This is what
+decides the namespace the sessionKey derives:
+
+| Kind | Scope | Typical use |
+| --- | --- | --- |
+| `user` | Private to the requesting user, keyed from the auth context. | Chat attachments, code output artifacts. |
+| `agent` | Shared across the users of one agent. | Agent-owned resources. |
+| `skill` | Shared, and additionally scoped by a `version` number. | Skill bundles, where each revision gets its own namespace. |
+
+`version` is **required** when `kind` is `skill` and **rejected** for the other
+kinds. Because a skill's version counter is monotonic, editing a skill
+naturally invalidates the previous cache entry — the new version derives a
+different sessionKey.
+
+Outputs are always `user`-scoped, regardless of the kinds of the inputs. A run
+that reads a shared skill bundle still writes its results into the requesting
+user's private namespace.
+
+## The workspace
+
+Inside the sandbox, code runs in `/mnt/data`. That directory is:
+
+- **Fresh for every execution** by default — created, used, destroyed.
+- **Writable**, unlike almost everything else in the sandbox.
+- **Where input files are staged**, under the `name` you gave them.
+- **Where output files are collected from** when the run finishes.
+
+If you enable [persistent sessions](/docs/guides/sessions), `/mnt/data` carries
+over between runs for the same caller instead of being discarded.
+
+## Principals and identity
+
+A **principal** is the authenticated caller. Depending on
+[how you configure authentication](/docs/guides/authentication), it comes from:
+
+- the verified claims of a LibreChat-signed JWT (the production path), or
+- the `User-Id` header, then the body's `user_id`, then `anonymous`, when
+  `CODEAPI_AUTH_PROVIDER=none`, or
+- a fixed local principal, when `LOCAL_MODE=true`.
+
+The principal is what the sessionKey derives from, so it is the boundary
+between one user's files and another's.
+
+## What "isolated" means here
+
+Isolation is layered, and how much you get depends on one setting.
+
+<Tabs items={['MicroVM mode (default)', 'NsJail-only mode']}>
+  <Tab value="MicroVM mode (default)">
+
+`KVM_ENABLED=true`. The sandbox runs inside a **libkrun microVM** with its own
+guest kernel, and NsJail runs *inside* that guest.
+
+- Untrusted code faces the guest kernel, not the host kernel.
+- A kernel-level exploit compromises a throwaway VM.
+- NsJail's namespaces, seccomp filter, and cgroup limits still apply inside.
+
+This is the configuration the security posture is designed around.
+
+  </Tab>
+  <Tab value="NsJail-only mode">
+
+`KVM_ENABLED=false`. NsJail alone, sharing the **host kernel**.
+
+- Namespaces, seccomp-bpf, cgroups, and rlimits still apply.
+- But a kernel vulnerability reachable through the permitted syscalls is a
+  host-level problem.
+
+Appropriate for local development and code you trust. Not appropriate for
+untrusted code from people you don't trust.
+
+  </Tab>
+</Tabs>
+
+In both modes the sandbox has **no network access**. Everything it needs from
+the outside — reading input files, writing outputs, calling tools — goes
+through the [egress gateway](/docs/developers/egress), which enforces a signed,
+scoped capability naming exactly which objects that specific run may touch.
+
+## Components at a glance
+
+The stack is several independently scalable services rather than one process:
+
+| Component | Port | Role |
+| --- | --- | --- |
+| **API** | 3112 | Public HTTP entry point. Authenticates, validates, enqueues. |
+| **Worker** | 3113 (health) | Pulls jobs off Redis, mints capabilities, drives the sandbox. |
+| **Sandbox runner** | 2000 | Actually executes code under NsJail/microVM. |
+| **File server** | 3000 | S3-backed object storage for session files. |
+| **Tool call server** | 3033 | Routes tool calls from inside sandboxes back to the caller. |
+| **Egress gateway** | 3190 | The only network path out of a sandbox; enforces capabilities. |
+| **package_init** | — | One-shot job that installs language runtimes onto a shared volume. |
+
+Plus Redis (job queue and session pointers) and S3-compatible storage (MinIO
+locally). See [Architecture](/docs/developers/architecture) for how they fit
+together.

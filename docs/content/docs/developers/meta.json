@@ -1,0 +1,22 @@
+{
+  "title": "Developers",
+  "description": "Internals, security design, and contributing",
+  "icon": "Wrench",
+  "root": true,
+  "pages": [
+    "architecture",
+    "repo-layout",
+    "---Execution---",
+    "execution-lifecycle",
+    "sandbox-isolation",
+    "---Security---",
+    "security-model",
+    "egress",
+    "---Working on it---",
+    "building",
+    "testing",
+    "contributing",
+    "---Internal API---",
+    "sandbox-api"
+  ]
+}

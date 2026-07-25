@@ -1,0 +1,184 @@
+---
+title: Connecting LibreChat
+description: Point LibreChat at this service and get the two sides agreeing on authentication.
+icon: Plug
+---
+
+LibreChat talks to this service over plain HTTP. There are exactly two things to
+get right: the base URL, and the authentication settings matching on both sides.
+
+## The base URL
+
+Point LibreChat at the **API** component, which listens on port `3112` and
+serves everything under the `/v1` prefix. Set `LIBRECHAT_CODE_BASEURL` to that
+base URL **including the `/v1` suffix**:
+
+```bash title="LibreChat .env"
+LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1
+```
+
+Use the internal service name when LibreChat and this service share a Docker
+network or Kubernetes namespace:
+
+```bash
+LIBRECHAT_CODE_BASEURL=http://api:3112/v1
+```
+
+<Callout type="warn">
+Forgetting the `/v1` is the single most common setup mistake. Without it every
+request 404s.
+</Callout>
+
+## Authentication
+
+Pick one of two modes. The service decides which via `CODEAPI_AUTH_PROVIDER`.
+
+<Callout type="info">
+The legacy `X-API-Key` header is no longer accepted. Outside local mode the API
+requires a `Bearer` JWT.
+</Callout>
+
+<Tabs items={['Unauthenticated (local/dev only)', 'JWT (production)']}>
+<Tab value="Unauthenticated (local/dev only)">
+
+The default Compose files run with `LOCAL_MODE=true`, which bypasses
+authentication entirely. LibreChat needs only the base URL; leave its
+`CODEAPI_JWT_*` variables unset. Nothing else is required on either side.
+
+```bash title="LibreChat .env"
+LIBRECHAT_CODE_BASEURL=http://localhost:3112/v1
+```
+
+If you run with `LOCAL_MODE=false` but still want no authentication, say so
+explicitly on the service:
+
+```bash title="codeapi .env"
+LOCAL_MODE=false
+CODEAPI_AUTH_PROVIDER=none
+CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true
+```
+
+With `CODEAPI_AUTH_PROVIDER=none` the user id comes from the `User-Id` header,
+falling back to the body's `user_id`, then `anonymous`. The service refuses to
+start in this mode unless `CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true` is also set.
+
+<Callout type="error">
+Unauthenticated mode lets any caller execute arbitrary code. Never expose it on
+a public network or a shared host. Use it only on loopback or a trusted private
+network.
+</Callout>
+
+</Tab>
+<Tab value="JWT (production)">
+
+LibreChat signs a short-lived EdDSA (Ed25519) JWT with a private key and sends
+it as `Authorization: Bearer <token>`. This service verifies the signature with
+the matching public key. **The private key stays on the LibreChat side and
+never reaches this service.**
+
+### Generate a keypair
+
+```bash
+# Private key stays with LibreChat (the signer)
+openssl genpkey -algorithm ed25519 -out jwt-codeapi.key
+
+# Public key goes to this service (the verifier)
+openssl pkey -in jwt-codeapi.key -pubout -out jwt-codeapi.pub
+```
+
+### Configure LibreChat (the signer)
+
+LibreChat populates the required claims — `iss`, `aud`, `sub`, `jti`, `iat`,
+`nbf`, `exp`, `principal_source`, `auth_context_hash` — automatically.
+
+```bash title="LibreChat .env"
+LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1
+CODEAPI_AUTH_PROVIDER=librechat-jwt
+CODEAPI_JWT_ALGORITHM=EdDSA
+CODEAPI_JWT_KID=lc-codeapi-1
+CODEAPI_JWT_ISSUER=librechat
+CODEAPI_JWT_AUDIENCE=codeapi
+# Contents of jwt-codeapi.key (newlines may be escaped as \n)
+CODEAPI_JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+```
+
+### Configure this service (the verifier)
+
+```bash title="codeapi .env"
+LOCAL_MODE=false
+CODEAPI_AUTH_PROVIDER=librechat-jwt
+CODEAPI_JWT_ISSUER=librechat
+CODEAPI_JWT_AUDIENCE=codeapi
+CODEAPI_JWT_ALLOWED_ALGS=EdDSA
+CODEAPI_JWT_KID=lc-codeapi-1
+# Contents of jwt-codeapi.pub (newlines may be escaped as \n)
+CODEAPI_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+```
+
+</Tab>
+</Tabs>
+
+## What must match on both sides
+
+| Setting | Signer (LibreChat) | Verifier (this service) |
+| --- | --- | --- |
+| Algorithm | `CODEAPI_JWT_ALGORITHM=EdDSA` | `CODEAPI_JWT_ALLOWED_ALGS=EdDSA` |
+| Key id | `CODEAPI_JWT_KID` | `CODEAPI_JWT_KID` |
+| Issuer | `CODEAPI_JWT_ISSUER` | `CODEAPI_JWT_ISSUER` (default `librechat`) |
+| Audience | `CODEAPI_JWT_AUDIENCE` | `CODEAPI_JWT_AUDIENCE` (default `codeapi`) |
+
+A token whose `kid` the verifier does not know is rejected outright. Tokens are
+capped at a 300-second lifetime (`CODEAPI_JWT_MAX_TTL_SECONDS`) with 30 seconds
+of clock skew tolerance.
+
+<Callout type="warn">
+Because `LOCAL_MODE=true` bypasses authentication entirely, JWT mode requires
+`LOCAL_MODE=false`. Setting up JWTs while leaving local mode on gets you
+unauthenticated access with extra steps.
+</Callout>
+
+## Key rotation
+
+Instead of a single `CODEAPI_JWT_PUBLIC_KEY` + `CODEAPI_JWT_KID`, the verifier
+also accepts:
+
+- `CODEAPI_JWT_JWKS_JSON` — an inline JWKS document
+- `CODEAPI_JWT_PUBLIC_KEYS_DIR` — a directory of PEM files named by `kid`
+
+Both let you serve several verifier keys at once, so you can introduce a new
+signing key before retiring the old one.
+
+## Enabling the languages you need
+
+`CODEAPI_LANGUAGES` selects which runtimes get pre-installed. Installing all of
+them takes a while and a fair amount of disk; if LibreChat only needs Python,
+say so:
+
+```bash
+CODEAPI_LANGUAGES=python
+```
+
+See [Languages and runtimes](/docs/guides/languages).
+
+## Verifying the connection
+
+From the LibreChat host:
+
+```bash
+curl -s http://codeapi-host:3112/v1/health
+```
+
+Then a real execution. In JWT mode, mint a token the way LibreChat does and:
+
+```bash
+curl -sX POST http://codeapi-host:3112/v1/exec \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"print(\"connected\")"}' | jq
+```
+
+If that returns `stdout: "connected\n"`, both sides agree. If it returns `401`,
+work through [the matching table](#what-must-match-on-both-sides) — issuer,
+audience, `kid`, and algorithm all have to line up exactly.
+
+See [Troubleshooting](/docs/guides/troubleshooting) for specific failure modes.

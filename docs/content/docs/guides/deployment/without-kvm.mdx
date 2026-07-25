@@ -1,0 +1,91 @@
+---
+title: Running without KVM
+description: How to run on hosts with no /dev/kvm, and exactly what you give up by doing so.
+icon: TriangleAlert
+---
+
+The default stack boots the sandbox inside a libkrun microVM and maps
+`/dev/kvm` into the sandbox container. On hosts without a usable `/dev/kvm`,
+Docker fails to start that container outright.
+
+Common cases: budget VPS instances, LXC containers, and nested virtualisation
+without KVM passthrough.
+
+## The override
+
+Layer the no-KVM override onto the default file:
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.nokvm.yml up
+```
+
+For the scalable stack, use its companion:
+
+```bash
+docker compose -f docker-compose.scalable.yml -f docker-compose.scalable.nokvm.yml up
+```
+
+On Kubernetes, set `workerSandbox.kvmEnabled=false` in the Helm values.
+
+Either way the effective setting is `KVM_ENABLED=false`, which switches the
+sandbox runner from microVM mode to NsJail-only mode.
+
+## What you give up
+
+<Callout type="error" title="This is a real reduction in the security boundary">
+NsJail-only mode shares the **host kernel** with untrusted code. It is
+appropriate for local development and for code you trust. It is **not**
+appropriate for executing untrusted code from people you don't trust.
+</Callout>
+
+Here is the concrete difference:
+
+| Layer | MicroVM mode | NsJail-only mode |
+| --- | --- | --- |
+| Guest kernel | Separate kernel inside libkrun | **None — host kernel is shared** |
+| Namespaces | Applied, inside the guest | Applied, on the host |
+| seccomp-bpf filter | Applied | Applied |
+| cgroups v2 limits | Applied | Applied |
+| rlimits | Applied | Applied |
+| Non-root execution | Applied | Applied |
+| Empty network namespace | Applied | Applied |
+| Blast radius of a kernel exploit | A throwaway VM | **Your host** |
+
+Everything except the kernel boundary is unchanged. That one row is the whole
+argument.
+
+The sandbox still has no network access, still runs unprivileged, still has its
+syscalls filtered, and is still resource-capped. What changes is what a
+successful kernel-level exploit reaches: in microVM mode it lands inside a
+disposable guest; without KVM it lands on the machine running your
+infrastructure.
+
+## When NsJail-only is a reasonable choice
+
+- Local development on your own machine.
+- CI pipelines running code from your own repository.
+- Internal tooling where every caller is already trusted with host access.
+
+## When it is not
+
+- Any deployment where a language model generates the code.
+- Any deployment reachable by users you do not personally trust.
+- Anything multi-tenant.
+
+If you need to run untrusted code and your host cannot do KVM, the answer is a
+host that can — not this override.
+
+## Checking which mode you are in
+
+The sandbox runner logs its mode at startup. You can also confirm from the
+outside that the stack is up and which runtimes it has:
+
+```bash
+curl -s http://localhost:2000/api/v2/runtimes | jq
+```
+
+For the mode itself, inspect the container's environment:
+
+```bash
+docker compose exec sandbox-runner sh -c 'echo "KVM_ENABLED=$KVM_ENABLED"'
+```
