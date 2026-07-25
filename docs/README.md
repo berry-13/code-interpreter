@@ -3,13 +3,13 @@
 The Code Interpreter documentation, built with [Fumadocs](https://fumadocs.dev)
 on Next.js and deployed to GitHub Pages as a static export.
 
-Published at <https://berry-13.github.io/code-interpreter>.
+Published at <https://codeapi.berry13.com>.
 
 ## Working on it
 
 ```bash
 npm install
-npm run dev      # http://localhost:3000/code-interpreter
+npm run dev      # http://localhost:3000
 npm run build    # static export → out/
 ```
 
@@ -51,17 +51,22 @@ the generated MDX. `scripts/generate-openapi.mjs` does the generation.
 | `lib/shared.ts` | App name, GitHub coordinates, base path |
 | `lib/openapi.ts` | OpenAPI server used to preload specs |
 
-## Base path
+## Domain and base path
 
-GitHub Pages serves this from `/code-interpreter`, set in `next.config.mjs` and
-mirrored to the client via `NEXT_PUBLIC_BASE_PATH` (the static search client
-needs it to find its index).
+The site is served from the root of `codeapi.berry13.com`, so it builds with an
+empty base path. `public/CNAME` carries the domain into the build output, so it
+survives every deploy.
 
-For a custom domain or a user/org Pages site, build with an empty base path:
+To build for the bare GitHub Pages project URL instead — which serves from a
+subdirectory — set the base path explicitly:
 
 ```bash
-DOCS_BASE_PATH= npm run build
+DOCS_BASE_PATH=/code-interpreter npm run build
 ```
+
+That value is set in `next.config.mjs` and mirrored to the client via
+`NEXT_PUBLIC_BASE_PATH`, which the static search client needs to locate its
+index.
 
 ## Deployment
 

@@ -1,5 +1,9 @@
 # Builds the documentation site (docs/, Next.js + Fumadocs static export) and
-# publishes it to GitHub Pages at https://berry-13.github.io/code-interpreter.
+# publishes it to GitHub Pages at https://codeapi.berry13.com.
+#
+# The custom domain serves from the root, so the build needs no base path
+# (next.config.mjs defaults to ''). docs/public/CNAME travels with the
+# artifact so the domain survives every deploy.
 #
 # The API reference pages are generated at build time from service/openapi.yml
 # and api/openapi.yaml by docs/scripts/generate-openapi.mjs (wired to the
@@ -54,9 +58,9 @@ jobs:
 
       - name: Build static site
         working-directory: docs
-        # basePath must match the Pages project path; next.config.mjs defaults
-        # to /code-interpreter. Set DOCS_BASE_PATH here to override for a
-        # custom domain.
+        # Served from the root of the custom domain, so no base path. Set
+        # DOCS_BASE_PATH=/code-interpreter to build for the bare Pages project
+        # URL instead.
         run: npm run build
 
       - name: Upload Pages artifact

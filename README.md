@@ -3,10 +3,10 @@
 Sandboxed code execution service for LibreChat — runs untrusted,
 model-generated code with real isolation, file storage, and tool calling.
 
-**📖 [Documentation](https://berry-13.github.io/code-interpreter)** ·
-[Quickstart](https://berry-13.github.io/code-interpreter/docs/guides/quickstart) ·
-[API reference](https://berry-13.github.io/code-interpreter/docs/reference) ·
-[Architecture](https://berry-13.github.io/code-interpreter/docs/developers/architecture)
+**📖 [Documentation](https://codeapi.berry13.com)** ·
+[Quickstart](https://codeapi.berry13.com/docs/guides/quickstart) ·
+[API reference](https://codeapi.berry13.com/docs/reference) ·
+[Architecture](https://codeapi.berry13.com/docs/developers/architecture)
 
 ## Quickstart
 
@@ -26,7 +26,7 @@ curl -sX POST http://localhost:3112/v1/exec \
 
 To skip building from source, use `docker compose -f docker-compose.prebuilt.yml up`.
 On hosts without `/dev/kvm`, see
-[running without KVM](https://berry-13.github.io/code-interpreter/docs/guides/deployment/without-kvm).
+[running without KVM](https://codeapi.berry13.com/docs/guides/deployment/without-kvm).
 
 ## Connecting LibreChat
 
@@ -39,7 +39,7 @@ LIBRECHAT_CODE_BASEURL=http://codeapi-host:3112/v1
 
 The local Docker Compose files run with `LOCAL_MODE=true`, which needs no
 further setup. For anything else, configure JWT authentication — see
-[Connecting LibreChat](https://berry-13.github.io/code-interpreter/docs/guides/librechat).
+[Connecting LibreChat](https://codeapi.berry13.com/docs/guides/librechat).
 
 ## Components
 
@@ -56,7 +56,7 @@ storage, plus a one-shot runtime installer:
 | **Egress gateway**   | 3190 | The only network path out of a sandbox                         |
 | **package_init**     | —    | One-shot job installing language runtimes onto a shared volume |
 
-See [Architecture](https://berry-13.github.io/code-interpreter/docs/developers/architecture)
+See [Architecture](https://codeapi.berry13.com/docs/developers/architecture)
 for how they fit together and why the split exists.
 
 ## Security
@@ -81,7 +81,7 @@ hardening defaults on, run the stack on isolated infrastructure with least
 privilege, keep hosts patched, and deploy responsibly.
 
 Before exposing this to real users, work through
-[production hardening](https://berry-13.github.io/code-interpreter/docs/guides/deployment/hardening) —
+[production hardening](https://codeapi.berry13.com/docs/guides/deployment/hardening) —
 the development defaults disable authentication and ship publicly known secrets.
 
 If you believe you have found a vulnerability, please report it privately
@@ -89,11 +89,11 @@ rather than opening a public issue (see [CONTRIBUTING](CONTRIBUTING.md)).
 
 ## Documentation
 
--   [Guides](https://berry-13.github.io/code-interpreter/docs/guides/quickstart) —
+-   [Guides](https://codeapi.berry13.com/docs/guides/quickstart) —
     install, configure, integrate, operate
--   [API reference](https://berry-13.github.io/code-interpreter/docs/reference) —
+-   [API reference](https://codeapi.berry13.com/docs/reference) —
     every endpoint, generated from the OpenAPI specs
--   [Developers](https://berry-13.github.io/code-interpreter/docs/developers/architecture) —
+-   [Developers](https://codeapi.berry13.com/docs/developers/architecture) —
     architecture, security model, contributing
 
 The site lives in [`docs/`](docs) and is published to GitHub Pages on every push
@@ -114,7 +114,7 @@ to `main`. Component-level notes also live next to the code in
 This repository is published from an internal monorepo; changes land here as
 sync commits. Pull requests are welcome and are imported with attribution
 preserved — see [CONTRIBUTING](CONTRIBUTING.md) and the
-[contributing guide](https://berry-13.github.io/code-interpreter/docs/developers/contributing).
+[contributing guide](https://codeapi.berry13.com/docs/developers/contributing).
 
 ## License
 

@@ -4,10 +4,13 @@ import { createMDX } from 'fumadocs-mdx/next';
 const withMDX = createMDX();
 
 /**
- * GitHub Pages serves this repo's site from `/code-interpreter`. Override with
- * `DOCS_BASE_PATH=''` when deploying to a custom domain or a user/org site.
+ * The site is served from the root of its custom domain
+ * (codeapi.berry13.com — see `public/CNAME`), so no base path is needed.
+ *
+ * Set `DOCS_BASE_PATH=/code-interpreter` to build for the bare GitHub Pages
+ * project URL instead, which serves from a subdirectory.
  */
-const basePath = process.env.DOCS_BASE_PATH ?? '/code-interpreter';
+const basePath = process.env.DOCS_BASE_PATH ?? '';
 
 /** @type {import('next').NextConfig} */
 const config = {
