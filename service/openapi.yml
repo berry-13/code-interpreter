@@ -1,14 +1,55 @@
-openapi: '3.0.0'
+openapi: '3.0.3'
 info:
-  title: LibreChat Code Interpreter API
-  version: '1.0.0'
-  description: API for sandbox code execution and file management
+  title: Code Interpreter API
+  version: '2.0.0'
+  description: |
+    Public HTTP API of the Code Interpreter service (internally `codeapi`) — the
+    component LibreChat talks to. It accepts code-execution requests, runs them
+    in an isolated sandbox, and manages the files those runs read and produce.
+
+    **Base URL.** The API component listens on port `3112` and serves every
+    route under the `/v1` prefix. Point `LIBRECHAT_CODE_BASEURL` at that base
+    URL including the suffix, e.g. `http://codeapi-host:3112/v1`.
+
+    **Authentication.** Two modes are supported, selected by
+    `CODEAPI_AUTH_PROVIDER` on the service:
+
+    - `librechat-jwt` (default) — a short-lived EdDSA (Ed25519) JWT in
+      `Authorization: Bearer <token>`, signed by LibreChat and verified here.
+      Tokens are capped at 300 s (`CODEAPI_JWT_MAX_TTL_SECONDS`) with 30 s of
+      clock-skew tolerance.
+    - `none` — no authentication; the user id is taken from the `User-Id`
+      header, then the request body `user_id`, then `anonymous`. Refuses to
+      start unless `CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true`.
+
+    `LOCAL_MODE=true` (the default in the local Docker Compose files) bypasses
+    authentication entirely and stamps every request with a fixed local
+    principal. The legacy `X-API-Key` header is no longer accepted.
+
+    **Sessions and storage.** Callers never choose a storage namespace. The
+    service derives a `sessionKey` server-side from the authenticated principal
+    and the resource a file belongs to, so one user can never address another's
+    files. Each `/exec` call mints a fresh `session_id` that doubles as the
+    storage prefix for any files the run produces.
 servers:
-  - url: https://api.librechat.ai/v1
-    description: LibreChat API server
+  - url: http://localhost:3112/v1
+    description: Local Docker Compose stack
+  - url: https://{host}/v1
+    description: Self-hosted deployment
+    variables:
+      host:
+        default: codeapi.example.com
 
 security:
   - BearerAuth: []
+
+tags:
+  - name: Execution
+    description: Run code in a sandbox.
+  - name: Files
+    description: Upload, list, download, and delete session files.
+  - name: Operations
+    description: Health and readiness.
 
 components:
   securitySchemes:
@@ -16,115 +57,314 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: |
+        EdDSA (Ed25519) JWT minted by LibreChat. Required unless the service
+        runs with `LOCAL_MODE=true` or `CODEAPI_AUTH_PROVIDER=none`.
 
   schemas:
-    FileRef:
-      type: object
-      properties:
-        id:
-          type: string
-        name:
-          type: string
-        path:
-          type: string
+    CodeEnvKind:
+      type: string
+      enum: [user, agent, skill]
+      description: |
+        Which resource a file belongs to, which in turn decides the storage
+        namespace the service derives:
+
+        - `user` — user-private. Chat attachments and code-output artifacts.
+        - `agent` — shared across the users of one agent.
+        - `skill` — shared, and additionally scoped by `version`.
 
     RequestFile:
       type: object
+      description: A reference to an already-uploaded file to stage into the sandbox.
+      required: [id, resource_id, storage_session_id, name, kind]
       properties:
         id:
           type: string
-        session_id:
+          description: |
+            Storage file id returned by the upload routes. Identifies the bytes
+            at `<storage_session_id>/<id>` in the object bucket.
+          example: V1StGXR8Z5jdHi6BmyT
+        resource_id:
+          type: string
+          description: |
+            Identity of the entity owning the file's storage session — the skill
+            id for `kind: skill`, the agent id for `agent`. Informational for
+            `user` (the namespace derives from the auth context instead).
+            Distinct from `id`, which is the storage uuid.
+        storage_session_id:
+          type: string
+          description: Per-file storage session id (where the bytes live).
+        name:
+          type: string
+          description: Filename to write inside the sandbox workspace.
+          example: data.csv
+        kind:
+          $ref: '#/components/schemas/CodeEnvKind'
+        version:
+          type: integer
+          description: Required when `kind` is `skill`; rejected for other kinds.
+
+    FileRef:
+      type: object
+      description: A file produced by a run, addressable through the download route.
+      required: [id, storage_session_id, name, kind]
+      properties:
+        id:
+          type: string
+        resource_id:
+          type: string
+        storage_session_id:
           type: string
         name:
           type: string
-      required:
-        - id
-        - session_id
-        - name
-
-    ExecuteResponse:
-      type: object
-      properties:
-        run:
-          type: object
-          properties:
-            stdout:
-              type: string
-            stderr:
-              type: string
-            code:
-              type: integer
-              nullable: true
-            signal:
-              type: string
-              nullable: true
-            output:
-              type: string
-            memory:
-              type: integer
-              nullable: true
-            message:
-              type: string
-              nullable: true
-            status:
-              type: string
-              nullable: true
-            cpu_time:
-              type: number
-              nullable: true
-            wall_time:
-              type: number
-              nullable: true
-        language:
-          type: string
+        kind:
+          $ref: '#/components/schemas/CodeEnvKind'
         version:
-          type: string
-        session_id:
-          type: string
-        files:
-          type: array
-          items:
-            $ref: '#/components/schemas/FileRef'
+          type: integer
 
-    RequestBody:
+    Dependencies:
       type: object
-      required:
-        - code
-        - lang
+      description: |
+        Request-declared packages installed for this job only, before user code
+        runs. **Off by default** — enable with
+        `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES=true`, otherwise a request carrying
+        this field is rejected.
+
+        Installs run in the trusted runner with `pip --only-binary=:all:`, so
+        only prebuilt wheels are used and no `setup.py` executes. The result is
+        mounted read-only into the sandbox on `PYTHONPATH`; the sandbox itself
+        still has no network.
+      properties:
+        pip:
+          type: array
+          description: |
+            Pinned `name==version` specs, each optionally followed by one or
+            more ` --hash=sha256:<hex>` options. When any entry is hashed, all
+            must be, and pip runs with `--require-hashes`. Bounded by
+            `CODEAPI_DEPENDENCY_MAX_COUNT` (default 50).
+          items:
+            type: string
+            example: cowsay==6.1
+
+    ExecRequest:
+      type: object
+      required: [code, lang]
       properties:
         code:
           type: string
+          description: Source to execute.
+          example: print(sum(range(10)))
         lang:
           type: string
+          description: |
+            Language to run the code as. Accepted values map onto the installed
+            runtimes; which of these actually exist depends on
+            `CODEAPI_LANGUAGES` at deploy time.
+          enum: [py, js, ts, node, bash, java]
         args:
           type: array
+          description: Command-line arguments passed to the program.
           items:
             type: string
         user_id:
           type: string
-        entity_id:
+          description: |
+            Caller-supplied user id. Used only when the service runs with
+            `CODEAPI_AUTH_PROVIDER=none` and no `User-Id` header is present;
+            ignored in JWT mode, where the principal comes from the token.
+        files:
+          type: array
+          description: Previously uploaded files to stage into the workspace.
+          items:
+            $ref: '#/components/schemas/RequestFile'
+        dependencies:
+          $ref: '#/components/schemas/Dependencies'
+
+    ExecResponse:
+      type: object
+      description: |
+        Note the flat shape — `stdout`/`stderr` sit at the top level, not nested
+        under a `run` object.
+      required: [session_id, stdout, stderr, files]
+      properties:
+        session_id:
+          type: string
+          description: |
+            Execution session id minted for this run. Also the storage prefix
+            for any files the run produced, so it is the `session_id` path
+            parameter for the download and list routes.
+        stdout:
+          type: string
+          description: Captured standard output, truncated at `SANDBOX_OUTPUT_MAX_SIZE`.
+        stderr:
+          type: string
+          description: Captured standard error, truncated at `SANDBOX_OUTPUT_MAX_SIZE`.
+        files:
+          type: array
+          description: Files the run left in `/mnt/data`, uploaded to object storage.
+          items:
+            $ref: '#/components/schemas/FileRef'
+        code:
+          type: integer
+          nullable: true
+          description: Process exit code, or `null` if the process was signalled.
+        signal:
+          type: string
+          nullable: true
+          description: Signal name that terminated the process, e.g. `SIGKILL` on OOM.
+        message:
+          type: string
+          nullable: true
+          description: Human-readable note about an abnormal outcome.
+        status:
+          type: string
+          nullable: true
+        wall_time:
+          type: number
+          nullable: true
+          description: Wall-clock run time in milliseconds.
+        session_state_persisted:
+          type: boolean
+          description: |
+            Only meaningful with `CODEAPI_PERSIST_SESSIONS=true`. True when this
+            run wrote a fresh workspace snapshot; false when the snapshot was
+            skipped (for example, over `CODEAPI_SESSION_STATE_MAX_BYTES`) — the
+            run still succeeded and the previous state stays current.
+        session_state_restore_failed:
+          type: boolean
+          description: |
+            True when a prior snapshot was expected but could not be restored,
+            so this run started from an empty workspace.
+
+    ProgrammaticTool:
+      type: object
+      description: A tool the sandboxed program may call back into.
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        parameters:
+          type: object
+          description: JSON Schema for the tool's arguments.
+
+    ProgrammaticToolCall:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        arguments:
+          type: object
+
+    ProgrammaticExecRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProgrammaticTool'
+        session_id:
+          type: string
+          description: Execution session id; a continuation reuses the id of the call it resumes.
+        timeout:
+          type: integer
+          description: Overall timeout in milliseconds.
+        continuation_token:
+          type: string
+          description: |
+            Returned with `status: tool_call_required`. Send it back, together
+            with `tool_results`, to resume the paused program.
+        tool_results:
+          type: array
+          description: Results for the tool calls the previous response requested.
+          items:
+            type: object
+            required: [call_id, result]
+            properties:
+              call_id:
+                type: string
+              result: {}
+              is_error:
+                type: boolean
+              error_message:
+                type: string
+        user_id:
           type: string
         files:
           type: array
           items:
             $ref: '#/components/schemas/RequestFile'
+        language:
+          type: string
+          enum: [python, bash]
+          default: python
+        lang:
+          type: string
+          enum: [python, bash]
+          description: Back-compat alias for `language`; `language` wins when both are sent.
 
-    FileObject:
+    ProgrammaticExecResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [tool_call_required, completed, error]
+        continuation_token:
+          type: string
+          description: Present when `status` is `tool_call_required`.
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProgrammaticToolCall'
+        partial_stdout:
+          type: string
+          description: Output produced before the program paused for a tool call.
+        partial_stderr:
+          type: string
+        stdout:
+          type: string
+        stderr:
+          type: string
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileRef'
+        session_id:
+          type: string
+        tool_calls_made:
+          type: integer
+        execution_time:
+          type: number
+        error:
+          type: string
+        error_type:
+          type: string
+
+    UploadedFile:
       type: object
       properties:
         name:
           type: string
         id:
           type: string
-        session_id:
-          type: string
-        content:
+          description: Storage file id — pass this as `RequestFile.id` on `/exec`.
+        storage_session_id:
           type: string
         size:
           type: number
         lastModified:
           type: string
+          format: date-time
         etag:
+          type: string
+        contentType:
           type: string
         metadata:
           type: object
@@ -133,20 +373,36 @@ components:
               type: string
             original-filename:
               type: string
-        contentType:
-          type: string
 
     UploadResponse:
       type: object
       properties:
         message:
           type: string
-        session_id:
+          example: success
+        storage_session_id:
           type: string
+          description: |
+            Storage session the batch was written under. Pass it back as
+            `RequestFile.storage_session_id` when referencing these files.
         files:
           type: array
           items:
-            $ref: '#/components/schemas/FileObject'
+            $ref: '#/components/schemas/UploadedFile'
+
+    ObjectMetadata:
+      type: object
+      description: Metadata for one stored object, without its bytes.
+      properties:
+        lastModified:
+          type: string
+          format: date-time
+        size:
+          type: number
+        etag:
+          type: string
+        contentType:
+          type: string
 
     Error:
       type: object
@@ -156,41 +412,355 @@ components:
         details:
           type: string
 
+    RateLimitError:
+      type: object
+      properties:
+        error:
+          type: string
+        retry_after:
+          type: integer
+          description: Seconds to wait before retrying.
+
+  responses:
+    Unauthorized:
+      description: Missing, malformed, or expired credentials.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: No such session or file, or it has expired.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: |
+        Rate limit exceeded. `RateLimit-Limit`, `RateLimit-Remaining`, and
+        `Retry-After` headers accompany the response.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RateLimitError'
+    ServerError:
+      description: Internal error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: The service is starting up or shutting down.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
 paths:
+  /health:
+    get:
+      tags: [Operations]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: The API component is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
   /exec:
     post:
+      tags: [Execution]
       summary: Execute code
-      description: Execute code with specified language and parameters
-      operationId: executeCode
+      description: |
+        Runs `code` in an isolated sandbox and returns its output plus any files
+        it produced. The call blocks until the run finishes.
+
+        Rate limited to 20 requests per 30 s per principal by default
+        (`MAX_REQUESTS` / `RATE_LIMIT_WINDOW`).
+
+        With `CODEAPI_PERSIST_SESSIONS=true` this route — and only this route —
+        continues the caller's previous run: files left in `/mnt/data` and, for
+        Python, the global namespace are restored automatically.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RequestBody'
+              $ref: '#/components/schemas/ExecRequest'
+            examples:
+              simple:
+                summary: Run a Python snippet
+                value:
+                  lang: py
+                  code: print(sum(range(10)))
+              withFile:
+                summary: Read a previously uploaded file
+                value:
+                  lang: py
+                  code: |
+                    import pandas as pd
+                    print(pd.read_csv('data.csv').describe())
+                  files:
+                    - id: V1StGXR8Z5jdHi6BmyT
+                      resource_id: user-42
+                      storage_session_id: 7fZq2NkP0aRcVbXsLmTdY
+                      name: data.csv
+                      kind: user
+              withDependencies:
+                summary: Install a pinned package for this job only
+                value:
+                  lang: py
+                  code: |
+                    import cowsay
+                    cowsay.cow('hello')
+                  dependencies:
+                    pip: [cowsay==6.1]
       responses:
         '200':
-          description: Successful execution
+          description: |
+            The run completed. A non-zero `code` or a non-null `signal` means
+            the user's program failed — that is still a `200`, since the service
+            performed its job correctly.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ExecuteResponse'
-        '401':
-          description: Unauthorized
+                $ref: '#/components/schemas/ExecResponse'
+        '400':
+          description: Unsupported language, malformed body, or unauthorized file reference.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
         '503':
-          description: Service unavailable
+          $ref: '#/components/responses/Unavailable'
+
+  /exec/programmatic:
+    post:
+      tags: [Execution]
+      summary: Execute code that can call tools
+      description: |
+        Runs code that may pause to call back into caller-provided tools. When
+        the program calls a tool, the response returns `status:
+        tool_call_required` with a `continuation_token` and the pending
+        `tool_calls`; send the results back with that token to resume.
+
+        Supports Python and Bash. **Persistent sessions do not apply to this
+        route** — even with `CODEAPI_PERSIST_SESSIONS=true`, programmatic runs
+        get a cold workspace and namespace every time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProgrammaticExecRequest'
+      responses:
+        '200':
+          description: The run either completed or paused for a tool call.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProgrammaticExecResponse'
+        '400':
+          description: Malformed body or invalid continuation token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /upload:
+    post:
+      tags: [Files]
+      summary: Upload files
+      description: |
+        Uploads one or more files and returns the storage ids needed to
+        reference them from `/exec`. The service mints the storage session; the
+        caller does not choose it.
+
+        Rate limited to 30 uploads per 5 minutes by default. Per-file size is
+        capped by `MAX_FILE_SIZE` (25 MiB default) and exceeding it returns
+        `413`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: array
+                  description: |
+                    One or more file parts. Subdirectory components in the
+                    filename are preserved (e.g. `pptx/editing.md`).
+                  items:
+                    type: string
+                    format: binary
+                kind:
+                  $ref: '#/components/schemas/CodeEnvKind'
+                id:
+                  type: string
+                  description: Resource id that owns the storage session, for shared kinds.
+                version:
+                  type: integer
+                  description: Required when `kind` is `skill`; rejected otherwise.
+                read_only:
+                  type: string
+                  enum: ['true', 'false']
+                  description: |
+                    Marks these uploads as infrastructure inputs (such as skill
+                    files) that must never be emitted back as run outputs, even
+                    if sandboxed code modifies them on disk.
+            encoding:
+              file:
+                contentType: application/octet-stream
+      responses:
+        '200':
+          description: Files stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+        '400':
+          description: Content type is not `multipart/form-data`, or the resource fields are invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: A file exceeded the per-file size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          description: Upload timed out.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /upload/batch:
+    post:
+      tags: [Files]
+      summary: Upload files as one batch
+      description: |
+        Same contract as `/upload`, tuned for writing many files into a single
+        storage session in one request — the shape skill bundles use.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                kind:
+                  $ref: '#/components/schemas/CodeEnvKind'
+                id:
+                  type: string
+                version:
+                  type: integer
+                read_only:
+                  type: string
+                  enum: ['true', 'false']
+      responses:
+        '200':
+          description: Files stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: A file exceeded the per-file size limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /files/{session_id}:
+    get:
+      tags: [Files]
+      summary: List the files in a session
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Storage session id — for run outputs, the `session_id` from the exec response.
+        - name: detail
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [simple, full]
+            default: simple
+      responses:
+        '200':
+          description: The session's files.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UploadedFile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The session belongs to another principal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
   /download/{session_id}/{fileId}:
     get:
+      tags: [Files]
       summary: Download a file
+      description: |
+        Streams the file's bytes. Rate limited to 60 downloads per minute by
+        default.
       parameters:
         - name: session_id
           in: path
@@ -204,76 +774,65 @@ paths:
             type: string
       responses:
         '200':
-          description: File content
+          description: The file's contents.
           content:
             application/octet-stream:
               schema:
                 type: string
                 format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The session belongs to another principal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
-          description: File not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
 
-  /upload:
-    post:
-      summary: Upload files
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              properties:
-                entity_id:
-                  type: string
-                files:
-                  type: array
-                  items:
-                    type: string
-                    format: binary
-      responses:
-        '200':
-          description: Successful upload
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadResponse'
-        '413':
-          description: File size limit exceeded
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /files/{session_id}:
+  /sessions/{session_id}/objects/{fileId}:
     get:
-      summary: Get files information
+      tags: [Files]
+      summary: Get file metadata
+      description: |
+        Returns one object's metadata without its bytes — used for freshness
+        checks, so a caller can tell whether a previously uploaded bundle is
+        still present before re-uploading it.
       parameters:
         - name: session_id
           in: path
           required: true
           schema:
             type: string
-        - name: detail
-          in: query
+        - name: fileId
+          in: path
+          required: true
           schema:
             type: string
-            default: simple
       responses:
         '200':
-          description: Files information
+          description: The object's metadata.
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/FileObject'
+                $ref: '#/components/schemas/ObjectMetadata'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
 
   /files/{session_id}/{fileId}:
     delete:
+      tags: [Files]
       summary: Delete a file
       parameters:
         - name: session_id
@@ -288,10 +847,19 @@ paths:
             type: string
       responses:
         '200':
-          description: File deleted successfully
-        '500':
-          description: Error deleting file
+          description: File deleted.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                type: object
+                properties:
+                  message:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'

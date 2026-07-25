@@ -1,0 +1,184 @@
+---
+title: Production hardening
+description: What must change before this service runs untrusted code from real users.
+icon: ShieldCheck
+---
+
+The development defaults are tuned so `docker compose up` works with zero
+configuration. Every one of those conveniences is a hole. This page is the
+checklist that closes them.
+
+## The non-negotiables
+
+<Callout type="error">
+If you skip any of these, the service is not safe to expose. In particular,
+`LOCAL_MODE=true` means **anyone who can reach the port can execute arbitrary
+code as you**.
+</Callout>
+
+### 1. Turn off local mode
+
+```bash
+LOCAL_MODE=false
+```
+
+`LOCAL_MODE=true` bypasses authentication entirely and stamps every request
+with a fixed principal. It is a development affordance and nothing else.
+
+### 2. Configure real authentication
+
+Set up [JWT verification](/docs/guides/authentication#jwt-eddsa-mode):
+
+```bash
+CODEAPI_AUTH_PROVIDER=librechat-jwt
+CODEAPI_JWT_ISSUER=librechat
+CODEAPI_JWT_AUDIENCE=codeapi
+CODEAPI_JWT_ALLOWED_ALGS=EdDSA
+CODEAPI_JWT_KID=lc-codeapi-1
+CODEAPI_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+```
+
+If you deliberately want no authentication because something in front is
+handling it, you must say so explicitly — the service refuses to start
+otherwise:
+
+```bash
+CODEAPI_AUTH_PROVIDER=none
+CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true
+```
+
+Only do this behind a gateway that authenticates for you, on a network the
+public cannot reach.
+
+### 3. Replace every shared secret
+
+| Variable | Requirement |
+| --- | --- |
+| `CODEAPI_INTERNAL_SERVICE_TOKEN` | Strong random value. When unset, file-object routes and tool-call session routes stay **unauthenticated** for backwards compatibility. |
+| `CODEAPI_EGRESS_GRANT_SECRET` | 32+ bytes of randomness. Signs the capabilities that scope sandbox egress. |
+| `REDIS_PASSWORD` | Strong random value. |
+| Object storage credentials | Real credentials, not `minioadmin`. |
+
+```bash
+# Reasonable generation
+openssl rand -base64 48
+```
+
+### 4. Generate your own manifest signing keypair
+
+The keypair inlined in the Compose files and in `values-local.yaml` is publicly
+known — it is the same one hardcoded in the unit tests.
+
+```bash
+openssl genpkey -algorithm ed25519 -out manifest-signing.pem
+openssl pkey -in manifest-signing.pem -pubout -out manifest-signing.pub.pem
+
+# For the Helm chart, as base64 DER
+openssl pkey -in manifest-signing.pem -outform DER | base64            # privateKey
+openssl pkey -in manifest-signing.pem -pubout -outform DER | base64    # publicKey
+```
+
+The **private** key goes to the worker only. The **public** key goes to the
+sandbox runner. Never mount the private key into the runner — the split is what
+makes a compromised runner unable to mint its own manifests.
+
+```bash
+CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY=...   # worker
+SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY=...    # sandbox runner
+```
+
+### 5. Keep the hardening flags on
+
+These default to the safe value. Verify nobody turned them off:
+
+```bash
+CODEAPI_HARDENED_SANDBOX_MODE=true
+KVM_ENABLED=true
+SANDBOX_REQUIRE_EGRESS_MANIFEST=true
+CODEAPI_EGRESS_LEDGER_REQUIRED=true
+```
+
+### 6. Do not expose internal ports
+
+Only the API (`3112`) should be reachable by clients. The sandbox runner
+(`2000`), file server (`3000`), tool call server (`3033`), egress gateway
+(`3190`), Redis, and object storage all belong on an internal network.
+
+The local Compose files publish several of these to the host for debugging.
+Remove those port mappings, or bind them to loopback, in anything shared.
+
+On Kubernetes, leave `networkPolicy.enabled=true`.
+
+## Recommended beyond the minimum
+
+### Install the seccomp profile
+
+On Kubernetes, `workerSandbox.seccomp.enabled=true` adds a node-level seccomp
+profile on top of NsJail's inner Kafel policy. It requires pre-installing the
+profile on every node at `/var/lib/kubelet/seccomp/profiles/nsjail.json` — see
+`seccomp/README.md` for the DaemonSet installer pattern.
+
+### Apply AppArmor
+
+`apparmor/sandbox-nsjail` ships a profile for the sandbox runner. See
+`apparmor/README.md`.
+
+### Isolate the execution tier
+
+Run sandbox pods on their own node group, with taints and tolerations so
+nothing else schedules there. If a sandbox escape ever happens, what it lands
+next to should be other sandboxes.
+
+### Set a storage lifecycle policy
+
+Abandoned [persistent sessions](/docs/guides/sessions#known-limitations) leave
+their last snapshot object in storage indefinitely — the Redis pointer expires,
+but that expiry does not delete the object it referenced. Configure a lifecycle
+or expiry policy on the bucket or prefix to reclaim it.
+
+### Review the resource limits
+
+Defaults are generous for development:
+
+```bash
+SANDBOX_RUN_TIMEOUT=300000        # 5 minutes
+SANDBOX_RUN_CPU_TIME=300000
+SANDBOX_MAX_CONCURRENT_JOBS=8
+SANDBOX_MAX_PROCESS_COUNT=100
+LAUNCHER_RAM_MIB=2048
+```
+
+Tighten them to what your workload actually needs. Every one of these is a
+denial-of-service budget you are handing to untrusted code.
+
+### Think hard about dynamic dependencies
+
+[Dynamic dependencies](/docs/guides/dependencies) are **off by default**.
+Enabling them means the trusted runner fetches operator-allowed packages from
+your configured index at job time. Wheels only, so no install-time code
+executes — but it is still a supply-chain surface you are opting into. If you
+enable it, consider pointing `CODEAPI_DEPENDENCY_INDEX_URL` at an internal
+mirror you control.
+
+## Verification
+
+Once deployed, confirm the posture:
+
+```bash
+# Auth is actually enforced — this should NOT return 200
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://your-host/v1/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"print(1)"}'
+# expect 401
+
+# The sandbox has no network
+curl -sX POST https://your-host/v1/exec \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"import urllib.request; urllib.request.urlopen(\"https://example.com\", timeout=5)"}' \
+  | jq '.stderr'
+# expect a network failure, not a page
+```
+
+Also confirm from outside your network that ports `2000`, `3000`, `3033`,
+`3190`, `6379`, and `9000` are not reachable.

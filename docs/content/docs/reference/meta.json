@@ -1,0 +1,7 @@
+{
+  "title": "API reference",
+  "description": "Generated from the OpenAPI specs",
+  "icon": "Braces",
+  "root": true,
+  "pages": ["index", "api"]
+}

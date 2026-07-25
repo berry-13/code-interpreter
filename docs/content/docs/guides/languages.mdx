@@ -1,0 +1,166 @@
+---
+title: Languages and runtimes
+description: Which languages are available, what is preinstalled in each, and how to control what gets installed.
+icon: Code
+---
+
+Language runtimes are not baked into the container images. A one-shot
+`package_init` job downloads and installs them onto a shared volume that the
+sandbox runner mounts read-only. That keeps images small and lets you install
+only what you need.
+
+## Available languages
+
+| Language | `lang` value | Pinned version | Notes |
+| --- | --- | --- | --- |
+| Python | `py` | 3.14.4 | The richest runtime — see the package set below. |
+| Node.js | `node` | 24.15.0 | Runs `.js` with a curated offline npm set. |
+| Bun | `ts`, `js` | 1.3.14 | JavaScript and TypeScript, same offline package set. |
+| Bash | `bash` | — | Shell scripting. |
+| Java | `java` | 21.0.11 (Temurin) | JVM. |
+
+## Choosing what to install
+
+```bash
+CODEAPI_LANGUAGES=python,bun
+```
+
+Comma-separated, from `python`, `node`, `bun`, `bash`, `java`. The default is
+all of them.
+
+<Callout type="info">
+Installing everything takes a while and several GB. For local development,
+`CODEAPI_LANGUAGES=python` is usually all you need and starts far faster.
+</Callout>
+
+Adding a language later installs only what is missing into the existing volume:
+
+```bash
+# was python, now also want bun
+CODEAPI_LANGUAGES=python,bun docker compose up
+```
+
+To wipe and rebuild from scratch:
+
+```bash
+FORCE_REBUILD=true docker compose up
+```
+
+The volume lives at `SANDBOX_PACKAGES_PATH` (`./data/pkgs` by default).
+
+## Checking what is actually installed
+
+```bash
+curl -s http://localhost:2000/api/v2/runtimes | jq
+```
+
+```json
+[
+  {
+    "language": "python",
+    "version": "3.14.4",
+    "aliases": ["py", "python3"],
+    "runtime": "python"
+  }
+]
+```
+
+This is the fastest way to confirm `package_init` finished and to see exactly
+which versions the runner discovered.
+
+## Python packages
+
+Python ships a substantial scientific and document-processing set, all
+available offline:
+
+<Accordions>
+<Accordion title="Data and numerics">
+`numpy`, `pandas`, `scipy`, `statsmodels`, `patsy`, `numexpr`, `numba`,
+`pyarrow`, `sympy`, `networkx`, `lifelines`
+</Accordion>
+
+<Accordion title="Machine learning">
+`scikit-learn`, `scikit-image`
+</Accordion>
+
+<Accordion title="Plotting and imaging">
+`matplotlib`, `seaborn`, `plotly`, `wordcloud`, `pillow`, `imageio`,
+`opencv-python-headless`, `svglib`, `cairosvg`, `fonttools`
+</Accordion>
+
+<Accordion title="Documents and spreadsheets">
+`openpyxl`, `xlsxwriter`, `xlrd`, `python-docx`, `docx2python`, `docxtpl`,
+`mammoth`, `python-pptx`, `vsdx`, `markitdown`, `tabulate`
+</Accordion>
+
+<Accordion title="PDF">
+`pypdf2`, `pdfminer`, `pdfminer.six`, `pdf2image`, `reportlab`
+</Accordion>
+
+<Accordion title="Web and parsing">
+`beautifulsoup4`
+</Accordion>
+
+<Accordion title="Other">
+`chdb` (embedded ClickHouse), `exifread`, `hachoir`, `python-barcode`,
+`qrcode`, `pytesseract`
+</Accordion>
+</Accordions>
+
+Matplotlib gets special handling — the service wraps plotting code so figures
+are captured and returned as files automatically. Just `savefig` and the image
+comes back in the response's `files` array.
+
+## JavaScript and TypeScript packages
+
+Node and Bun share one curated offline set, pinned for reproducibility in
+`javascript-packages.txt`. It includes `zod`, `lodash`, `date-fns`, `nanoid`,
+`uuid`, `pino`, `dotenv`, `chalk`, `fast-glob`, `sharp`, `pdf-lib`, `exceljs`,
+`mammoth`, `marked`, `markdown-it`, `papaparse`, `js-yaml`, `cheerio`, `ajv`,
+`gray-matter`, `dayjs`, `winston`, `commander`, `yargs`, `handlebars`, and
+more.
+
+Bun handles both `.js` and `.ts` directly — no build step for TypeScript.
+
+## Overriding versions
+
+```bash
+PYTHON_VERSION=3.13.2
+PYTHON_SHA256=<checksum>
+```
+
+Runtime downloads are verified against SHA-256 checksums pinned for the default
+versions. When you override a version, `package_init` verifies against the
+provider's published checksum file instead; set the matching `*_SHA256` to pin
+your own value rather than trusting the fetched one.
+
+Available: `PYTHON_VERSION`/`PYTHON_SHA256`, `NODE_VERSION`/`NODE_SHA256`,
+`BUN_VERSION`/`BUN_SHA256`, `JAVA_VERSION`/`JAVA_SHA256` (plus
+`TEMURIN_BUILD`), and `BASH_PACKAGE_VERSION`.
+
+## Adding packages beyond the preinstalled set
+
+Two options, in increasing order of commitment:
+
+1. **[Dynamic dependencies](/docs/guides/dependencies)** — let a request declare
+   pinned pip packages installed just for that job. Off by default, wheels only.
+2. **Extend the package set** — edit `build-packages.sh` (Python) or
+   `javascript-packages.txt` (JS/TS) and rebuild the volume with
+   `FORCE_REBUILD=true`. This bakes them in for every run.
+
+For anything you use routinely, the second is better: it is installed once,
+available instantly, and needs no network at job time.
+
+## Other runtimes
+
+The package format is generic, so other runtimes (Go, Rust, GCC) can be
+installed. They may need additional system libraries added to the sandbox
+image, and they are not part of the tested configuration.
+
+## How the runtime is selected
+
+A request names a `lang`; the service maps it to a language and version range,
+and the sandbox runner picks the **newest installed runtime matching that
+range**. If nothing matches, the request fails with a `400` naming the
+unsupported language — usually meaning that runtime was excluded by
+`CODEAPI_LANGUAGES`.

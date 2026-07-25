@@ -1,0 +1,170 @@
+---
+title: Repository layout
+description: Where everything lives and which component each directory becomes.
+icon: FolderTree
+---
+
+## Top level
+
+<Files>
+  <Folder name="api" defaultOpen>
+    <File name="src/" />
+    <File name="config/sandbox.cfg" />
+    <File name="Dockerfile" />
+    <File name="openapi.yaml" />
+  </Folder>
+  <Folder name="service" defaultOpen>
+    <File name="src/" />
+    <File name="Dockerfile*" />
+    <File name="openapi.yml" />
+  </Folder>
+  <Folder name="launcher">
+    <File name="src/main.rs" />
+    <File name="Cargo.toml" />
+  </Folder>
+  <Folder name="docker">
+    <File name="Dockerfile.package-init" />
+    <File name="Dockerfile.worker-sandbox" />
+    <File name="sandbox-entrypoint.sh" />
+  </Folder>
+  <Folder name="helm/codeapi">
+    <File name="values.yaml" />
+    <File name="templates/" />
+  </Folder>
+  <Folder name="seccomp" />
+  <Folder name="apparmor" />
+  <Folder name="docs" />
+  <File name="build-packages.sh" />
+  <File name="javascript-packages.txt" />
+  <File name="docker-compose*.yml" />
+</Files>
+
+| Path | Becomes | Language |
+| --- | --- | --- |
+| `api/` | Sandbox runner | TypeScript (Bun) |
+| `service/` | API, worker, file server, tool call server, egress gateway | TypeScript (Node/Bun) |
+| `launcher/` | microVM launcher | Rust |
+| `docker/` | Sandbox and package-init images | Dockerfiles + shell |
+| `helm/codeapi/` | Kubernetes chart | Helm |
+| `seccomp/`, `apparmor/` | Host-level hardening profiles | JSON / AppArmor |
+| `docs/` | This documentation site | Next.js + Fumadocs |
+| `build-packages.sh` | Runtime and package installer | Bash |
+
+## `service/src` — the trusted tier
+
+One codebase, several entry points. Which one runs is chosen by the Dockerfile
+target.
+
+### Entry points
+
+| File | Component |
+| --- | --- |
+| `api-server.ts` | The public API (`SERVICE_PORT`, 3112) |
+| `worker-server.ts` | The job worker (health on 3113) |
+| `file-server.ts` | File server (3000) |
+| `tool-call-server.ts` | Tool call server (3033) |
+| `egress-gateway.ts` | Egress gateway (3190) |
+| `local-api.ts`, `service-api.ts` | API variants for local and service modes |
+
+### Security core
+
+| File | Responsibility |
+| --- | --- |
+| `execution-manifest.ts` | Signing and verifying execution manifests. |
+| `execution-manifest-claims.ts` | The claim shape. |
+| `egress-grant.ts` | Minting and parsing encrypted egress grants. |
+| `egress-ledger.ts` | Redis-backed grant ledger — budgets, revocation, counters. |
+| `egress-gateway-client.ts` | Client used by trusted components. |
+| `internal-service-auth.ts` | Component-to-component shared-token auth. |
+| `session-key.ts` | Deriving the storage namespace from auth context. |
+| `execution-identity.ts` | Resolving the principal and tenant. |
+| `auth/` | JWT verification, key loading, JWKS. |
+| `secure-startup.ts` | Fail-fast configuration validation at boot. |
+| `tool-scope.ts`, `tool-input-signature.ts` | Tool-call authorization. |
+
+### Execution path
+
+| File | Responsibility |
+| --- | --- |
+| `service/router.ts` | `/exec`, `/upload`, `/download`, `/files` routes. |
+| `service/programmatic-router.ts` | `/exec/programmatic` and its continuation handling. |
+| `queue.ts`, `workers.ts` | BullMQ queues and worker registration. |
+| `sandbox-dispatch.ts` | Builds the signed request sent to the sandbox runner. |
+| `payload.ts` | Assembles the execution payload. |
+| `preamble.ts`, `preamble-bash.ts` | Injected tool-calling preambles. |
+| `matplotlib.py`, `matplotlib-async.py` | Templates wrapping plotting code. |
+| `session-persist.ts` | Persistent-session snapshot logic. |
+| `sandbox-egress.ts` | Egress helpers for the sandbox path. |
+
+### Support
+
+`config.ts` (environment parsing), `metrics.ts` (Prometheus), `telemetry.ts`
+(OpenTelemetry), `logger.ts`, `middleware/limits.ts` (rate limiting),
+`http-limits.ts`, `lifecycle.ts` (startup and graceful shutdown),
+`redis-options.ts`, `types/`, `enum/`.
+
+## `api/src` — the sandbox runner
+
+| File | Responsibility |
+| --- | --- |
+| `index.ts` | Entry point. |
+| `api/v2.ts` | The `/api/v2` routes: `execute`, `runtimes`, `health`. |
+| `job.ts` | The big one — the whole job lifecycle: staging, fetching, running, collecting, uploading. |
+| `nsjail.ts` | Builds the NsJail invocation and the Kafel seccomp policy. |
+| `nsjail-setup-gate.ts` | Serialises sandbox setup, with a watchdog. |
+| `workspace-isolation.ts` | Per-job workspaces, UID pools, permissions, the reaper. |
+| `runtime.ts` | Discovers installed runtimes from the packages volume. |
+| `execution-manifest.ts` | Manifest **verification** (public key only). |
+| `execution-manifest-request.ts` | Verifying a request against its manifest. |
+| `egress.ts` | Egress grant header handling. |
+| `dependencies.ts` | Validating request-declared pip specs. |
+| `tool-call-socket-proxy.ts` | The in-sandbox tool-call socket. |
+| `secure-startup.ts` | Fail-fast startup checks. |
+| `safe-error.ts` | Classifying errors safe to return to callers. |
+| `validation.ts`, `walker.ts` | Request validation and filesystem walking. |
+| `spec-guard.c` | A small native guard compiled into the image. |
+
+`api/config/sandbox.cfg` is the NsJail protobuf config: namespace flags, the
+mount table, UID/GID mapping, and default cgroup limits. Per-execution
+overrides are passed as CLI arguments by `nsjail.ts`.
+
+## `launcher/` — the microVM launcher
+
+A single `main.rs` binding libkrun's C API through FFI:
+
+```rust
+krun_create_ctx() → krun_set_vm_config() → krun_set_root()
+→ krun_add_virtiofs() → krun_set_port_map() → krun_set_exec()
+→ krun_start_enter()
+```
+
+It also installs a seccomp filter of its own before entering the guest.
+Deliberately tiny — it runs adjacent to untrusted code, so there is little of it
+to get wrong. Built with `opt-level = "s"`, LTO, and stripped.
+
+## Docker images
+
+| Dockerfile | Produces |
+| --- | --- |
+| `service/Dockerfile` (targets `api`, `worker`, `production`) | API, worker, file server |
+| `service/Dockerfile.api` | API only |
+| `service/Dockerfile.worker` | Worker only |
+| `service/Dockerfile.tool-call-server` | Tool call server |
+| `service/Dockerfile.egress-gateway` | Egress gateway |
+| `api/Dockerfile` | Sandbox runner (includes NsJail, libkrun, the launcher) |
+| `docker/Dockerfile.package-init` | The one-shot runtime installer |
+| `docker/Dockerfile.worker-sandbox` | Combined worker + sandbox |
+
+## Where the docs live
+
+- `docs/` — this site (Next.js + Fumadocs). Content in `docs/content/docs`.
+- `service/openapi.yml` — the public API spec, rendered into the
+  [API reference](/docs/reference/api/execution/exec/post).
+- `api/openapi.yaml` — the internal runner spec, rendered into the
+  [sandbox API reference](/docs/developers/sandbox-api/execution/execute/post).
+- `helm/codeapi/README.md`, `apparmor/README.md`, `seccomp/README.md` —
+  component-level notes kept next to the code.
+
+The two OpenAPI specs are the source of truth for their reference sections; the
+site regenerates those pages at build time, so editing the spec is how you edit
+those docs.

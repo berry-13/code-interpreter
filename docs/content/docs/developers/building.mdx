@@ -1,0 +1,202 @@
+---
+title: Building and running from source
+description: Local development setup, the build for each component, and the fast iteration loops.
+icon: Hammer
+---
+
+## Toolchain
+
+| Component | Runtime | Build |
+| --- | --- | --- |
+| `api/` (sandbox runner) | Bun 1.3.x | `bun run build` |
+| `service/` (everything else) | Bun / Node | `bun run build` (Rollup) |
+| `launcher/` | Rust 2021 | `cargo build --release` |
+| `docs/` | Node 20+ | `npm run build` |
+
+A Nix shell is provided (`shell.nix`, `.envrc`) if you use direnv.
+
+## The fastest loop
+
+For most changes, run the stack in Docker and rebuild only what you touched:
+
+```bash
+# Full stack, one language, from source
+CODEAPI_LANGUAGES=python docker compose up --build
+
+# Rebuild a single component
+docker compose up --build api
+docker compose up --build sandbox-runner
+```
+
+`docker-compose.local-dev.yml` adds source mounts for a tighter loop.
+
+## Building the service
+
+```bash
+cd service
+bun install
+bun run build          # Rollup → .build-service/
+```
+
+One codebase, several entry points — pick one at run time:
+
+```bash
+bun run start:api               # public API (3112)
+bun run start:worker            # job worker
+bun run start:file-server       # file server (3000)
+bun run start:tool-call-server  # tool call server (3033)
+bun run start:egress-gateway    # egress gateway (3190)
+```
+
+Development variants run through `ts-node` without a build:
+
+```bash
+bun run start:api:dev
+bun run start:worker:dev
+bun run start:debug             # with --inspect on 9230
+```
+
+<Callout type="info">
+These still need Redis, object storage, and a sandbox runner to be useful. The
+usual approach is `docker compose up` for the dependencies, then run the one
+component you are working on from source against them.
+</Callout>
+
+## Building the sandbox runner
+
+```bash
+cd api
+bun install
+bun run build          # → .build/
+bun run dev            # watch mode
+bun run start          # run the built output
+```
+
+The build produces two artifacts: the main bundle (targeting Bun, with
+OpenTelemetry left external) and `tool-call-socket-proxy.cjs` as CommonJS for
+Node.
+
+<Callout type="warn">
+Running the sandbox runner outside its container is of limited use — it needs
+NsJail, the packages volume, and, in microVM mode, libkrun and `/dev/kvm`. Build
+locally to typecheck and test; run it in Docker.
+</Callout>
+
+### spec-guard
+
+`api/src/spec-guard.c` is a small static binary compiled into the image. CI
+compiles and smoke-tests it separately, because otherwise only the Dockerfile
+would catch a syntax error:
+
+```bash
+cd api/src
+gcc -O2 -static -Wall -Wextra -Werror -o /tmp/spec-guard spec-guard.c
+```
+
+## Building the launcher
+
+```bash
+cd launcher
+cargo build --release
+```
+
+It links against libkrun through FFI, so libkrun's headers and library must be
+present — which is why it is normally built inside `api/Dockerfile`. Release
+settings are `opt-level = "s"`, LTO, stripped: it runs adjacent to untrusted
+code, so there is deliberately very little of it.
+
+## Building the images
+
+```bash
+docker build -t codeapi-api:latest              -f service/Dockerfile.api .
+docker build -t codeapi-worker:latest           -f service/Dockerfile.worker .
+docker build -t codeapi-sandbox-runner:latest   -f api/Dockerfile .
+docker build -t codeapi-file-server:latest      -f service/Dockerfile --target production .
+docker build -t codeapi-tool-call-server:latest -f service/Dockerfile.tool-call-server --target production .
+docker build -t codeapi-egress-gateway:latest   -f service/Dockerfile.egress-gateway --target production .
+docker build -t codeapi-package-init:latest     -f docker/Dockerfile.package-init .
+```
+
+All build from the repository root — the Dockerfiles expect that context.
+
+## Language runtimes
+
+`build-packages.sh` downloads runtimes and installs the offline package sets.
+Normally the `package_init` container runs it; you can run it directly to
+populate `./data/pkgs`:
+
+```bash
+CODEAPI_LANGUAGES=python ./build-packages.sh
+```
+
+Pinned versions live at the top of the script (Python 3.14.4, Node 24.15.0, Bun
+1.3.14, Java 21.0.11). The JavaScript package set is `javascript-packages.txt`;
+the Python set is inline in the script.
+
+Adding a package for everyone means editing one of those and rebuilding the
+volume with `FORCE_REBUILD=true`.
+
+## Building the docs
+
+```bash
+cd docs
+npm install
+npm run dev            # http://localhost:3000/code-interpreter
+npm run build          # static export → docs/out
+```
+
+`npm run openapi` regenerates the API reference pages from `service/openapi.yml`
+and `api/openapi.yaml`. It runs automatically before `dev` and `build`, and its
+output is gitignored — **edit the specs, not the generated MDX**.
+
+To build for a root path instead of the GitHub Pages project path:
+
+```bash
+DOCS_BASE_PATH= npm run build
+```
+
+## Kubernetes development
+
+```bash
+minikube start --cpus=4 --memory=8192
+eval $(minikube docker-env)
+# build images as above, then
+cd helm/codeapi
+helm dependency update
+helm install codeapi . -f values-local.yaml
+kubectl port-forward svc/codeapi-api 3112:3112
+```
+
+After a rebuild:
+
+```bash
+kubectl rollout restart deployment/codeapi-service-worker
+kubectl rollout restart deployment/codeapi-sandbox-runner
+```
+
+See [Kubernetes deployment](/docs/guides/deployment/kubernetes).
+
+## Code style
+
+Prettier is configured at the root (`.prettierrc.yaml`), and `pre-commit` runs
+it. The service also has an ESLint config.
+
+Match the surrounding code — comment density in this codebase is unusually
+high, and deliberately so: many comments record *why* a non-obvious choice was
+made, often citing the bug that motivated it. Those are worth preserving and
+extending rather than trimming.
+
+## Next
+
+<Cards>
+  <Card
+    title="Testing"
+    description="The test suites, what CI runs, and the sandbox test scripts."
+    href="/docs/developers/testing"
+  />
+  <Card
+    title="Contributing"
+    description="How this repository is maintained and how changes land."
+    href="/docs/developers/contributing"
+  />
+</Cards>

@@ -1,94 +1,392 @@
-openapi: 3.0.0
+openapi: 3.0.3
 info:
-  title: Code Execution API
-  version: 1.0.0
+  title: Sandbox Runner API
+  version: '2.0.0'
+  description: |
+    **Internal API — not for public exposure.**
+
+    This is the HTTP surface of the sandbox runner (`api/`, the `sandbox-runner`
+    container), the component that actually executes untrusted code inside
+    NsJail — and, in the default hardened configuration, inside a libkrun
+    microVM whose guest kernel is separate from the host's.
+
+    Only the service worker calls it, over the cluster-internal network on port
+    `2000` under the `/api/v2` prefix. It has no user authentication of its own:
+    authorization is carried by two signed capabilities that the worker mints
+    and this component verifies.
+
+    - **Execution manifest** (`execution_manifest`, or the
+      `X-CodeAPI-Execution-Manifest` header) — an Ed25519-signed statement of
+      what this execution is allowed to be. The worker signs with the private
+      key; the runner holds only the public key, so compromising a runner does
+      not let it mint new manifests. The manifest binds a SHA-256 of the request
+      body, so no field can be altered after signing.
+    - **Egress grant** (`egress_grant`, or the `X-CodeAPI-Egress-Grant` header)
+      — an encrypted, scoped capability naming exactly which files this run may
+      read and where it may write. The egress gateway enforces it.
+
+    Both ride in the JSON body rather than headers by default: skill-heavy
+    executions produce capabilities large enough to blow past header size
+    limits and fail with `431` before validation could run. The header forms
+    remain accepted so rolling upgrades work.
+
+    Public API consumers want `service/openapi.yml` instead.
+servers:
+  - url: http://sandbox-runner:2000/api/v2
+    description: Cluster-internal address used by the service worker
+  - url: http://localhost:2000/api/v2
+    description: Local Docker Compose stack
+
+tags:
+  - name: Execution
+    description: Run code inside the sandbox.
+  - name: Operations
+    description: Runtime discovery and health.
+
+components:
+  schemas:
+    File:
+      type: object
+      description: |
+        A file to stage into the sandbox workspace at `/mnt/data`. Either
+        provide `content` inline, or provide `id` + `storage_session_id` for the
+        runner to fetch from the file server through the egress gateway. A
+        fetched file must be covered by the egress grant, or the run is refused.
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: |
+            Filename inside `/mnt/data`. The first file is treated as the entry
+            point when the runtime needs one.
+          example: main.py
+        content:
+          type: string
+          description: Inline file contents, decoded per `encoding`.
+        encoding:
+          type: string
+          enum: [base64, hex, utf8]
+          default: utf8
+        id:
+          type: string
+          description: Storage file id, for files fetched rather than inlined.
+        storage_session_id:
+          type: string
+          description: Storage session holding the bytes for `id`.
+        entity_id:
+          type: string
+          description: |
+            Per-file entity scope from the caller's authorization model. Echoed
+            back on `inherited: true` output refs so multi-turn callers keep
+            the scope across runs.
+
+    PersistSession:
+      type: object
+      description: |
+        Persistent-session marker, set by the service only when
+        `CODEAPI_PERSIST_SESSIONS=true`. Instructs the runner to restore a prior
+        workspace tar before the run and snapshot `/mnt/data` back afterwards.
+        Covered by the manifest body hash like every other field.
+      required: [file_id, filename]
+      properties:
+        file_id:
+          type: string
+          description: Object id under `output_session_id` to write the snapshot to.
+        filename:
+          type: string
+          description: Name of the tar as staged into `/mnt/data`.
+        restore_session_id:
+          type: string
+          description: Storage session holding the previous run's snapshot, when one exists.
+
+    ExecuteRequest:
+      type: object
+      required: [language, version, files]
+      properties:
+        language:
+          type: string
+          description: Runtime language, matched against the discovered runtimes.
+          example: python
+        version:
+          type: string
+          description: |
+            Semver range selecting a runtime version. The newest installed
+            runtime matching the range wins.
+          example: 3.14.4
+        files:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/File'
+        session_id:
+          type: string
+          description: Top-level execution session id for one sandbox invocation.
+        output_session_id:
+          type: string
+          description: Storage session that generated files are uploaded to.
+        args:
+          type: array
+          items:
+            type: string
+        stdin:
+          type: string
+        run_timeout:
+          type: integer
+          description: Wall-clock run limit in ms. Defaults to `SANDBOX_RUN_TIMEOUT`.
+        compile_timeout:
+          type: integer
+          description: Compile-phase limit in ms. Defaults to `SANDBOX_COMPILE_TIMEOUT`.
+        run_cpu_time:
+          type: integer
+          description: CPU-time limit for the run phase, in ms.
+        compile_cpu_time:
+          type: integer
+          description: CPU-time limit for the compile phase, in ms.
+        run_memory_limit:
+          type: integer
+          description: Run-phase memory cgroup limit in bytes; `-1` for no limit.
+        compile_memory_limit:
+          type: integer
+          description: Compile-phase memory cgroup limit in bytes; `-1` for no limit.
+        env_vars:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Extra environment variables. Keys must match `^[A-Z_][A-Z0-9_]*$`
+            (case-insensitive); non-conforming keys are dropped. The combined
+            key and value bytes may not exceed 1,000,000.
+        tool_call_socket:
+          type: boolean
+          description: |
+            Requests a tool-call socket inside the sandbox. Granted only when
+            the execution manifest authorizes it and is body-bound; otherwise
+            the request is rejected with a scope mismatch.
+        egress_grant:
+          type: string
+          description: Encrypted egress capability. Also accepted as `X-CodeAPI-Egress-Grant`.
+        execution_manifest:
+          type: string
+          description: |
+            Signed execution manifest. Also accepted as
+            `X-CodeAPI-Execution-Manifest`. Required when
+            `SANDBOX_REQUIRE_EGRESS_MANIFEST=true` (the default).
+        persist_session:
+          $ref: '#/components/schemas/PersistSession'
+        dependencies:
+          type: object
+          description: |
+            Per-job packages installed before user code runs, wheels only.
+            Rejected unless `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES=true`.
+          properties:
+            pip:
+              type: array
+              items:
+                type: string
+
+    FileRef:
+      type: object
+      description: A file present in `/mnt/data` after the run, uploaded to object storage.
+      required: [id, name, storage_session_id]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        storage_session_id:
+          type: string
+        modified_from:
+          type: object
+          description: Set when the run modified a staged input rather than creating a new file.
+          properties:
+            id:
+              type: string
+            storage_session_id:
+              type: string
+        inherited:
+          type: boolean
+          description: |
+            `true` when the ref is an unchanged passthrough of an input the
+            caller already owns. Callers should skip post-processing these —
+            the bytes are already persisted at their origin.
+        entity_id:
+          type: string
+          description: Echoed verbatim from the matching input file when present.
+
+    ExecuteResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        stdout:
+          type: string
+          description: Truncated at `SANDBOX_OUTPUT_MAX_SIZE` bytes.
+        stderr:
+          type: string
+          description: Truncated at `SANDBOX_OUTPUT_MAX_SIZE` bytes.
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileRef'
+        code:
+          type: integer
+          nullable: true
+          description: Exit code, or `null` when the process was signalled.
+        signal:
+          type: string
+          nullable: true
+          description: |
+            Signal that terminated the process. `SIGKILL` typically means the
+            cgroup memory limit or a timeout was hit.
+        message:
+          type: string
+          nullable: true
+        status:
+          type: string
+          nullable: true
+        wall_time:
+          type: number
+          nullable: true
+        session_state_persisted:
+          type: boolean
+        session_state_restore_failed:
+          type: boolean
+
+    Runtime:
+      type: object
+      properties:
+        language:
+          type: string
+          example: python
+        version:
+          type: string
+          example: 3.14.4
+        aliases:
+          type: array
+          items:
+            type: string
+          example: [py, python3]
+        runtime:
+          type: string
+
+    Error:
+      type: object
+      properties:
+        message:
+          type: string
 
 paths:
   /execute:
     post:
-      summary: Execute code
+      tags: [Execution]
+      summary: Execute code in the sandbox
+      description: |
+        Stages `files` into a fresh workspace, runs the entry point under NsJail
+        with the configured limits, and returns the captured output plus refs to
+        any files the run produced.
+
+        Concurrency is bounded by `SANDBOX_MAX_CONCURRENT_JOBS`. The request
+        body is capped by `SANDBOX_EXECUTE_BODY_LIMIT` (50 MB by default).
+      parameters:
+        - name: X-CodeAPI-Execution-Manifest
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Header form of `execution_manifest`, for rolling upgrades.
+        - name: X-CodeAPI-Egress-Grant
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Header form of `egress_grant`, for rolling upgrades.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/ExecuteRequest'
+            examples:
+              minimal:
+                summary: Run an inline Python file
+                value:
+                  language: python
+                  version: 3.14.4
+                  files:
+                    - name: main.py
+                      content: print(42)
       responses:
         '200':
-          description: Successful execution
+          description: |
+            The sandbox ran the program. A non-zero `code` or non-null `signal`
+            reports the program's own failure, not an API error.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExecuteResponse'
         '400':
-          description: Bad request
+          description: Validation failed — unknown runtime, malformed files, or bad limits.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: |
+            The execution manifest is missing, malformed, expired, not yet
+            valid, fails signature verification, or its scope does not cover
+            the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: Content type is not `application/json`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
-          description: Internal server error
+          description: Sandbox setup or execution failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
-components:
-  schemas:
-    ExecuteRequest:
-      type: object
-      required:
-        - language
-        - version
-        - files
-      properties:
-        session_id:
-          type: string
-        language:
-          type: string
-        version:
-          type: string
-        files:
-          type: array
-          items:
-            $ref: '#/components/schemas/File'
-        stdin:
-          type: string
-        args:
-          type: array
-          items:
-            type: string
-        compileTimeout:
-          type: integer
-        runTimeout:
-          type: integer
-        compileMemoryLimit:
-          type: integer
-        runMemoryLimit:
-          type: integer
-    
-    File:
-      type: object
-      required:
-        - name
-        - content
-      properties:
-        name:
-          type: string
-        id:
-          type: string
-        content:
-          type: string
-        encoding:
-          type: string
-          enum: [base64, hex, utf8]
-    
-    ExecuteResponse:
-      type: object
-      properties:
-        compile:
-          $ref: '#/components/schemas/ExecutionStage'
-        run:
-          $ref: '#/components/schemas/ExecutionStage'
-    
-    ExecutionStage:
-      type: object
-      properties:
-        stdout:
-          type: string
-        stderr:
-          type: string
-        exitCode:
-          type: integer
+  /runtimes:
+    get:
+      tags: [Operations]
+      summary: List installed runtimes
+      description: |
+        Runtimes are discovered from `SANDBOX_PACKAGES_DIRECTORY` at startup —
+        the volume the `package_init` job populates. Which languages appear
+        depends on `CODEAPI_LANGUAGES` at deploy time.
+      responses:
+        '200':
+          description: The installed runtimes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Runtime'
+
+  /health:
+    get:
+      tags: [Operations]
+      summary: Sandbox workspace health
+      description: |
+        Reports whether the runner can still create and tear down sandbox
+        workspaces. Used as the container healthcheck.
+      responses:
+        '200':
+          description: The workspace subsystem is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+        '503':
+          description: The workspace subsystem is unhealthy.
+          content:
+            application/json:
+              schema:
+                type: object

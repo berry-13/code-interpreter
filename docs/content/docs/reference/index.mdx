@@ -1,0 +1,90 @@
+---
+title: API reference
+description: The public HTTP API, generated from the OpenAPI spec that ships with the service.
+icon: Braces
+---
+
+These pages are generated at build time from `service/openapi.yml` in the
+repository, so they cannot drift from the spec the service ships with.
+
+## Base URL
+
+The API component listens on port `3112` and serves every route under the `/v1`
+prefix:
+
+```
+http://your-host:3112/v1
+```
+
+## Authentication
+
+Requests carry a short-lived EdDSA JWT unless the service runs with
+`LOCAL_MODE=true` or `CODEAPI_AUTH_PROVIDER=none`:
+
+```
+Authorization: Bearer <token>
+```
+
+See [Authentication](/docs/guides/authentication) for setup, and
+[Connecting LibreChat](/docs/guides/librechat) for the signer side.
+
+## Endpoints
+
+<Cards>
+  <Card
+    title="Execute code"
+    description="POST /v1/exec — run code and get its output and files."
+    href="/docs/reference/api/execution/exec/post"
+  />
+  <Card
+    title="Execute with tool calling"
+    description="POST /v1/exec/programmatic — run code that can call back into your tools."
+    href="/docs/reference/api/execution/exec/programmatic/post"
+  />
+  <Card
+    title="Upload files"
+    description="POST /v1/upload — stage inputs for later runs."
+    href="/docs/reference/api/files/upload/post"
+  />
+  <Card
+    title="Download a file"
+    description="GET /v1/download/{session_id}/{fileId}"
+    href="/docs/reference/api/files/download/session_id/fileid/get"
+  />
+</Cards>
+
+## Things worth knowing before you read the schemas
+
+**A failed program is still HTTP 200.** The status code reports whether the
+*service* did its job. A crashed program shows up as a non-zero `code` or a
+non-null `signal` on a `200` response.
+
+**The exec response is flat.** `stdout`, `stderr`, and `files` sit at the top
+level of the response, not nested under a `run` object.
+
+**Two different session ids exist.** `session_id` identifies an execution (and
+prefixes its outputs); `storage_session_id` says where a particular file's bytes
+live. See [core concepts](/docs/guides/concepts#session_id-versus-storage_session_id).
+
+**You never choose a storage namespace.** It is derived server-side from your
+authenticated identity, which is what keeps one caller out of another's files.
+
+## Rate limits
+
+Per principal, backed by Redis so they hold across API replicas:
+
+| Operation | Default |
+| --- | --- |
+| Executions | 20 per 30 s |
+| Uploads | 30 per 5 min |
+| Downloads | 60 per min |
+| File list / metadata | 120 per min |
+
+Rejections return `429` with `RateLimit-Limit`, `RateLimit-Remaining`, and
+`Retry-After`. Tune them in [configuration](/docs/guides/configuration#rate-limits).
+
+## The internal API
+
+The sandbox runner has its own API on port `2000`, documented under
+[Developers → Sandbox runner API](/docs/developers/sandbox-api/execution/execute/post).
+It is called only by the worker and must never be exposed publicly.

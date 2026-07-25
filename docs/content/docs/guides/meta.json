@@ -1,0 +1,25 @@
+{
+  "title": "Guides",
+  "description": "Install, configure, and operate the service",
+  "icon": "BookOpen",
+  "root": true,
+  "pages": [
+    "quickstart",
+    "concepts",
+    "---Deployment---",
+    "deployment",
+    "configuration",
+    "---Integration---",
+    "librechat",
+    "authentication",
+    "---Using it---",
+    "languages",
+    "files",
+    "dependencies",
+    "sessions",
+    "tool-calling",
+    "---Operating it---",
+    "operations",
+    "troubleshooting"
+  ]
+}

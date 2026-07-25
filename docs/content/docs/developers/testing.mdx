@@ -1,0 +1,173 @@
+---
+title: Testing
+description: The unit suites, the sandbox escape tests, and what CI enforces.
+icon: FlaskConical
+---
+
+## Unit tests
+
+Both TypeScript codebases use Bun's test runner.
+
+```bash
+# Sandbox runner
+cd api && bun test
+
+# Service (API, worker, file server, gateway, tool call server)
+cd service && bun test
+```
+
+Tests sit next to the code they cover as `*.test.ts` / `*.spec.ts`. The service
+suite globs both the top level and subdirectories:
+
+```
+bun test ./src/*.test.ts ./src/*.spec.ts ./src/**/*.test.ts ./src/**/*.spec.ts
+```
+
+### What is covered most heavily
+
+The security-critical modules have the densest coverage, which is a good guide
+to where care is expected:
+
+| Area | Tests |
+| --- | --- |
+| Execution manifests | `execution-manifest.test.ts` (both codebases), `execution-manifest-request.test.ts` |
+| Egress | `egress-grant.test.ts`, `egress-ledger.test.ts`, `egress-gateway.test.ts`, `egress-gateway-client.test.ts` |
+| Auth and identity | `internal-service-auth.test.ts`, `execution-identity.test.ts`, `session-key.test.ts` |
+| Sandbox isolation | `workspace-isolation.test.ts`, `nsjail.test.ts`, `nsjail-setup-gate.test.ts` |
+| Job lifecycle | `job-cleanup.test.ts`, `job-helpers.test.ts`, `job-restore-permissions.test.ts`, `job-strip-symlinks.test.ts`, `job-tar-estimate.test.ts` |
+| Persistence | `session-persist.test.ts` |
+| Dependencies | `dependencies.test.ts` |
+| Error safety | `safe-error.test.ts` |
+| Startup validation | `secure-startup.test.ts` (both codebases) |
+
+<Callout type="info">
+`workspace-isolation.test.ts` includes a case deliberately written to be
+privilege-independent, so `chownTreeToJobUid` can be tested without root. Keep
+new tests runnable without elevated privileges where possible.
+</Callout>
+
+## Sandbox behaviour tests
+
+`test-sandbox.sh` drives a running sandbox runner over HTTP, minting real signed
+execution manifests as it goes:
+
+```bash
+docker compose up -d
+./test-sandbox.sh
+```
+
+It defaults to `SANDBOX_URL=http://localhost:2000` and the well-known
+development manifest keypair. `jq` is required.
+
+`test-sandbox-docker.sh` wraps the same suite for a containerised run.
+
+## Isolation probes
+
+`tests/` holds programs that assert the sandbox actually contains things. They
+are meant to *fail to escape*:
+
+| File | Probes |
+| --- | --- |
+| `network.py` | That outbound network access is unavailable |
+| `fork.py` | PID limits |
+| `fallocate.py` | Filesystem size limits |
+| `runaway_output.py` | Output truncation |
+| `concurrent_jobs.py` | Concurrency limits |
+| `multi_request.py` | Multiple requests in flight |
+| `file_persistance.py` | Workspace lifetime between runs |
+| `specguard_fd_isolation.py` | File-descriptor isolation |
+| `specguard_emfile_fallback.sh` | Behaviour at the fd limit |
+
+See `tests/readme.md`.
+
+<Callout type="warn">
+When you change the seccomp policy, mount table, or limits, run these. A policy
+edit that silently permits something is exactly the failure they exist to
+catch — and the kind unit tests will not notice.
+</Callout>
+
+## Integration scripts
+
+`service/scripts/` holds targeted scripts for subsystems that need real
+infrastructure:
+
+| Script | Exercises |
+| --- | --- |
+| `test-s3-minio.ts` | Object storage against MinIO |
+| `test-irsa-simulation.ts` | IRSA-style credential flow |
+| `test-ptc-replay-smoke.ts` | Programmatic tool-calling replay |
+| `test-ptc-replay-bash-smoke.ts` | The same for Bash |
+| `test-ptc-sentinel.ts` | Tool-call sentinel handling |
+| `test-replay-state.ts` | Replay state management |
+
+## What CI runs
+
+`.github/workflows/ci.yml`, on pushes to `main` and `sync/**` and on every pull
+request:
+
+<Steps>
+<Step>
+### API unit tests
+
+Bun 1.3.13 with a package cache, `bun ci`, `bun run build`, then `bun test`.
+</Step>
+
+<Step>
+### spec-guard compile and smoke
+
+```bash
+gcc -O2 -static -Wall -Wextra -Werror -o /tmp/spec-guard spec-guard.c
+```
+
+Then a smoke check that it `execvp`s its argument cleanly.
+
+This exists because `spec-guard.c` is otherwise only compiled by
+`api/Dockerfile`, which the Helm workflow builds *post-merge*. Compiling it in
+CI stops a broken sandbox binary from reaching an image build.
+</Step>
+
+<Step>
+### Service unit tests
+
+Same shape for the `service/` codebase.
+</Step>
+</Steps>
+
+Other workflows: `publish-images.yml` builds and pushes images to GHCR on
+pushes to `main` and version tags; `open-sync-pr.yml` handles the mirror-sync
+flow described in [Contributing](/docs/developers/contributing).
+
+## Writing tests
+
+**Keep security tests behavioural.** The manifest and grant suites assert on
+*outcomes* — that an expired manifest is rejected, that a mutated body fails the
+hash check — rather than on internal representation. That way a refactor of the
+encoding does not silently weaken the check.
+
+**Cover the failure path first.** For anything in the security core, the
+interesting case is the rejection, not the happy path.
+
+**Prefer no privileges.** Tests that need root cannot run in CI.
+
+**Document non-obvious cases in the test.** This codebase's comments frequently
+record the bug that motivated a check; tests are a good place to continue that.
+
+## Manual verification
+
+```bash
+# End to end
+curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"print(sum(range(10)))"}' | jq
+
+# Runtimes discovered
+curl -s localhost:2000/api/v2/runtimes | jq
+
+# Network really is unavailable
+curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"import urllib.request;urllib.request.urlopen(\"https://example.com\",timeout=5)"}' \
+  | jq -r '.stderr'
+
+# Limits really are enforced
+curl -sX POST localhost:3112/v1/exec -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"x = bytearray(10**10)"}' | jq '{code,signal,message}'
+```

@@ -1,0 +1,223 @@
+---
+title: Configuration reference
+description: Every environment variable, grouped by what it controls, with defaults and the ones that matter.
+icon: Settings
+---
+
+Configuration is entirely environment-variable driven. The Compose files inline
+development defaults; `.env.example` in the repository root is the annotated
+template to copy from.
+
+<Callout type="info">
+Variables are read by different components. A variable set on the API does
+nothing on the sandbox runner and vice versa — the **Component** column below
+says where each one belongs. The Compose and Helm files already route them
+correctly.
+</Callout>
+
+## Core mode
+
+| Variable | Default | Component | Description |
+| --- | --- | --- | --- |
+| `LOCAL_MODE` | `true` in Compose | API, worker | Bypasses authentication entirely and stamps a fixed local principal. **Development only.** |
+| `CODEAPI_HARDENED_SANDBOX_MODE` | `true` | API, worker, runner, gateway | Keeps microVM + NsJail hardening on. Only disable for local debugging. |
+
+## Authentication
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEAPI_AUTH_PROVIDER` | `librechat-jwt` | `librechat-jwt` or `none`. |
+| `CODEAPI_ALLOW_AUTH_PROVIDER_NONE` | unset | Must be `true` for `CODEAPI_AUTH_PROVIDER=none` to start outside local mode. |
+| `CODEAPI_JWT_ISSUER` | `librechat` | Must match the `iss` the signer mints. |
+| `CODEAPI_JWT_AUDIENCE` | `codeapi` | Must match the `aud` the signer mints. |
+| `CODEAPI_JWT_ALLOWED_ALGS` | `EdDSA` | Accepted signature algorithms. |
+| `CODEAPI_JWT_KID` | `lc-codeapi-1` | Key id. A token with an unknown `kid` is rejected. |
+| `CODEAPI_JWT_PUBLIC_KEY` | unset | Verifier key, PEM or base64 DER. Escaped `\n` allowed. |
+| `CODEAPI_JWT_JWKS_JSON` | unset | Inline JWKS document, as an alternative to a single key. |
+| `CODEAPI_JWT_PUBLIC_KEYS_DIR` | unset | Directory of PEM files named by `kid`, for rotation. |
+| `CODEAPI_JWT_MAX_TTL_SECONDS` | `300` | Token lifetime cap. Max 300. |
+| `CODEAPI_JWT_CLOCK_SKEW_SECONDS` | `30` | Clock skew tolerance. Max 30. |
+| `CODEAPI_TENANT_ISOLATION_STRICT` | unset | When `true`, rejects requests whose auth context carries no tenant id. |
+
+See [Authentication](/docs/guides/authentication) for the full setup.
+
+## Internal secrets
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEAPI_INTERNAL_SERVICE_TOKEN` | dev value in Compose | Shared token between components. **When unset, file-object routes and tool-call session routes are unauthenticated.** |
+| `CODEAPI_EGRESS_GRANT_SECRET` | dev value in Compose | Signs egress grants. 32+ bytes in production. |
+| `CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY` | test key in Compose | Ed25519 signing key. **Worker only.** |
+| `SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY` | test key in Compose | Ed25519 verifier. **Sandbox runner only.** |
+
+<Callout type="error">
+The manifest keypair inlined in the Compose files and `values-local.yaml` is
+publicly known — the same one is hardcoded in the unit tests. Replace it. See
+[production hardening](/docs/guides/deployment/hardening).
+</Callout>
+
+## Execution manifests
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EXECUTION_MANIFEST_TTL_SECONDS` | `300` | Manifest validity window. |
+| `EXECUTION_MANIFEST_MAX_UPLOAD_BYTES` | — | Upload budget granted to one execution. |
+| `EXECUTION_MANIFEST_MAX_OUTPUT_FILES` | — | Output file count budget. |
+| `EXECUTION_MANIFEST_MAX_REQUESTS` | — | Total gateway requests one execution may make. |
+| `SANDBOX_REQUIRE_EGRESS_MANIFEST` | `true` | Runner refuses unsigned execute requests. |
+| `CODEAPI_EGRESS_LEDGER_REQUIRED` | `true` | Gateway requires a live ledger entry per grant. |
+
+## Redis
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `REDIS_HOST` | `redis` | Hostname. |
+| `REDIS_PORT` | `6379` | Port. |
+| `REDIS_PASSWORD` | `localdev` in Compose | Password. |
+| `REDIS_TLS` | unset | Set `true` for managed Redis requiring TLS. |
+| `SESSION_CACHE_TTL` | `86400` | Seconds a session→sessionKey mapping is cached. |
+
+## Object storage
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MINIO_ENDPOINT` | `minio` | S3 endpoint host. |
+| `MINIO_PORT` | `9000` | Endpoint port. |
+| `MINIO_USE_SSL` | `false` | TLS to the endpoint. |
+| `MINIO_ACCESS_KEY` | `minioadmin` | Access key. |
+| `MINIO_SECRET_KEY` | `minioadmin` | Secret key. |
+| `MINIO_BUCKET` | `test-bucket` | Bucket name. |
+| `MINIO_NO_PORT` | `false` | Omit an explicit port — for gateways that must not receive one. |
+| `FILE_SERVER_PORT` | `3000` | File server listen port. |
+
+Despite the names, any S3-compatible endpoint works; the file server also
+supports IRSA authentication on EKS.
+
+## Sandbox runner
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `KVM_ENABLED` | `true` | microVM mode. `false` is NsJail-only — [weaker isolation](/docs/guides/deployment/without-kvm). |
+| `KVM_DEVICE_PATH` | `/dev/kvm` | Device to map in. |
+| `SANDBOX_PACKAGES_DIRECTORY` | `/pkgs` | Where runtimes are mounted inside the runner. |
+| `SANDBOX_MAX_CONCURRENT_JOBS` | `8` | Parallel executions per runner. |
+| `SANDBOX_MAX_PROCESS_COUNT` | `100` | PID limit inside the sandbox. |
+| `SANDBOX_RUN_TIMEOUT` | `300000` | Run wall-clock limit (ms). |
+| `SANDBOX_RUN_CPU_TIME` | `300000` | Run CPU-time limit (ms). |
+| `SANDBOX_COMPILE_TIMEOUT` | `30000` | Compile phase limit (ms). |
+| `SANDBOX_RUN_MEMORY_LIMIT` | `-1` | Run memory cgroup limit in bytes; `-1` is unlimited. |
+| `SANDBOX_OUTPUT_MAX_SIZE` | `65536` | Max stdout/stderr bytes before truncation. |
+| `SANDBOX_MAX_OPEN_FILES` | `2048` | rlimit nofile. |
+| `SANDBOX_MAX_FILE_SIZE` | `10000000` | rlimit fsize (bytes). |
+| `SANDBOX_RLIMIT_AS` | `4096` | Address space rlimit (MB). |
+| `SANDBOX_USE_CGROUPV2` | `true` | Use cgroups v2. |
+| `SANDBOX_PER_JOB_UIDS` | `true` | Allocate a distinct UID per concurrent job. |
+| `SANDBOX_JOB_UID_BASE` | `200000` | First UID in the per-job pool. |
+| `SANDBOX_JOB_GID_BASE` | `200000` | First GID in the per-job pool. |
+| `SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS` | `3600` | Age after which orphaned workspaces are reclaimed. |
+| `SANDBOX_EXECUTE_BODY_LIMIT` | `50mb` | Max execute request body. |
+| `SANDBOX_LOG_LEVEL` | `INFO` | Log verbosity. |
+| `SANDBOX_ALLOWED_LOCAL_NETWORK_PORT` | `0` | The single host port the sandbox may reach — the egress gateway. |
+| `SANDBOX_FORWARD_TARGET` | — | Where that port forwards to. |
+
+### microVM launcher
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LAUNCHER_VCPUS` | `2` | vCPUs per sandbox microVM. |
+| `LAUNCHER_RAM_MIB` | `2048` | RAM per sandbox microVM. |
+| `LAUNCHER_LOG_LEVEL` | `3` | libkrun log verbosity. |
+
+## Worker concurrency
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PYTHON_CONCURRENCY` | `1` | Concurrent Python jobs per worker. |
+| `OTHER_CONCURRENCY` | `8` | Concurrent non-Python jobs per worker. |
+| `JOB_WINDOW` | `1000` | Job scheduling window. |
+| `WORKER_HEALTH_PORT` | `3113` | Worker health/metrics port. |
+
+Python gets its own queue and a lower default because scientific workloads are
+heavier. See [Operations](/docs/guides/operations#scaling).
+
+## Rate limits
+
+Applied per principal on the API.
+
+| Variable | Default | Applies to |
+| --- | --- | --- |
+| `MAX_REQUESTS` | `20` | Executions per window |
+| `RATE_LIMIT_WINDOW` | `30000` | Execution window (ms) |
+| `UPLOAD_MAX_REQUESTS` | `30` | Uploads per window |
+| `UPLOAD_LIMIT_WINDOW` | `300000` | Upload window (ms) |
+| `DOWNLOAD_MAX_REQUESTS` | `60` | Downloads per window |
+| `DOWNLOAD_LIMIT_WINDOW` | `60000` | Download window (ms) |
+| `FETCH_MAX_REQUESTS` | `120` | File list/metadata calls per window |
+| `FETCH_LIMIT_WINDOW` | `60000` | Fetch window (ms) |
+| `MAX_FILE_SIZE` | `26214400` | Per-file upload cap (25 MiB) |
+| `CODEAPI_HTTP_JSON_LIMIT` | `50mb` | Max JSON request body |
+
+## Language runtimes
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEAPI_LANGUAGES` | all | Comma-separated subset of `python`, `node`, `bun`, `bash`, `java`. |
+| `SANDBOX_PACKAGES_PATH` | `./data/pkgs` | Host path where runtimes are cached. |
+| `FORCE_REBUILD` | unset | `true` wipes and rebuilds the packages volume. |
+| `PYTHON_VERSION`, `NODE_VERSION`, `BUN_VERSION`, `JAVA_VERSION` | pinned | Override a runtime version. |
+| `PYTHON_SHA256`, `NODE_SHA256`, `BUN_SHA256`, `JAVA_SHA256` | pinned | Checksum for a custom version. |
+
+Downloads are verified against SHA-256 checksums pinned for the default
+versions. Override a version and `package_init` verifies against the provider's
+published checksum file instead; set the matching `*_SHA256` to pin your own.
+
+## Persistent sessions
+
+Off by default. See [Persistent sessions](/docs/guides/sessions).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEAPI_PERSIST_SESSIONS` | `false` | Carry files and Python variables across runs. |
+| `CODEAPI_SESSION_STATE_MAX_BYTES` | `104857600` | Snapshot cap (100 MiB). Oversize snapshots are skipped; the run still succeeds. |
+| `CODEAPI_SESSION_STATE_TTL_SECONDS` | `604800` | Idle expiry of the Redis pointer (7 days), refreshed each run. |
+
+## Dynamic dependencies
+
+Off by default. See [Dynamic dependencies](/docs/guides/dependencies).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES` | `false` | Allow per-job pip installs. |
+| `CODEAPI_DEPENDENCY_INDEX_URL` | `https://pypi.org/simple` | Package index the runner fetches from. |
+| `CODEAPI_DEPENDENCY_MAX_COUNT` | `50` | Max packages per job. |
+| `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS` | `120000` | Install timeout. |
+| `CODEAPI_DEPENDENCY_MAX_BYTES` | `262144000` | Total install size cap. |
+
+## Service URLs
+
+Set by the Compose files and the chart; override only for custom topologies.
+
+| Variable | Compose value |
+| --- | --- |
+| `SERVICE_PORT` | `3112` |
+| `SANDBOX_ENDPOINT` | `http://sandbox-runner:2000/api/v2` |
+| `EGRESS_GATEWAY_URL` | `http://egress_gateway:3190` |
+| `FILE_SERVER_URL` | `http://file_server:3000` |
+| `TOOL_CALL_SERVER_URL` | `http://tool_call_server:3033` |
+| `EGRESS_GATEWAY_PORT` | `3190` |
+| `TOOL_CALL_SERVER_PORT` | `3033` |
+| `TOOL_CALL_REQUEST_TIMEOUT` | `300000` |
+| `TOOL_CALL_SESSION_EXPIRY` | `600` |
+| `EGRESS_GATEWAY_MAX_FILE_BYTES` | `10000000` |
+| `EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES` | `1048576` |
+
+## Telemetry
+
+OpenTelemetry tracing, off by default. On Kubernetes set `otel.enabled=true`.
+
+| Variable | Description |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Traces-specific endpoint. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Extra headers. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Resource attributes. |

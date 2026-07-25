@@ -1,0 +1,127 @@
+---
+title: Docker Compose
+description: Running the stack on a single host, including the scalable topology and image publishing.
+icon: Container
+---
+
+## The default stack
+
+```bash
+docker compose up --build
+```
+
+This builds every image from source and brings up nine services:
+
+| Service | Container | Published port | Role |
+| --- | --- | --- | --- |
+| `api` | `api` | `3112` | Public HTTP API |
+| `service-worker` | `service-worker` | — | Job consumer |
+| `sandbox-runner` | `sandbox-runner` | `2000` | Executes code |
+| `file_server` | `file_server` | `13000` → 3000 | Object storage front end |
+| `tool_call_server` | `tool_call_server` | — | Tool call routing |
+| `egress_gateway` | `egress_gateway` | `3190` | Sandbox egress control |
+| `package_init` | `package_init` | — | One-shot runtime installer |
+| `redis` | `redis` | `16379` → 6379 | Queue and session pointers |
+| `minio` | `minio` | `19000`, `19001` | S3-compatible storage |
+
+<Callout type="info">
+Only `api` is meant to be reachable by clients. The others are published
+locally for debugging convenience; in any real deployment they belong on an
+internal network. Override the host ports with `CODEAPI_FILE_SERVER_PORT`,
+`CODEAPI_REDIS_PORT`, `CODEAPI_MINIO_PORT`, and `CODEAPI_MINIO_CONSOLE_PORT`.
+</Callout>
+
+### First start
+
+`package_init` runs once and downloads the language runtimes into
+`./data/pkgs` (override with `SANDBOX_PACKAGES_PATH`). Nothing is installed on
+the host itself. Everything else waits for it:
+
+- `sandbox-runner` has `depends_on: package_init: service_completed_successfully`
+- `service-worker` waits for `sandbox-runner` to report healthy
+
+The runtime downloads are verified against SHA-256 checksums pinned for the
+default versions. If you override a runtime version, `package_init` verifies
+against the provider's published checksum file instead; set `PYTHON_SHA256`,
+`NODE_SHA256`, `BUN_SHA256`, or `JAVA_SHA256` to pin a custom version yourself.
+
+### Controlling which languages install
+
+```bash
+CODEAPI_LANGUAGES=python,bun docker compose up --build
+```
+
+Adding a language later installs only what is missing into the existing volume.
+`FORCE_REBUILD=true` wipes and rebuilds it from scratch.
+
+## Prebuilt images
+
+```bash
+docker compose -f docker-compose.prebuilt.yml up
+```
+
+Pulls from `ghcr.io/berry-13/codeapi-*`, published by the `publish-images`
+workflow on every push to `main` and on version tags. Same topology, same
+`package_init` behaviour, no build step.
+
+<Callout type="warn">
+`linux/amd64` only. On arm64 (including Apple Silicon), build from source.
+</Callout>
+
+## The scalable stack
+
+```bash
+docker compose -f docker-compose.scalable.yml up --build
+```
+
+This separates the worker and sandbox into a scalable pair, mirroring how the
+Helm chart lays out the `worker-sandbox` pod. Use it when you want to exercise
+multi-worker behaviour — queue depth, job distribution, concurrency limits —
+on a single host before deploying to Kubernetes.
+
+Its no-KVM companion is `docker-compose.scalable.nokvm.yml`:
+
+```bash
+docker compose -f docker-compose.scalable.yml -f docker-compose.scalable.nokvm.yml up
+```
+
+## Local development
+
+`docker-compose.local-dev.yml` adds source mounts and a faster rebuild loop for
+working on the service itself. `docker-compose.mac.yml` carries macOS-specific
+adjustments.
+
+See [Building and running from source](/docs/developers/building) for the
+development workflow.
+
+## Secrets in the Compose files
+
+The local Compose files inline development values so the stack starts with no
+configuration:
+
+| Variable | Local default | Must change in production |
+| --- | --- | --- |
+| `LOCAL_MODE` | `true` | **Yes** — this disables authentication entirely |
+| `CODEAPI_INTERNAL_SERVICE_TOKEN` | `localdev-internal-service-token` | **Yes** |
+| `CODEAPI_EGRESS_GRANT_SECRET` | `localdev-egress-grant-secret-change-me-32b` | **Yes** — needs 32+ bytes |
+| `CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY` | a known test key | **Yes** |
+| `SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY` | the matching test key | **Yes** |
+| `REDIS_PASSWORD` | `localdev` | **Yes** |
+| MinIO credentials | `minioadmin` / `minioadmin` | **Yes** |
+
+<Callout type="error" title="These are publicly known values">
+The manifest keypair inlined in the Compose files is the same one hardcoded in
+the unit tests. Anyone can read it out of the repository. It exists so `docker
+compose up` works with zero setup — it provides no security whatsoever.
+</Callout>
+
+Work through [production hardening](/docs/guides/deployment/hardening) before
+running this for anyone but yourself.
+
+## Stopping and cleaning up
+
+```bash
+docker compose down            # stop, keep volumes
+docker compose down -v         # also drop MinIO data
+rm -rf ./data/pkgs             # force runtimes to re-download next start
+```

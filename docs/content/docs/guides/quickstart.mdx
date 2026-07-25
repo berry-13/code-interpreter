@@ -1,0 +1,169 @@
+---
+title: Quickstart
+description: Bring up the full stack locally and run your first sandboxed program.
+icon: Rocket
+---
+
+This gets you a complete, working stack on one machine — API, worker, sandbox
+runner, file server, tool-call server, egress gateway, Redis, and MinIO — and
+then runs code in it.
+
+## Requirements
+
+<Callout type="info">
+The default stack boots the sandbox inside a **libkrun microVM** and maps
+`/dev/kvm` into the sandbox container. If your host has no usable `/dev/kvm` —
+cheap VPSes, LXC containers, nested virtualisation without KVM passthrough —
+Docker will fail to start that container. Jump to
+[running without KVM](/docs/guides/deployment/without-kvm), or use the
+`--nokvm` override shown below.
+</Callout>
+
+- Docker with Compose v2
+- `/dev/kvm` available (or use the no-KVM override)
+- Roughly 8 GB of free disk for the language runtimes on first start
+
+## Start the stack
+
+```bash
+docker compose up --build
+```
+
+On first start the one-shot `package_init` service downloads the language
+runtimes into `./data/pkgs`, so nothing needs to be installed on the host. That
+volume is reused on later starts and already-installed runtimes are skipped.
+
+To install only a subset of languages — much faster, and usually what you want
+locally:
+
+```bash
+CODEAPI_LANGUAGES=python docker compose up --build
+```
+
+Accepted values are `python`, `node`, `bun`, `bash`, and `java`; the default is
+all of them. Adding a language later (say `CODEAPI_LANGUAGES=python,bun`)
+installs only the missing runtime into the existing volume. Set
+`FORCE_REBUILD=true` to wipe and rebuild the volume from scratch.
+
+<Callout type="warn">
+The local Compose files run with `LOCAL_MODE=true`, which **bypasses
+authentication entirely** and stamps every request with a fixed local
+principal. That is fine on a loopback interface and nowhere else. See
+[Authentication](/docs/guides/authentication) before exposing this anywhere.
+</Callout>
+
+## Run your first program
+
+The API listens on port `3112` and serves everything under `/v1`.
+
+```bash
+curl -sX POST http://localhost:3112/v1/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"print(sum(range(10)))"}' | jq
+```
+
+```json title="Response"
+{
+  "session_id": "V1StGXR8Z5jdHi6BmyT",
+  "stdout": "45\n",
+  "stderr": "",
+  "files": [],
+  "code": 0,
+  "signal": null,
+  "wall_time": 412
+}
+```
+
+<Callout type="info" title="Non-zero exit codes are still HTTP 200">
+The API returns `200` whenever it successfully ran the program. If the user's
+code crashed, that shows up as a non-zero `code` or a non-null `signal` — not
+as an HTTP error. Check those fields, not just the status code.
+</Callout>
+
+## Produce a file
+
+Anything the program writes into its working directory comes back as a
+downloadable artifact:
+
+```bash
+curl -sX POST http://localhost:3112/v1/exec \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "lang": "py",
+    "code": "import matplotlib.pyplot as plt\nplt.plot([1,4,9,16])\nplt.savefig(\"squares.png\")"
+  }' | jq '.files'
+```
+
+```json title="Response"
+[
+  {
+    "id": "8ZqL2mVxRt0PnCbWyKdSa",
+    "name": "squares.png",
+    "storage_session_id": "7fZq2NkP0aRcVbXsLmTdY",
+    "kind": "user"
+  }
+]
+```
+
+Download it with the `session_id` from the exec response and the file's `id`:
+
+```bash
+curl -s http://localhost:3112/v1/download/7fZq2NkP0aRcVbXsLmTdY/8ZqL2mVxRt0PnCbWyKdSa \
+  -o squares.png
+```
+
+See [Working with files](/docs/guides/files) for uploading inputs and the full
+file lifecycle.
+
+## Verify the stack is healthy
+
+```bash
+curl -s http://localhost:3112/v1/health          # API
+curl -s http://localhost:2000/api/v2/runtimes    # installed runtimes
+```
+
+The `runtimes` call is the quickest way to confirm `package_init` finished and
+the sandbox runner picked up the languages you asked for.
+
+## Using prebuilt images
+
+To skip building from source, use the pull-based Compose file. It mirrors the
+default stack but pulls every image from GHCR (`ghcr.io/berry-13/codeapi-*`),
+published on each push to `main` and on version tags:
+
+```bash
+docker compose -f docker-compose.prebuilt.yml up
+```
+
+`package_init` still populates `./data/pkgs` on first start, so the same
+`CODEAPI_LANGUAGES` and `SANDBOX_PACKAGES_PATH` options apply.
+
+<Callout type="warn">
+Prebuilt images are `linux/amd64` only for now. On other architectures, build
+from source with the default Compose file instead.
+</Callout>
+
+## Where to go next
+
+<Cards>
+  <Card
+    title="Core concepts"
+    description="Sessions, files, and the vocabulary the API uses."
+    href="/docs/guides/concepts"
+  />
+  <Card
+    title="Connect LibreChat"
+    description="Wire this service up as LibreChat's code interpreter."
+    href="/docs/guides/librechat"
+  />
+  <Card
+    title="Deployment options"
+    description="Compose variants, Kubernetes, and hosts without KVM."
+    href="/docs/guides/deployment"
+  />
+  <Card
+    title="Configuration reference"
+    description="Every environment variable, grouped by what it controls."
+    href="/docs/guides/configuration"
+  />
+</Cards>

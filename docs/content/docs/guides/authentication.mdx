@@ -1,0 +1,215 @@
+---
+title: Authentication
+description: The three authentication modes, how principals are derived, and what each mode is safe for.
+icon: KeyRound
+---
+
+Authentication decides one thing that matters enormously: **which principal a
+request runs as**. The principal is what the storage namespace derives from, so
+it is the boundary between one user's files and another's. Get it wrong and
+every caller shares one namespace — or worse, executes code with no identity at
+all.
+
+## The three modes
+
+| Mode | Set by | Principal comes from | Safe for |
+| --- | --- | --- | --- |
+| **Local** | `LOCAL_MODE=true` | A fixed built-in principal | Loopback development only |
+| **None** | `CODEAPI_AUTH_PROVIDER=none` | `User-Id` header → body `user_id` → `anonymous` | Behind a gateway that authenticates for you |
+| **JWT** | `CODEAPI_AUTH_PROVIDER=librechat-jwt` | Verified EdDSA token claims | Production |
+
+<Callout type="warn">
+`LOCAL_MODE=true` **wins over everything**. It bypasses authentication before
+the provider is ever consulted. Configuring JWTs while leaving local mode on
+gets you unauthenticated access with extra configuration.
+</Callout>
+
+## Local mode
+
+```bash
+LOCAL_MODE=true
+```
+
+The default in every local Compose file. Every request is stamped with a fixed
+local principal — no header, no token, no check.
+
+This means **anyone who can reach port 3112 can execute arbitrary code**. Bind
+it to loopback and nothing else.
+
+## Provider: none
+
+```bash
+LOCAL_MODE=false
+CODEAPI_AUTH_PROVIDER=none
+CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true
+```
+
+The service takes the user id from, in order:
+
+1. the `User-Id` request header,
+2. the request body's `user_id`,
+3. the literal `anonymous`.
+
+The second flag is a deliberate speed bump: the service **refuses to start** in
+this mode unless `CODEAPI_ALLOW_AUTH_PROVIDER_NONE=true` is also set, so you
+cannot arrive here by typo.
+
+<Callout type="error">
+The caller supplies their own identity here. Any client can claim to be any
+user and read that user's files. Only use this behind something that
+authenticates and rewrites `User-Id` itself, on a network the public cannot
+reach.
+</Callout>
+
+## JWT (EdDSA) mode
+
+The production path. LibreChat signs a short-lived Ed25519 JWT; this service
+verifies it. The private key never leaves the signer.
+
+```bash
+LOCAL_MODE=false
+CODEAPI_AUTH_PROVIDER=librechat-jwt
+CODEAPI_JWT_ISSUER=librechat
+CODEAPI_JWT_AUDIENCE=codeapi
+CODEAPI_JWT_ALLOWED_ALGS=EdDSA
+CODEAPI_JWT_KID=lc-codeapi-1
+CODEAPI_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+```
+
+### Required claims
+
+The signer populates these; the verifier checks them:
+
+| Claim | Checked against |
+| --- | --- |
+| `iss` | `CODEAPI_JWT_ISSUER` |
+| `aud` | `CODEAPI_JWT_AUDIENCE` |
+| `sub` | Becomes the principal's user id |
+| `jti` | Token id |
+| `iat` / `nbf` / `exp` | Validity window, with skew tolerance |
+| `principal_source` | Where the identity originated |
+| `auth_context_hash` | Binds the token to its auth context |
+
+The token's `kid` header selects the verifier key. An unknown `kid` is rejected
+without further checks.
+
+### Lifetime
+
+| Variable | Default | Max |
+| --- | --- | --- |
+| `CODEAPI_JWT_MAX_TTL_SECONDS` | `300` | 300 |
+| `CODEAPI_JWT_CLOCK_SKEW_SECONDS` | `30` | 30 |
+
+Both are capped by the service. Tokens are meant to be minted per request or
+near enough; a five-minute ceiling is the most you get.
+
+### Supplying verifier keys
+
+Three mutually compatible options:
+
+<Tabs items={['Single key', 'JWKS', 'Key directory']}>
+<Tab value="Single key">
+
+```bash
+CODEAPI_JWT_KID=lc-codeapi-1
+CODEAPI_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+```
+
+PEM or base64-encoded DER. Escaped `\n` is accepted, which is what makes this
+survivable in `.env` files and Kubernetes secrets.
+
+</Tab>
+<Tab value="JWKS">
+
+```bash
+CODEAPI_JWT_JWKS_JSON='{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"lc-codeapi-1","x":"..."}]}'
+```
+
+An inline JWKS document. Serves several keys at once — the natural fit for
+rotation.
+
+</Tab>
+<Tab value="Key directory">
+
+```bash
+CODEAPI_JWT_PUBLIC_KEYS_DIR=/etc/codeapi/jwt-keys
+```
+
+A directory of PEM files named by `kid`. Mount it from a Kubernetes secret and
+rotate by adding a file rather than restarting with new configuration.
+
+</Tab>
+</Tabs>
+
+## Key rotation
+
+Because the `kid` selects the key, rotation is additive:
+
+<Steps>
+<Step>
+### Add the new public key to the verifier
+
+Put it in the JWKS document or the key directory alongside the current one.
+Both are now accepted.
+</Step>
+<Step>
+### Switch the signer
+
+Point LibreChat at the new private key and its `kid`. Tokens signed with either
+key still verify.
+</Step>
+<Step>
+### Wait out the old tokens
+
+At most `CODEAPI_JWT_MAX_TTL_SECONDS` — five minutes by default.
+</Step>
+<Step>
+### Remove the old public key
+
+Nothing in flight is signed with it any more.
+</Step>
+</Steps>
+
+## Internal service authentication
+
+Separate from caller authentication, the components authenticate to **each
+other** with a shared token:
+
+```bash
+CODEAPI_INTERNAL_SERVICE_TOKEN=<strong random value>
+```
+
+<Callout type="error">
+When this is unset, file-object routes and Tool Call Server session-management
+routes stay **unauthenticated** for backwards compatibility. In any deployment
+where the internal network is not fully trusted, this is a real hole. Set it.
+</Callout>
+
+The local Compose files inline `localdev-internal-service-token`, which is
+public knowledge.
+
+## Tenant isolation
+
+```bash
+CODEAPI_TENANT_ISOLATION_STRICT=true
+```
+
+The storage namespace can include a tenant dimension. Single-tenant deployments
+may not populate a tenant id at all, in which case `legacy` is used. Setting
+this to `true` rejects requests whose auth context carries no tenant id, rather
+than silently pooling them under `legacy`.
+
+Turn it on for any multi-tenant deployment.
+
+## Verifying your setup
+
+The check that matters is that an unauthenticated request fails:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://your-host/v1/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"print(1)"}'
+```
+
+`401` is correct. `200` means you are in local mode or `none` mode, whatever
+your JWT configuration says.
