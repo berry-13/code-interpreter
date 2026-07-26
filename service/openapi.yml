@@ -459,6 +459,19 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    ExecutionAbandoned:
+      description: |
+        The request's budget expired while the execution was still running on a
+        worker. Its result will not be delivered, but the run itself was not
+        cancelled: it may still finish and upload output files, so retrying
+        duplicates the work. Distinct from `503`, where the job never started
+        and was removed, and from a genuine run timeout, which is `200` with
+        `status: "TO"`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
     Unavailable:
       description: |
         The service is starting up or shutting down, or, on `/exec`, the
@@ -562,6 +575,8 @@ paths:
           $ref: '#/components/responses/ServerError'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/ExecutionAbandoned'
 
   /exec/programmatic:
     post:
@@ -603,6 +618,8 @@ paths:
           $ref: '#/components/responses/ServerError'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/ExecutionAbandoned'
 
   /upload:
     post:

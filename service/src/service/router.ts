@@ -693,15 +693,41 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      * while its worker is still legitimately running with budget left. Report
      * that as the capacity problem it is instead of a generic 500, which reads
      * as a fault in the submitted code and tells the caller nothing about
-     * whether retrying helps. */
-    const pendingStates = new Set(['waiting', 'waiting-children', 'delayed', 'prioritized', 'active']);
+     * whether retrying helps.
+     *
+     * Retryability is NOT the same in the two cases, so they do not share a
+     * status. A job that never started can be removed here, which makes a retry
+     * genuinely safe. A job already ACTIVE cannot be removed (its worker holds
+     * the lock) and will run to completion unobserved -- it may still upload
+     * output files and advance the session pointer -- so telling that caller to
+     * retry would duplicate the work and compound the saturation it is already
+     * suffering from. */
+    const notStarted = new Set(['waiting', 'waiting-children', 'delayed', 'prioritized']);
     const jobState = job ? await job.getState().catch(() => 'unknown') : 'unknown';
-    if (pendingStates.has(jobState)) {
-      logger.warn(`[${INSTANCE_ID}] Request budget expired with job ${job?.id} still ${jobState}; queue is saturated`);
+
+    if (notStarted.has(jobState)) {
+      // Drop it before answering: leaving a request nobody is waiting for in
+      // the queue spends a worker slot on output nobody will read.
+      const removed = await job?.remove().then(() => true).catch(() => false);
+      logger.warn(
+        `[${INSTANCE_ID}] Request budget expired with job ${job?.id} still ${jobState}; ` +
+        `queue is saturated (removed: ${removed})`,
+      );
       return res.status(503).json({
-        error: 'Execution did not start in time; the queue is saturated. Retry shortly.',
+        error: removed
+          ? 'Execution did not start in time; the queue is saturated. Safe to retry.'
+          : 'Execution did not start in time; the queue is saturated.',
       });
     }
+
+    if (jobState === 'active') {
+      logger.warn(`[${INSTANCE_ID}] Request budget expired while job ${job?.id} was still active`);
+      return res.status(504).json({
+        error: 'Execution is still running and its result will not be delivered. ' +
+          'It may still produce output files; retrying will duplicate the work.',
+      });
+    }
+
     return res.status(500).json({ error: 'Internal server error' });
   } finally {
     // Release this run's ref on the prior snapshot and delete it only once the

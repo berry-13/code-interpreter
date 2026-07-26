@@ -233,6 +233,17 @@ workerSandbox:
     otherConcurrency: 8
     jobWindow: 1000
     jobTimeout: 25000       # 25 seconds
+    # Ceiling for a request's own run_timeout; capped at jobTimeout.
+    maxRunTimeout: 25000
+    # Margin between the timeout layers. Each layer waits one grace longer
+    # than the layer below it, so a timed-out run returns status "TO" rather
+    # than a generic 500.
+    jobWaitGraceMs: 15000
+    # Time reserved for the sandbox's prime phase (input downloads, workspace
+    # restore, any pip install) and for post-run output uploads. Both are spent
+    # inside the same call the worker is waiting on.
+    jobPrimeAllowanceMs: 120000
+    jobPostProcessAllowanceMs: 60000
 
   # Health check port for the worker
   healthPort: 3113

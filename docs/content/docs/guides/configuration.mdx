@@ -136,6 +136,7 @@ supports IRSA authentication on EKS.
 | `MAX_RUN_TIMEOUT` | `JOB_TIMEOUT` | Ceiling for a request's own `run_timeout` (ms). Capped at `JOB_TIMEOUT`. |
 | `JOB_WAIT_GRACE_MS` | `15000` | Margin between the timeout layers (ms). |
 | `JOB_PRIME_ALLOWANCE_MS` | `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS` | Time reserved for the sandbox's prime phase (ms). |
+| `JOB_POSTPROCESS_ALLOWANCE_MS` | `60000` | Time reserved for post-run output uploads (ms). |
 
 A request may pass `run_timeout` (ms) to cap its own run. It is clamped down to
 `MAX_RUN_TIMEOUT`, and again to the runner's `SANDBOX_RUN_TIMEOUT`: a caller can
@@ -171,10 +172,21 @@ has to cover the sum of all three phases:
 | Prime | `JOB_PRIME_ALLOWANCE_MS` (default `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS`, 120000) | Input downloads, workspace restore, any pip install |
 | Compile | `SANDBOX_COMPILE_TIMEOUT` | Before the run, for compiled languages like Java |
 | Run | `SANDBOX_RUN_TIMEOUT` or the request's `run_timeout` | The program itself |
+| Post | `JOB_POSTPROCESS_ALLOWANCE_MS` (60000) | Walking the workspace and uploading outputs, after the run ends |
 
-These are the **runner's** variables. The service reads them to size its own
-layers, so **if you raise one on the runner, set it on the API and worker too**,
-or those layers under-provision by the difference.
+The sandbox does not answer when the run ends: it still has to walk the
+workspace and upload artifacts. The post allowance is sized for ordinary
+output, not for the pathological case where every one of
+`SANDBOX_MAX_OUTPUT_FILES` hits its own 30-second upload timeout (with the
+defaults, `ceil(50/8) * 30s` = 210s, which means the file server is broken
+rather than busy). Raise it if a deployment routinely emits many large
+artifacts.
+
+Most of these are the **runner's** variables. The service reads them to size
+its own layers, so **if you raise one on the runner, set it on the API and
+worker too**, or those layers under-provision by the difference. The shipped
+Compose files and Helm chart already forward all of them to every process that
+computes the ladder.
 
 <Callout type="info">
 The ladder bounds one job's time *inside a worker*. Queue delay sits outside it:

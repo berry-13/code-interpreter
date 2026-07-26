@@ -88,15 +88,26 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
  *    CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS, all BEFORE compile starts.
  *  - compile: SANDBOX_COMPILE_TIMEOUT, spent before the run for java.
  *  - run: the run budget itself.
+ *  - post: the sandbox does NOT answer when the run ends -- it walks the
+ *    workspace and uploads outputs (up to SANDBOX_MAX_OUTPUT_FILES, in batches
+ *    of SANDBOX_UPLOAD_CONCURRENCY, 30s per file) and may write a session
+ *    snapshot, all inside the same HTTP call.
  * Job.execute() spends them sequentially, so the worker has to cover the sum.
  * These are the RUNNER's variables: set them here too if you raise them there,
- * or this layer under-provisions by the difference. */
+ * or this layer under-provisions by the difference.
+ *
+ * The post allowance is sized for ordinary output, not for the pathological
+ * case where every one of max_output_files hits its own 30s upload timeout
+ * (with the defaults, ceil(50/8)*30s = 210s, which means the file server is
+ * broken rather than busy). Raise JOB_POSTPROCESS_ALLOWANCE_MS if a deployment
+ * routinely emits many large artifacts. */
 const JOB_WAIT_GRACE_MS = positiveIntEnv(process.env.JOB_WAIT_GRACE_MS, 15_000);
 const COMPILE_ALLOWANCE_MS = positiveIntEnv(process.env.SANDBOX_COMPILE_TIMEOUT, 30_000);
 const PRIME_ALLOWANCE_MS = positiveIntEnv(
   process.env.JOB_PRIME_ALLOWANCE_MS ?? process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS,
   120_000,
 );
+const POSTPROCESS_ALLOWANCE_MS = positiveIntEnv(process.env.JOB_POSTPROCESS_ALLOWANCE_MS, 60_000);
 
 /** Build the timeout ladder from its inputs, enforcing the ordering above.
  *
@@ -109,11 +120,15 @@ export function resolveTimeoutLadder(args: {
   jobTimeoutMs: number;
   compileAllowanceMs: number;
   primeAllowanceMs: number;
+  postProcessAllowanceMs: number;
   graceMs: number;
   maxRunTimeoutRaw?: string;
 }): { maxRunTimeoutMs: number; sandboxCallTimeoutMs: number; jobWaitTimeoutMs: number } {
-  const { jobTimeoutMs, compileAllowanceMs, primeAllowanceMs, graceMs, maxRunTimeoutRaw } = args;
-  const sandboxCallTimeoutMs = jobTimeoutMs + compileAllowanceMs + primeAllowanceMs + graceMs;
+  const {
+    jobTimeoutMs, compileAllowanceMs, primeAllowanceMs, postProcessAllowanceMs, graceMs, maxRunTimeoutRaw,
+  } = args;
+  const sandboxCallTimeoutMs =
+    jobTimeoutMs + compileAllowanceMs + primeAllowanceMs + postProcessAllowanceMs + graceMs;
   return {
     maxRunTimeoutMs: Math.min(positiveIntEnv(maxRunTimeoutRaw, jobTimeoutMs), jobTimeoutMs),
     sandboxCallTimeoutMs,
@@ -125,22 +140,32 @@ const timeoutLadder = resolveTimeoutLadder({
   jobTimeoutMs: defaultJobTimeoutMs,
   compileAllowanceMs: COMPILE_ALLOWANCE_MS,
   primeAllowanceMs: PRIME_ALLOWANCE_MS,
+  postProcessAllowanceMs: POSTPROCESS_ALLOWANCE_MS,
   graceMs: JOB_WAIT_GRACE_MS,
   maxRunTimeoutRaw: process.env.MAX_RUN_TIMEOUT,
 });
 
 /** Resolve a caller-supplied `run_timeout` (ms) against the server ceiling.
  *
- *  Returns `undefined` when absent (the router substitutes MAX_RUN_TIMEOUT, so
- *  every job carries an explicit budget), `null` when present but malformed --
- *  callers surface that as a 400 rather than silently ignoring it, which is the
- *  behavior this replaces -- and otherwise the value clamped down to `maxMs`.
+ *  Returns `undefined` only when the field is genuinely absent (the router
+ *  substitutes MAX_RUN_TIMEOUT, so every job carries an explicit budget),
+ *  `null` when present but malformed -- callers surface that as a 400 rather
+ *  than silently ignoring it, which is the behavior this replaces -- and
+ *  otherwise the value clamped down to `maxMs`.
+ *
+ *  An explicit JSON `null` counts as malformed, NOT as absent: the schema says
+ *  positive integer, and a client that serializes an unset-or-invalid timeout
+ *  as null should hear about it rather than quietly receive the longest run the
+ *  deployment allows. Omitting the field remains the way to say "no cap of my
+ *  own". Nothing is on the wire yet -- the field is new in this change -- so
+ *  the strictness breaks no existing caller.
+ *
  *  Clamping is one-directional
  *  BY DESIGN: a request may only narrow the operator's ceiling, never raise it,
  *  so a client cannot buy itself a longer hold on a sandbox slot than the
  *  deployment allows. */
 export function resolveRequestedRunTimeout(raw: unknown, maxMs: number): number | null | undefined {
-  if (raw == null) {
+  if (raw === undefined) {
     return undefined;
   }
   if (typeof raw !== 'number' || !Number.isFinite(raw) || !Number.isInteger(raw) || raw < 1) {

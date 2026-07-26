@@ -38,7 +38,16 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-export const EXECUTION_STATE_TTL = 600;
+/** TTL on `exec_state:<id>` and its `tool_history:<id>` hash.
+ *
+ *  Must outlive the longest a continuation can sit blocked on its job, which is
+ *  the request's own wait (`env.JOB_WAIT_TIMEOUT`, itself prime + compile + run
+ *  + post + graces). Otherwise the pair expires mid-execution: the completion
+ *  path recreates `exec_state` via setExecutionState, but NOT the tool-history
+ *  hash, so a later replay re-emits tool calls that were already resolved.
+ *  Floored at the historical 10 minutes so a short JOB_TIMEOUT cannot shrink
+ *  the window. */
+export const EXECUTION_STATE_TTL = Math.max(600, Math.ceil(env.JOB_WAIT_TIMEOUT / 1000) + 60);
 export const MAX_REPLAY_CALLS = 200;
 
 /** Cap on the serialized `exec_state:<id>` JSON blob (request inputs +

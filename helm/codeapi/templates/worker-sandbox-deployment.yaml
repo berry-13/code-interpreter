@@ -162,8 +162,21 @@ spec:
               value: {{ .Values.workerSandbox.config.otherConcurrency | quote }}
             - name: JOB_WINDOW
               value: {{ .Values.workerSandbox.config.jobWindow | quote }}
+            # Timeout ladder: every process that waits on a job must
+            # compute the same one, so these are rendered identically here and
+            # in the worker. See guides/configuration#timeouts.
             - name: JOB_TIMEOUT
               value: {{ .Values.workerSandbox.config.jobTimeout | quote }}
+            - name: MAX_RUN_TIMEOUT
+              value: {{ .Values.workerSandbox.config.maxRunTimeout | quote }}
+            - name: JOB_WAIT_GRACE_MS
+              value: {{ .Values.workerSandbox.config.jobWaitGraceMs | quote }}
+            - name: JOB_PRIME_ALLOWANCE_MS
+              value: {{ .Values.workerSandbox.config.jobPrimeAllowanceMs | quote }}
+            - name: JOB_POSTPROCESS_ALLOWANCE_MS
+              value: {{ .Values.workerSandbox.config.jobPostProcessAllowanceMs | quote }}
+            - name: SANDBOX_COMPILE_TIMEOUT
+              value: {{ .Values.workerSandbox.sandbox.compileTimeout | quote }}
             - name: WORKER_HEALTH_PORT
               value: {{ .Values.workerSandbox.healthPort | quote }}
             {{- with .Values.workerSandbox.extraEnv }}
