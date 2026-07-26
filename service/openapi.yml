@@ -179,6 +179,17 @@ components:
             $ref: '#/components/schemas/RequestFile'
         dependencies:
           $ref: '#/components/schemas/Dependencies'
+        run_timeout:
+          type: integer
+          minimum: 1
+          description: |
+            Wall-clock budget for the run, in milliseconds. Clamped down to
+            `MAX_RUN_TIMEOUT` (default: `JOB_TIMEOUT`, 300000) and again to the
+            sandbox's own `SANDBOX_RUN_TIMEOUT`, so a request can only narrow
+            the deployment's ceiling, never raise it. Omit for the sandbox
+            default. A run that exceeds its budget returns `200` with
+            `status: "TO"`, `code: 137`, `signal: "SIGKILL"`, not an error.
+          example: 3000
 
     ExecResponse:
       type: object

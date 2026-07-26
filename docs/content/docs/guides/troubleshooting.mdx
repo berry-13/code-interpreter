@@ -115,13 +115,35 @@ Almost always a limit:
 | Cause | Field | Fix |
 | --- | --- | --- |
 | Out of memory | `signal: "SIGKILL"` | Raise `SANDBOX_RUN_MEMORY_LIMIT` or `LAUNCHER_RAM_MIB` |
-| Wall-clock timeout | `message` mentions a time limit | Raise `SANDBOX_RUN_TIMEOUT` |
+| Wall-clock timeout | `status: "TO"`, `code: 137` | Raise `SANDBOX_RUN_TIMEOUT`, or pass a per-request `run_timeout` |
 | CPU-time limit | `signal: "SIGXCPU"` | Raise `SANDBOX_RUN_CPU_TIME` |
 | Too many processes | fork failures in `stderr` | Raise `SANDBOX_MAX_PROCESS_COUNT` |
 | File too large | `signal: "SIGXFSZ"` | Raise `SANDBOX_MAX_FILE_SIZE` |
 
 Raise them deliberately. Each one is a denial-of-service budget you are handing
 to untrusted code.
+
+### One long-running request stalls every other execution
+
+A program that never exits holds its worker slot for the whole
+`SANDBOX_RUN_TIMEOUT` window, and `PYTHON_CONCURRENCY` defaults to `1`: a single
+`while True:` can therefore stall every other Python run on that worker for five
+minutes. An LLM emitting an accidental infinite loop produces exactly this.
+
+Cap the individual run:
+
+```bash
+curl -sX POST http://localhost:3112/v1/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"while True: pass","run_timeout":3000}'
+```
+
+The run is killed at the budget and returns `200` with `status: "TO"`. That is
+cooperative, though: a caller that omits `run_timeout` still gets the full
+window. If untrusted callers can reach the API, lower `SANDBOX_RUN_TIMEOUT` to
+what your workloads actually need and raise `PYTHON_CONCURRENCY` so one
+submission cannot monopolise a worker. See
+[Timeouts](/docs/guides/configuration#timeouts).
 
 ### Output is truncated
 

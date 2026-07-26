@@ -151,6 +151,15 @@ LAUNCHER_RAM_MIB=2048
 Tighten them to what your workload actually needs. Every one of these is a
 denial-of-service budget you are handing to untrusted code.
 
+`SANDBOX_RUN_TIMEOUT` deserves particular attention, because it interacts with
+`PYTHON_CONCURRENCY` (default `1`): a program that never exits holds its worker
+slot for the entire window, so at the default five minutes a handful of runaway
+submissions can stall Python execution on a worker. Callers may cap themselves
+with a per-request `run_timeout`, but that is cooperative and an untrusted
+caller simply will not. Set the ceiling low enough that a stuck run cannot
+matter, and raise `PYTHON_CONCURRENCY` (or add workers) so one submission cannot
+monopolise the queue. See [Timeouts](/docs/guides/configuration#timeouts).
+
 ### Think hard about dynamic dependencies
 
 [Dynamic dependencies](/docs/guides/dependencies) are **off by default**.

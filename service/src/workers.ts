@@ -44,7 +44,9 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
   activeJobs.inc({ language });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), env.JOB_TIMEOUT);
+  // One grace above the sandbox's own run budget so a timed-out run's
+  // structured result reaches us instead of being aborted mid-flight.
+  const timer = setTimeout(() => controller.abort(), env.SANDBOX_CALL_TIMEOUT);
   let egressGrantId: string | undefined;
   let egressGrantTokenForRestore: string | undefined;
   let revokeReason = 'completed';
@@ -165,7 +167,7 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     logger.error('Error processing job', errorDetails);
 
     if (isAbortError(error)) {
-      throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
+      throw new Error(`Job timed out after ${env.SANDBOX_CALL_TIMEOUT}ms`);
     } else if (axios.isAxiosError(error)) {
       /** Preserve error message from sandbox */
       const sandboxError = sandboxErrorMessageFromAxios(error);

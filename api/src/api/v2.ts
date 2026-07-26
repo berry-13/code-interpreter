@@ -133,6 +133,16 @@ export function authorizeToolCallSocket(
   return false;
 }
 
+/** Clamp a request-supplied timeout to the runtime's configured ceiling.
+ *  Anything absent, non-numeric, non-finite, or non-positive falls back to the
+ *  ceiling rather than to an unbounded or zero budget. */
+export function clampTimeout(requested: number | undefined, ceiling: number): number {
+  if (typeof requested !== 'number' || !Number.isFinite(requested) || requested < 1) {
+    return ceiling;
+  }
+  return Math.min(requested, ceiling);
+}
+
 function getJob(
   body: ExecuteRequestBody,
   egressGrantToken?: string,
@@ -214,8 +224,12 @@ function getJob(
     files: effectiveFiles,
     dependencies,
     timeouts: {
-      run: run_timeout ?? rt.timeouts.run,
-      compile: compile_timeout ?? rt.timeouts.compile,
+      /* Request-supplied timeouts may only NARROW the runtime's configured
+       * ceiling, never raise it: `min`, not `??`. Without the clamp a caller
+       * that reached this API could hold a sandbox slot (and the concurrency
+       * it gates) for longer than SANDBOX_RUN_TIMEOUT allows. */
+      run: clampTimeout(run_timeout, rt.timeouts.run),
+      compile: clampTimeout(compile_timeout, rt.timeouts.compile),
     },
     cpu_times: {
       run: run_cpu_time ?? rt.cpu_times.run,

@@ -62,6 +62,40 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
 }
 
+/* Timeout ladder. Each layer must outlive the layer it waits on, otherwise the
+ * inner layer's structured result loses the race with the outer layer's
+ * give-up and the caller gets a generic `Internal server error` instead of the
+ * sandbox's timeout result (`code: 137, signal: SIGKILL, status: "TO"`):
+ *
+ *   sandbox run budget   SANDBOX_RUN_TIMEOUT, or the request's run_timeout
+ *   < worker's abort     JOB_TIMEOUT + 1 grace  (env.SANDBOX_CALL_TIMEOUT)
+ *   < service's wait     JOB_TIMEOUT + 2 grace  (env.JOB_WAIT_TIMEOUT)
+ *
+ * Before this, all three sat at 300000: a runaway program's SIGKILL result was
+ * produced at the same instant every layer above it gave up. The graces only
+ * extend how long each layer waits for a result already on its way; they never
+ * extend how long user code may run, which the sandbox alone decides. */
+const JOB_WAIT_GRACE_MS = positiveIntEnv(process.env.JOB_WAIT_GRACE_MS, 15_000);
+
+/** Resolve a caller-supplied `run_timeout` (ms) against the server ceiling.
+ *
+ *  Returns `undefined` when absent (the sandbox applies its own default),
+ *  `null` when present but malformed -- callers surface that as a 400 rather
+ *  than silently ignoring it, which is the behavior this replaces -- and
+ *  otherwise the value clamped down to `maxMs`. Clamping is one-directional
+ *  BY DESIGN: a request may only narrow the operator's ceiling, never raise it,
+ *  so a client cannot buy itself a longer hold on a sandbox slot than the
+ *  deployment allows. */
+export function resolveRequestedRunTimeout(raw: unknown, maxMs: number): number | null | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || !Number.isInteger(raw) || raw < 1) {
+    return null;
+  }
+  return Math.min(raw, maxMs);
+}
+
 export function resolveEgressGrantTtlSeconds(rawTtlSeconds: string | undefined, jobTimeoutMs: number): number {
   const defaultTtlSeconds = Math.max(1, Math.ceil((jobTimeoutMs + EGRESS_GRANT_GRACE_MS) / 1000));
   if (rawTtlSeconds == null || rawTtlSeconds.trim() === '') {
@@ -106,6 +140,17 @@ export const env = {
   MAX_UPLOAD_WAIT: Number(process.env.MAX_UPLOAD_WAIT) || 500,
   MAX_FILE_SIZE: defaultMaxFileSize,
   JOB_TIMEOUT: defaultJobTimeoutMs, // 5 minutes (increased for complex matplotlib rendering)
+  /* Worker's budget for driving one job through the sandbox: one grace above
+   * the run budget it is waiting on. See the ladder at JOB_WAIT_GRACE_MS. */
+  SANDBOX_CALL_TIMEOUT: defaultJobTimeoutMs + JOB_WAIT_GRACE_MS,
+  /* How long a request waits for its job result: one grace above the worker,
+   * so the worker's own outcome (including a timeout result) always arrives
+   * first. See the ladder at JOB_WAIT_GRACE_MS. */
+  JOB_WAIT_TIMEOUT: defaultJobTimeoutMs + 2 * JOB_WAIT_GRACE_MS,
+  /* Ceiling on a caller-supplied `run_timeout`. Defaults to JOB_TIMEOUT:
+   * requesting longer than the service is willing to wait is meaningless, and
+   * the sandbox clamps to its own SANDBOX_RUN_TIMEOUT on top of this. */
+  MAX_RUN_TIMEOUT: positiveIntEnv(process.env.MAX_RUN_TIMEOUT, defaultJobTimeoutMs),
   // Execution Rate Limits
   EXEC_LIMIT_WINDOW: Number(process.env.RATE_LIMIT_WINDOW) || 30 * 1000, // 30 seconds
   EXEC_MAX_REQUESTS: Number(process.env.MAX_REQUESTS) || 20, // execution requests per window

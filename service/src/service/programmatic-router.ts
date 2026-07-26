@@ -411,7 +411,7 @@ async function runReplayIteration(
   });
   jobsSubmitted.inc({ language });
 
-  return job.waitUntilFinished(events, env.JOB_TIMEOUT);
+  return job.waitUntilFinished(events, env.JOB_WAIT_TIMEOUT);
 }
 
 function isSandboxRunSuccess(result: t.ExecuteResult): boolean {
@@ -1394,7 +1394,7 @@ async function handleBlocking(
       }
     });
 
-    job.waitUntilFinished(pyQueueEvents, env.JOB_TIMEOUT)
+    job.waitUntilFinished(pyQueueEvents, env.JOB_WAIT_TIMEOUT)
       .then(async (result) => {
         if (clientDisconnected) return;
         await setExecutionResult(execution_id, result);

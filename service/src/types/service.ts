@@ -140,6 +140,11 @@ export interface RequestBody {
   user_id?: string;
   files?: RequestFile[];
   dependencies?: Dependencies;
+  /** Wall-clock budget for the run, in milliseconds. Positive integer,
+   *  clamped down to MAX_RUN_TIMEOUT (and again to the sandbox's own
+   *  SANDBOX_RUN_TIMEOUT) -- a request can only narrow the operator's
+   *  ceiling, never raise it. Omitted means the sandbox default. */
+  run_timeout?: number;
 }
 
 export type CreatePayload = { req: AuthenticatedRequest, session_id: string; isPyPlot?: boolean };

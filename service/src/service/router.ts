@@ -13,7 +13,7 @@ import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveSessionKey, resolveOutputBucketSessionKey, SessionKeyResolutionError, parseUploadSessionKeyInput, type SessionKeyInput } from '../session-key';
 import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from '../queue';
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
-import { env, planLimits, resolveLanguage } from '../config';
+import { env, planLimits, resolveLanguage, resolveRequestedRunTimeout } from '../config';
 import { createPayload } from '../payload';
 import {
   SESSION_STATE_FILE_ID,
@@ -347,6 +347,17 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     return res.status(400).json({ error: `Unsupported language: ${rawLang}` });
   }
 
+  /* Caller-supplied wall-clock budget. Reject malformed values outright rather
+   * than ignoring them (the previous behavior: a client asking for a 3s cap
+   * silently got the full 5-minute one, holding a scarce sandbox slot and its
+   * HTTP connection open for the whole run). Valid values are clamped down to
+   * the server ceiling, never up. */
+  const requestedRunTimeout = resolveRequestedRunTimeout(body.run_timeout, env.MAX_RUN_TIMEOUT);
+  if (requestedRunTimeout === null) {
+    return res.status(400).json({ error: 'run_timeout must be a positive integer number of milliseconds' });
+  }
+  body.run_timeout = requestedRunTimeout;
+
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
@@ -573,7 +584,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
-    }, () => currentJob.waitUntilFinished(currentQueueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+    }, () => currentJob.waitUntilFinished(currentQueueEvents, env.JOB_WAIT_TIMEOUT), 'CONSUMER');
 
     /* Track the restore-failure streak: a failed restore feeds it (releasing
      * the pointer once the streak hits the limit); any healthy outcome for a

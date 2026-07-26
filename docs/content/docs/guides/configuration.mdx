@@ -102,7 +102,7 @@ supports IRSA authentication on EKS.
 | `SANDBOX_PACKAGES_DIRECTORY` | `/pkgs` | Where runtimes are mounted inside the runner. |
 | `SANDBOX_MAX_CONCURRENT_JOBS` | `8` | Parallel executions per runner. |
 | `SANDBOX_MAX_PROCESS_COUNT` | `100` | PID limit inside the sandbox. |
-| `SANDBOX_RUN_TIMEOUT` | `300000` | Run wall-clock limit (ms). |
+| `SANDBOX_RUN_TIMEOUT` | `300000` | Run wall-clock limit (ms). Also the ceiling for a request's own `run_timeout`. |
 | `SANDBOX_RUN_CPU_TIME` | `300000` | Run CPU-time limit (ms). |
 | `SANDBOX_COMPILE_TIMEOUT` | `30000` | Compile phase limit (ms). |
 | `SANDBOX_RUN_MEMORY_LIMIT` | `-1` | Run memory cgroup limit in bytes; `-1` is unlimited. |
@@ -127,6 +127,47 @@ supports IRSA authentication on EKS.
 | `LAUNCHER_VCPUS` | `2` | vCPUs per sandbox microVM. |
 | `LAUNCHER_RAM_MIB` | `2048` | RAM per sandbox microVM. |
 | `LAUNCHER_LOG_LEVEL` | `3` | libkrun log verbosity. |
+
+## Timeouts
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `JOB_TIMEOUT` | `300000` | Budget for one job (ms), and the default ceiling for `run_timeout`. |
+| `MAX_RUN_TIMEOUT` | `JOB_TIMEOUT` | Ceiling for a request's own `run_timeout` (ms). |
+| `JOB_WAIT_GRACE_MS` | `15000` | Margin between the timeout layers (ms). |
+
+A request may pass `run_timeout` (ms) to cap its own run. It is clamped down to
+`MAX_RUN_TIMEOUT`, and again to the runner's `SANDBOX_RUN_TIMEOUT`: a caller can
+only narrow the deployment's ceiling, never raise it.
+
+```bash
+curl -sX POST http://localhost:3112/v1/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"while True: pass","run_timeout":3000}'
+```
+
+A run that exceeds its budget is a **successful** HTTP response describing a
+killed process, not an error:
+
+```json
+{ "status": "TO", "code": 137, "signal": "SIGKILL", "stdout": "", "stderr": "" }
+```
+
+The three layers are deliberately staggered by `JOB_WAIT_GRACE_MS`: the sandbox
+kills the run, the worker waits one grace longer than that, and the API waits
+one grace longer than the worker. Each layer therefore outlives the one it is
+waiting on, so the structured timeout above propagates to the caller instead of
+racing an outer give-up and surfacing as a generic 500. Raise `JOB_TIMEOUT` and
+the rest follow automatically.
+
+<Callout type="warn">
+`run_timeout` is a **cooperative** cap: a client that omits it still gets the
+full `SANDBOX_RUN_TIMEOUT`, and with `PYTHON_CONCURRENCY=1` one runaway
+submission occupies a worker's Python slot for that entire window. On a
+deployment reachable by untrusted callers, lower `SANDBOX_RUN_TIMEOUT` to what
+your workloads genuinely need and scale `PYTHON_CONCURRENCY` with it, rather
+than relying on callers to cap themselves.
+</Callout>
 
 ## Worker concurrency
 
