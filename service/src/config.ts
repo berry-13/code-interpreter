@@ -67,15 +67,51 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
  * give-up and the caller gets a generic `Internal server error` instead of the
  * sandbox's timeout result (`code: 137, signal: SIGKILL, status: "TO"`):
  *
- *   sandbox run budget   SANDBOX_RUN_TIMEOUT, or the request's run_timeout
- *   < worker's abort     JOB_TIMEOUT + 1 grace  (env.SANDBOX_CALL_TIMEOUT)
- *   < service's wait     JOB_TIMEOUT + 2 grace  (env.JOB_WAIT_TIMEOUT)
+ *   run budget           <= MAX_RUN_TIMEOUT (itself <= JOB_TIMEOUT)
+ *   < worker's abort     JOB_TIMEOUT + compile + 1 grace (SANDBOX_CALL_TIMEOUT)
+ *   < service's wait     JOB_TIMEOUT + compile + 2 grace (JOB_WAIT_TIMEOUT)
  *
  * Before this, all three sat at 300000: a runaway program's SIGKILL result was
  * produced at the same instant every layer above it gave up. The graces only
  * extend how long each layer waits for a result already on its way; they never
- * extend how long user code may run, which the sandbox alone decides. */
+ * extend how long user code may run, which the sandbox alone decides.
+ *
+ * The compile term matters for compiled runtimes: Job.execute() spends up to
+ * compile_timeout and THEN up to run_timeout, sequentially, so a java job that
+ * compiles slowly and then runs to its deadline needs both budgets covered.
+ * SANDBOX_COMPILE_TIMEOUT is the runner's variable; set it here too if you
+ * raise it there, or this layer under-provisions by the difference. */
 const JOB_WAIT_GRACE_MS = positiveIntEnv(process.env.JOB_WAIT_GRACE_MS, 15_000);
+const COMPILE_ALLOWANCE_MS = positiveIntEnv(process.env.SANDBOX_COMPILE_TIMEOUT, 30_000);
+
+/** Build the timeout ladder from its inputs, enforcing the ordering above.
+ *
+ *  `maxRun` is clamped to the job budget rather than trusted: an operator who
+ *  sets MAX_RUN_TIMEOUT above JOB_TIMEOUT would otherwise get requests accepted
+ *  with a run budget that outlives the very waits meant to observe it -- the
+ *  exact 500-instead-of-`TO` failure this ladder exists to prevent. Raising
+ *  JOB_TIMEOUT is how you buy longer runs; the rest follows from it. */
+export function resolveTimeoutLadder(args: {
+  jobTimeoutMs: number;
+  compileAllowanceMs: number;
+  graceMs: number;
+  maxRunTimeoutRaw?: string;
+}): { maxRunTimeoutMs: number; sandboxCallTimeoutMs: number; jobWaitTimeoutMs: number } {
+  const { jobTimeoutMs, compileAllowanceMs, graceMs, maxRunTimeoutRaw } = args;
+  const sandboxCallTimeoutMs = jobTimeoutMs + compileAllowanceMs + graceMs;
+  return {
+    maxRunTimeoutMs: Math.min(positiveIntEnv(maxRunTimeoutRaw, jobTimeoutMs), jobTimeoutMs),
+    sandboxCallTimeoutMs,
+    jobWaitTimeoutMs: sandboxCallTimeoutMs + graceMs,
+  };
+}
+
+const timeoutLadder = resolveTimeoutLadder({
+  jobTimeoutMs: defaultJobTimeoutMs,
+  compileAllowanceMs: COMPILE_ALLOWANCE_MS,
+  graceMs: JOB_WAIT_GRACE_MS,
+  maxRunTimeoutRaw: process.env.MAX_RUN_TIMEOUT,
+});
 
 /** Resolve a caller-supplied `run_timeout` (ms) against the server ceiling.
  *
@@ -140,17 +176,18 @@ export const env = {
   MAX_UPLOAD_WAIT: Number(process.env.MAX_UPLOAD_WAIT) || 500,
   MAX_FILE_SIZE: defaultMaxFileSize,
   JOB_TIMEOUT: defaultJobTimeoutMs, // 5 minutes (increased for complex matplotlib rendering)
-  /* Worker's budget for driving one job through the sandbox: one grace above
-   * the run budget it is waiting on. See the ladder at JOB_WAIT_GRACE_MS. */
-  SANDBOX_CALL_TIMEOUT: defaultJobTimeoutMs + JOB_WAIT_GRACE_MS,
+  /* Worker's budget for driving one job through the sandbox: the full
+   * compile-plus-run path, one grace above what it waits on. See the ladder at
+   * JOB_WAIT_GRACE_MS. */
+  SANDBOX_CALL_TIMEOUT: timeoutLadder.sandboxCallTimeoutMs,
   /* How long a request waits for its job result: one grace above the worker,
    * so the worker's own outcome (including a timeout result) always arrives
    * first. See the ladder at JOB_WAIT_GRACE_MS. */
-  JOB_WAIT_TIMEOUT: defaultJobTimeoutMs + 2 * JOB_WAIT_GRACE_MS,
-  /* Ceiling on a caller-supplied `run_timeout`. Defaults to JOB_TIMEOUT:
-   * requesting longer than the service is willing to wait is meaningless, and
-   * the sandbox clamps to its own SANDBOX_RUN_TIMEOUT on top of this. */
-  MAX_RUN_TIMEOUT: positiveIntEnv(process.env.MAX_RUN_TIMEOUT, defaultJobTimeoutMs),
+  JOB_WAIT_TIMEOUT: timeoutLadder.jobWaitTimeoutMs,
+  /* Ceiling on a caller-supplied `run_timeout`, never above JOB_TIMEOUT: a run
+   * budget that outlives the waits observing it defeats the ladder. The sandbox
+   * clamps to its own SANDBOX_RUN_TIMEOUT on top of this. */
+  MAX_RUN_TIMEOUT: timeoutLadder.maxRunTimeoutMs,
   // Execution Rate Limits
   EXEC_LIMIT_WINDOW: Number(process.env.RATE_LIMIT_WINDOW) || 30 * 1000, // 30 seconds
   EXEC_MAX_REQUESTS: Number(process.env.MAX_REQUESTS) || 20, // execution requests per window

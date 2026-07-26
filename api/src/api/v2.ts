@@ -133,12 +133,17 @@ export function authorizeToolCallSocket(
   return false;
 }
 
-/** Clamp a request-supplied timeout to the runtime's configured ceiling.
- *  Anything absent, non-numeric, non-finite, or non-positive falls back to the
- *  ceiling rather than to an unbounded or zero budget. */
-export function clampTimeout(requested: number | undefined, ceiling: number): number {
-  if (typeof requested !== 'number' || !Number.isFinite(requested) || requested < 1) {
-    return ceiling;
+/** Clamp a request-supplied timeout down to the runtime's configured ceiling,
+ *  so a request can only narrow it, never raise it.
+ *
+ *  Anything that is not a usable number passes through UNCHANGED rather than
+ *  being replaced by the ceiling: `validateConstraints` still has to see the
+ *  original so it can report a type error, and a negative value has to survive
+ *  to its own "must be non-negative" check. Absent stays absent, and the
+ *  caller substitutes the ceiling. */
+export function clampTimeout(requested: number | undefined, ceiling: number): number | undefined {
+  if (typeof requested !== 'number' || !Number.isFinite(requested)) {
+    return requested;
   }
   return Math.min(requested, ceiling);
 }
@@ -198,7 +203,19 @@ function getJob(
     throw { message: 'files must include at least one utf8 encoded file' };
   }
 
-  validateConstraints(body, rt);
+  /* Clamp the timeouts BEFORE validating, and validate the clamped values.
+   * `validateConstraints` rejects anything above the runtime's ceiling, so
+   * clamping afterwards would be unreachable for exactly the case it exists to
+   * handle: when the service's MAX_RUN_TIMEOUT is higher than this runner's
+   * SANDBOX_RUN_TIMEOUT (as with the shipped helm values, jobTimeout 25000 vs
+   * runTimeout 15000), a forwarded 20000 would 400 instead of capping to 15000.
+   *
+   * Timeouts clamp; memory and cpu-time still reject. Shrinking those changes
+   * what the program is able to do, while a shorter deadline is what the caller
+   * asked for, only sooner. */
+  const runTimeout = clampTimeout(run_timeout, rt.timeouts.run);
+  const compileTimeout = clampTimeout(compile_timeout, rt.timeouts.compile);
+  validateConstraints({ ...body, run_timeout: runTimeout, compile_timeout: compileTimeout }, rt);
 
   // Rollout flag-skew guard: if the service injected the synthetic state file
   // but this sandbox has persistence disabled, the marker is dropped below, so
@@ -224,12 +241,11 @@ function getJob(
     files: effectiveFiles,
     dependencies,
     timeouts: {
-      /* Request-supplied timeouts may only NARROW the runtime's configured
-       * ceiling, never raise it: `min`, not `??`. Without the clamp a caller
-       * that reached this API could hold a sandbox slot (and the concurrency
-       * it gates) for longer than SANDBOX_RUN_TIMEOUT allows. */
-      run: clampTimeout(run_timeout, rt.timeouts.run),
-      compile: clampTimeout(compile_timeout, rt.timeouts.compile),
+      /* Clamped above: a request may only NARROW the runtime's ceiling, never
+       * raise it, or a caller could hold a sandbox slot (and the concurrency it
+       * gates) for longer than SANDBOX_RUN_TIMEOUT allows. */
+      run: runTimeout ?? rt.timeouts.run,
+      compile: compileTimeout ?? rt.timeouts.compile,
     },
     cpu_times: {
       run: run_cpu_time ?? rt.cpu_times.run,

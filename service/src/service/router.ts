@@ -356,7 +356,12 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   if (requestedRunTimeout === null) {
     return res.status(400).json({ error: 'run_timeout must be a positive integer number of milliseconds' });
   }
-  body.run_timeout = requestedRunTimeout;
+  /* Always forward a budget, even when the request omits one, so the ladder
+   * holds by construction rather than by operator discipline: a runner whose
+   * SANDBOX_RUN_TIMEOUT exceeds this service's JOB_TIMEOUT would otherwise
+   * grant an unasked-for run longer than the waits watching it. The sandbox
+   * still clamps to its own ceiling, so this can only ever shorten a run. */
+  body.run_timeout = requestedRunTimeout ?? env.MAX_RUN_TIMEOUT;
 
   let authorizedFiles: t.RequestFile[];
   try {
