@@ -626,8 +626,6 @@ paths:
           $ref: '#/components/responses/ServerError'
         '503':
           $ref: '#/components/responses/Unavailable'
-        '504':
-          $ref: '#/components/responses/ExecutionAbandoned'
 
   /upload:
     post:

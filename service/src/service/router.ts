@@ -720,11 +720,27 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     let jobState = job ? await job.getState().catch(() => 'unknown') : 'unknown';
 
     if (notStarted.has(jobState)) {
+      /* "Safe to retry" is a promise that this execution never ran, so it needs
+       * positive evidence, not just a state read. `processedOn` is stamped when
+       * a worker picks the job up and survives into completion, so a job that
+       * started and even finished during our wait is still recognisable --
+       * removing a COMPLETED job succeeds, so remove() alone cannot tell us. */
+      const jobQueue = language === Languages.py ? pyQueue : otherQueue;
+      const startedAt = job?.id
+        ? await jobQueue.getJob(job.id)
+          .then(fresh => fresh?.processedOn ?? job.processedOn ?? null)
+          .catch(() => job.processedOn ?? null)
+        : null;
+      if (startedAt) {
+        logger.warn(`[${INSTANCE_ID}] Job ${job?.id} had already started; not advertising a retry`);
+        return res.status(abandoned.status).json(abandoned.body);
+      }
+
       // Drop it before answering: leaving a request nobody is waiting for in
       // the queue spends a worker slot on output nobody will read.
       jobRemoved = (await job?.remove().then(() => true).catch(() => false)) === true;
       if (!jobRemoved) {
-        /* A worker claimed it between getState() and remove(), so the state we
+        /* A worker claimed it between the check above and remove(), so what we
          * read is already stale. Re-read rather than answering from it: the
          * only reason removal fails here is that the job went active, and
          * reporting that as a safely-retryable 503 would invite a duplicate
