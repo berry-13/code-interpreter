@@ -475,11 +475,13 @@ components:
     Unavailable:
       description: |
         The service is starting up or shutting down, or, on `/exec`, the
-        request's budget expired while the job was still queued (or still
-        running on a worker that has budget left). The latter means the queue
-        is saturated, not that the submitted code failed: retry shortly. A run
-        that genuinely exceeded its own budget returns `200` with
-        `status: "TO"` instead.
+        request's budget expired while the job was **still queued**. The job is
+        removed before this is returned, so nothing is left running and a retry
+        is safe; it means the queue is saturated, not that the submitted code
+        failed. An execution that had already STARTED returns `504` instead
+        (see `ExecutionAbandoned`, where retrying is not safe), and one that
+        genuinely exceeded its own run budget returns `200` with
+        `status: "TO"`.
       content:
         application/json:
           schema:

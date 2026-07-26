@@ -165,7 +165,7 @@ above propagates to the caller instead of racing an outer give-up and surfacing
 as a generic 500. Raise `JOB_TIMEOUT` and the rest follow automatically.
 
 A sandbox spends its budget in sequence, not in parallel, so the worker's layer
-has to cover the sum of all three phases:
+has to cover the sum of every phase:
 
 | Phase | Bounded by | Spent |
 | --- | --- | --- |
@@ -173,6 +173,7 @@ has to cover the sum of all three phases:
 | Compile | `SANDBOX_COMPILE_TIMEOUT` | Before the run, for compiled languages like Java |
 | Run | `SANDBOX_RUN_TIMEOUT` or the request's `run_timeout` | The program itself |
 | Post | `JOB_POSTPROCESS_ALLOWANCE_MS` (60000) | Walking the workspace and uploading outputs, after the run ends |
+| Gateway | `EGRESS_GATEWAY_REQUEST_TIMEOUT_MS` x2 | In hardened mode, the grant-creation and result-restore round trips that bracket the call |
 
 The sandbox does not answer when the run ends: it still has to walk the
 workspace and upload artifacts. The post allowance is sized for ordinary

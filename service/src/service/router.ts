@@ -417,6 +417,12 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   // snapshot ref -- see the finally block below.
   let job: Job<t.JobData, t.JobResult, Jobs.execute> | undefined;
   let queueEvents: QueueEvents | undefined;
+  /* Set once the job has been deleted from the queue (client disconnect, or the
+   * saturated-queue branch below). A removed job can never emit a completion
+   * event, so the `finally` block must not wait for one -- it would hold the
+   * handler and its snapshot ref open for the full wait margin, under exactly
+   * the queue pressure that triggered the removal. */
+  let jobRemoved = false;
 
   try {
     if (!isSyntheticRequest) {
@@ -585,6 +591,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     req.on('close', async () => {
       try {
         await currentJob.remove();
+        jobRemoved = true;
         logger.info(`[${INSTANCE_ID}] Job ${currentJob.id} removed due to client disconnect`);
       } catch (error) {
         logger.error(`[${INSTANCE_ID}] Error removing job ${currentJob.id} on client disconnect:`, error);
@@ -709,6 +716,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       // Drop it before answering: leaving a request nobody is waiting for in
       // the queue spends a worker slot on output nobody will read.
       const removed = await job?.remove().then(() => true).catch(() => false);
+      jobRemoved = removed === true;
       logger.warn(
         `[${INSTANCE_ID}] Request budget expired with job ${job?.id} still ${jobState}; ` +
         `queue is saturated (removed: ${removed})`,
@@ -734,7 +742,11 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     // pointer has advanced past it AND no other in-flight run still holds a ref
     // (which would otherwise 404 its restore). Runs regardless of success/error.
     if (snapshotRefKey && priorSnapshotSession) {
-      if (job && queueEvents) {
+      // A job that was deleted from the queue can never restore from the prior
+      // snapshot and can never emit a completion event, so waiting on one below
+      // would just park this handler (and its ref) for the full margin while
+      // the queue is already saturated. Release immediately instead.
+      if (job && queueEvents && !jobRemoved) {
         // The wait above can reject (or this whole handler can throw) while the
         // job itself is still queued/active -- e.g. the queue is backed up past
         // JOB_TIMEOUT, so our own wait times out before the job even starts. If

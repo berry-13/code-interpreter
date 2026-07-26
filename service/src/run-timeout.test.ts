@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { resolveRequestedRunTimeout, resolveTimeoutLadder, env } from './config';
+import { resolveRequestedRunTimeout, resolveTimeoutLadder, firstSetEnv, env } from './config';
 
 const MAX = 300_000;
 
@@ -29,6 +29,24 @@ describe('resolveRequestedRunTimeout', () => {
   });
 });
 
+describe('firstSetEnv', () => {
+  // Compose passes every optional variable as ${VAR:-}, so "unset" arrives as
+  // an empty string. `??` accepts that and never reads the fallback, which is
+  // how a knob can look wired up and do nothing in the very deployments it
+  // ships in: JOB_PRIME_ALLOWANCE_MS shadowing
+  // CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS was exactly that.
+  test('skips blank and unset values', () => {
+    expect(firstSetEnv('', '600000')).toBe('600000');
+    expect(firstSetEnv('   ', '600000')).toBe('600000');
+    expect(firstSetEnv(undefined, '600000')).toBe('600000');
+    expect(firstSetEnv('', undefined)).toBeUndefined();
+  });
+
+  test('an explicitly set value still wins', () => {
+    expect(firstSetEnv('120000', '600000')).toBe('120000');
+  });
+});
+
 describe('timeout ladder', () => {
   /* Each layer must outlive the one it waits on, or a timed-out run's
    * structured result loses the race and the caller gets a generic 500. */
@@ -37,6 +55,7 @@ describe('timeout ladder', () => {
     compileAllowanceMs: 30_000,
     primeAllowanceMs: 120_000,
     postProcessAllowanceMs: 60_000,
+    gatewayAllowanceMs: 60_000,
     graceMs: 15_000,
   };
 
@@ -49,14 +68,16 @@ describe('timeout ladder', () => {
   test('the worker budget covers every phase the sandbox spends in one call', () => {
     // The sandbox spends these sequentially and only answers at the end: a pip
     // install during prime(), a java compile, the run, then the output-file
-    // uploads. A budget covering only the run would abort before the sandbox
-    // could hand back its structured TO result.
+    // uploads -- and in hardened mode the worker also brackets the call with
+    // two gateway round trips. A budget covering only the run would abort
+    // before the sandbox could hand back its structured TO result.
     const { sandboxCallTimeoutMs } = resolveTimeoutLadder(LADDER);
     expect(sandboxCallTimeoutMs).toBeGreaterThan(
       LADDER.jobTimeoutMs
       + LADDER.compileAllowanceMs
       + LADDER.primeAllowanceMs
-      + LADDER.postProcessAllowanceMs,
+      + LADDER.postProcessAllowanceMs
+      + LADDER.gatewayAllowanceMs,
     );
   });
 
@@ -109,6 +130,7 @@ describe('timeout ladder', () => {
       compileAllowanceMs: 30_000,
       primeAllowanceMs: 120_000,
       postProcessAllowanceMs: 60_000,
+      gatewayAllowanceMs: 60_000,
       graceMs: 15_000,
     });
     expect(ladder.maxRunTimeoutMs).toBe(25_000);

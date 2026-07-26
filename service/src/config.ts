@@ -62,14 +62,26 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
 }
 
+/** First value that is actually set, treating blank as unset.
+ *
+ *  The Compose files pass every optional variable through as `${VAR:-}`, so an
+ *  option the operator never set arrives as an empty STRING, not as undefined.
+ *  `??` would accept that empty string as a value and never consult the
+ *  fallback variable -- which is how a knob can look wired up and silently do
+ *  nothing in exactly the deployments it ships in. */
+export function firstSetEnv(...values: Array<string | undefined>): string | undefined {
+  return values.find(value => value != null && value.trim() !== '');
+}
+
 /* Timeout ladder. Each layer must outlive the layer it waits on, otherwise the
  * inner layer's structured result loses the race with the outer layer's
  * give-up and the caller gets a generic `Internal server error` instead of the
  * sandbox's timeout result (`code: 137, signal: SIGKILL, status: "TO"`):
  *
- *   run budget           <= MAX_RUN_TIMEOUT (itself <= JOB_TIMEOUT)
- *   < worker's abort     prime + compile + JOB_TIMEOUT + 1 grace  (SANDBOX_CALL_TIMEOUT)
- *   < service's wait     prime + compile + JOB_TIMEOUT + 2 grace  (JOB_WAIT_TIMEOUT)
+ *   run budget         <= MAX_RUN_TIMEOUT (itself <= JOB_TIMEOUT)
+ *   < worker's abort   prime+compile+JOB_TIMEOUT+post+gateway+1 grace
+ *                                                     (SANDBOX_CALL_TIMEOUT)
+ *   < service's wait   the same + 1 more grace          (JOB_WAIT_TIMEOUT)
  *
  * Before this, all three sat at 300000: a runaway program's SIGKILL result was
  * produced at the same instant every layer above it gave up. The graces only
@@ -92,8 +104,11 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
  *    workspace and uploads outputs (up to SANDBOX_MAX_OUTPUT_FILES, in batches
  *    of SANDBOX_UPLOAD_CONCURRENCY, 30s per file) and may write a session
  *    snapshot, all inside the same HTTP call.
+ *  - gateway: in hardened mode the worker brackets the sandbox call with two
+ *    gateway round trips (grant creation, result restore), each bounded by
+ *    EGRESS_GATEWAY_REQUEST_TIMEOUT_MS, under the same abort timer.
  * Job.execute() spends them sequentially, so the worker has to cover the sum.
- * These are the RUNNER's variables: set them here too if you raise them there,
+ * Most are the RUNNER's variables: set them here too if you raise them there,
  * or this layer under-provisions by the difference.
  *
  * The post allowance is sized for ordinary output, not for the pathological
@@ -104,10 +119,18 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
 const JOB_WAIT_GRACE_MS = positiveIntEnv(process.env.JOB_WAIT_GRACE_MS, 15_000);
 const COMPILE_ALLOWANCE_MS = positiveIntEnv(process.env.SANDBOX_COMPILE_TIMEOUT, 30_000);
 const PRIME_ALLOWANCE_MS = positiveIntEnv(
-  process.env.JOB_PRIME_ALLOWANCE_MS ?? process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS,
+  firstSetEnv(process.env.JOB_PRIME_ALLOWANCE_MS, process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS),
   120_000,
 );
 const POSTPROCESS_ALLOWANCE_MS = positiveIntEnv(process.env.JOB_POSTPROCESS_ALLOWANCE_MS, 60_000);
+/* The worker's timer also covers the two gateway round trips that bracket the
+ * sandbox call in hardened mode -- createGatewayEgressGrant() before it and
+ * restoreGatewaySandboxResult() after -- each bounded by
+ * EGRESS_GATEWAY_REQUEST_TIMEOUT_MS. One slow gateway would otherwise be enough
+ * to abort a job whose sandbox phases were entirely within budget. */
+const GATEWAY_ROUND_TRIPS = 2;
+const GATEWAY_ALLOWANCE_MS =
+  GATEWAY_ROUND_TRIPS * positiveIntEnv(process.env.EGRESS_GATEWAY_REQUEST_TIMEOUT_MS, 30_000);
 
 /** Build the timeout ladder from its inputs, enforcing the ordering above.
  *
@@ -121,14 +144,17 @@ export function resolveTimeoutLadder(args: {
   compileAllowanceMs: number;
   primeAllowanceMs: number;
   postProcessAllowanceMs: number;
+  gatewayAllowanceMs: number;
   graceMs: number;
   maxRunTimeoutRaw?: string;
 }): { maxRunTimeoutMs: number; sandboxCallTimeoutMs: number; jobWaitTimeoutMs: number } {
   const {
-    jobTimeoutMs, compileAllowanceMs, primeAllowanceMs, postProcessAllowanceMs, graceMs, maxRunTimeoutRaw,
+    jobTimeoutMs, compileAllowanceMs, primeAllowanceMs, postProcessAllowanceMs,
+    gatewayAllowanceMs, graceMs, maxRunTimeoutRaw,
   } = args;
   const sandboxCallTimeoutMs =
-    jobTimeoutMs + compileAllowanceMs + primeAllowanceMs + postProcessAllowanceMs + graceMs;
+    jobTimeoutMs + compileAllowanceMs + primeAllowanceMs + postProcessAllowanceMs
+    + gatewayAllowanceMs + graceMs;
   return {
     maxRunTimeoutMs: Math.min(positiveIntEnv(maxRunTimeoutRaw, jobTimeoutMs), jobTimeoutMs),
     sandboxCallTimeoutMs,
@@ -141,6 +167,7 @@ const timeoutLadder = resolveTimeoutLadder({
   compileAllowanceMs: COMPILE_ALLOWANCE_MS,
   primeAllowanceMs: PRIME_ALLOWANCE_MS,
   postProcessAllowanceMs: POSTPROCESS_ALLOWANCE_MS,
+  gatewayAllowanceMs: GATEWAY_ALLOWANCE_MS,
   graceMs: JOB_WAIT_GRACE_MS,
   maxRunTimeoutRaw: process.env.MAX_RUN_TIMEOUT,
 });
@@ -210,7 +237,17 @@ export const env = {
   EGRESS_LEDGER_REQUIRED: process.env.CODEAPI_EGRESS_LEDGER_REQUIRED === 'true' || process.env.CODEAPI_HARDENED_SANDBOX_MODE === 'true',
   EGRESS_LEDGER_TTL_GRACE_SECONDS: Number(process.env.CODEAPI_EGRESS_LEDGER_TTL_GRACE_SECONDS) || 300,
   EGRESS_GRANT_SECRET: process.env.CODEAPI_EGRESS_GRANT_SECRET ?? '',
-  EGRESS_GRANT_TTL_SECONDS: resolveEgressGrantTtlSeconds(process.env.EGRESS_GRANT_TTL_SECONDS, defaultJobTimeoutMs),
+  /* Derived from the whole sandbox-call budget, not JOB_TIMEOUT alone: the
+   * grant has to stay valid for as long as the call it authorizes can run, or
+   * a deployment that raises the allowances gets sandbox file operations (and
+   * the worker's own restore-result call) rejected on an otherwise healthy
+   * execution. The 10-minute grace on top is unchanged. This does lengthen the
+   * window a leaked grant stays usable, which is why it tracks the call budget
+   * exactly rather than being padded further. */
+  EGRESS_GRANT_TTL_SECONDS: resolveEgressGrantTtlSeconds(
+    process.env.EGRESS_GRANT_TTL_SECONDS,
+    timeoutLadder.sandboxCallTimeoutMs,
+  ),
   PYTHON_CONCURRENCY: Number(process.env.PYTHON_CONCURRENCY) || 1,
   OTHER_CONCURRENCY: Number(process.env.OTHER_CONCURRENCY) || 8,
   JOB_WINDOW: Number(process.env.JOB_WINDOW) || 1000,

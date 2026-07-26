@@ -58,12 +58,14 @@ export const MAX_REPLAY_CALLS = 200;
  * proportionally. */
 export const MAX_EXECUTION_STATE_BYTES = 10_000_000;
 
-/** Per-execution continuation lock TTL. Must exceed the worst-case sandbox
- * run (`env.JOB_TIMEOUT`) plus bookkeeping overhead, otherwise the lock can
- * expire while the holder is still executing and a second continuation
- * would be able to mutate `tool_history`/`exec_state` concurrently. Floor
- * at 10 minutes so short job timeouts don't produce a tiny lock window. */
-export const REPLAY_LOCK_TTL_MS = Math.max(10 * 60 * 1000, env.JOB_TIMEOUT * 2 + 30_000);
+/** Per-execution continuation lock TTL. Must exceed the worst-case iteration
+ * (`env.JOB_WAIT_TIMEOUT`, which is what runReplayIteration actually blocks on:
+ * prime + compile + run + post + gateway + graces) plus bookkeeping overhead,
+ * otherwise the lock can expire while the holder is still executing and a
+ * second continuation would be able to launch a duplicate iteration or mutate
+ * `tool_history`/`exec_state` concurrently. Floor at 10 minutes so short job
+ * timeouts don't produce a tiny lock window. */
+export const REPLAY_LOCK_TTL_MS = Math.max(10 * 60 * 1000, env.JOB_WAIT_TIMEOUT * 2 + 30_000);
 
 /** Per-entry cap for a single serialized tool result (JSON bytes). Keeps the
  * Redis hash and the `_ptc_history.json` injected into the sandbox bounded
