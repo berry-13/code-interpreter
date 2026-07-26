@@ -68,7 +68,12 @@ const DEFAULT_PROGRAMMATIC_TIMEOUT_MS = 300000;
 
 export function normalizeProgrammaticTimeoutMs(
   rawTimeout: unknown,
-  maxTimeoutMs = env.JOB_TIMEOUT,
+  /* MAX_RUN_TIMEOUT, not JOB_TIMEOUT: this value becomes the payload's
+   * run_timeout, so defaulting to the job budget would let a programmatic
+   * caller hold a sandbox for longer than the ceiling an operator set for
+   * requests. MAX_RUN_TIMEOUT is itself capped at JOB_TIMEOUT, so this is
+   * identical unless the operator deliberately lowered it. */
+  maxTimeoutMs = env.MAX_RUN_TIMEOUT,
   defaultTimeoutMs = DEFAULT_PROGRAMMATIC_TIMEOUT_MS,
 ): number {
   const maxTimeout = Math.max(1, Math.floor(maxTimeoutMs));

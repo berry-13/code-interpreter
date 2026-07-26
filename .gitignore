@@ -8,6 +8,10 @@ node_modules
 /service-logs/**/*
 /tool-call-server-logs/**/*
 
+# Build output (`bun run build` in api/, rollup in service/)
+.build/
+.build-service/
+
 # Helm artifacts
 helm/*/charts/*.tgz
 helm/*/Chart.lock

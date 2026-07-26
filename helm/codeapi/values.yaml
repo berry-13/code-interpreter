@@ -53,7 +53,11 @@ otel:
 # service-api, and service-worker never receive this secret.
 egressGrant:
   secret: "changeme-egress-grant-secret-32-bytes-minimum"
-  ttlSeconds: 900
+  # Leave empty to derive from the timeout ladder (the sandbox call budget plus
+  # a 10-minute grace). A fixed value shorter than that budget lets the grant
+  # expire mid-execution and rejects the sandbox's own file operations, so only
+  # set this if you have checked it against your allowances.
+  ttlSeconds: ""
   ledgerRequired: true
   ledgerTtlGraceSeconds: 300
 
@@ -233,6 +237,17 @@ workerSandbox:
     otherConcurrency: 8
     jobWindow: 1000
     jobTimeout: 25000       # 25 seconds
+    # Ceiling for a request's own run_timeout; capped at jobTimeout.
+    maxRunTimeout: 25000
+    # Margin between the timeout layers. Each layer waits one grace longer
+    # than the layer below it, so a timed-out run returns status "TO" rather
+    # than a generic 500.
+    jobWaitGraceMs: 15000
+    # Time reserved for the sandbox's prime phase (input downloads, workspace
+    # restore, any pip install) and for post-run output uploads. Both are spent
+    # inside the same call the worker is waiting on.
+    jobPrimeAllowanceMs: 120000
+    jobPostProcessAllowanceMs: 60000
 
   # Health check port for the worker
   healthPort: 3113

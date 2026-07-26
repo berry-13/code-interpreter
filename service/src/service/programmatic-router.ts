@@ -60,7 +60,11 @@ import {
 
 const { INSTANCE_ID } = env;
 const POLL_INTERVAL = 100; // ms (blocking mode only)
-const MAX_POLL_TIME = 300000; // 5 minutes (blocking mode only)
+/* Ceiling on the blocking-mode foreground poll. Sized to the whole job budget,
+ * not the run alone: the poll has to outlast queueing and priming as well, or
+ * it gives up on a job the worker is still legitimately executing (see the
+ * poll's own comment at the call site). */
+const MAX_POLL_TIME = env.JOB_WAIT_TIMEOUT;
 const TOOL_CALL_SERVER_RETRY_ATTEMPTS = 3;
 const TOOL_CALL_SERVER_RETRY_DELAY = 1000; // ms
 const MAX_TOOLS_PER_REQUEST = 100;
@@ -411,7 +415,7 @@ async function runReplayIteration(
   });
   jobsSubmitted.inc({ language });
 
-  return job.waitUntilFinished(events, env.JOB_TIMEOUT);
+  return job.waitUntilFinished(events, env.JOB_WAIT_TIMEOUT);
 }
 
 function isSandboxRunSuccess(result: t.ExecuteResult): boolean {
@@ -1322,7 +1326,13 @@ async function handleBlocking(
         executionId: execution_id,
         sessionId: session_id,
         callbackToken: toolCallResponse.data.callback_token,
-        timeoutSeconds: timeoutMsToGrantSeconds(timeout),
+        /* The token is minted here, before enqueue, but is only used once
+         * user code makes a tool call -- after priming (dependency installs,
+         * input downloads) and any compile. Sizing it on the run budget alone
+         * expired it mid-run on exactly the jobs that prime slowest. Widening
+         * it does lengthen the window a stolen token stays usable, so it adds
+         * only what the sandbox demonstrably spends first, not a round number. */
+        timeoutSeconds: timeoutMsToGrantSeconds(timeout + env.JOB_PRE_RUN_ALLOWANCE),
         allowedToolNames: tools.map(tool => tool.name),
       });
     } catch (error) {
@@ -1394,7 +1404,7 @@ async function handleBlocking(
       }
     });
 
-    job.waitUntilFinished(pyQueueEvents, env.JOB_TIMEOUT)
+    job.waitUntilFinished(pyQueueEvents, env.JOB_WAIT_TIMEOUT)
       .then(async (result) => {
         if (clientDisconnected) return;
         await setExecutionResult(execution_id, result);
@@ -1404,7 +1414,17 @@ async function handleBlocking(
         await setExecutionError(execution_id, error);
       });
 
-    const state = await waitForExecutionState(execution_id, Math.min(timeout, MAX_POLL_TIME));
+    /* `timeout` is the RUN budget. Polling for only that long gave up while the
+     * job was still queued or priming -- the handler then returned
+     * status: "error" and cleanupExecution() deleted the execution and its Tool
+     * Call Server session out from under a worker that was still running, so
+     * the sandbox's eventual tool callback failed against a session that no
+     * longer existed. Wait for everything that precedes the run as well; the
+     * background waitUntilFinished above is bounded by the same budget. */
+    const state = await waitForExecutionState(
+      execution_id,
+      Math.min(timeout + env.JOB_PRE_RUN_ALLOWANCE, MAX_POLL_TIME),
+    );
 
     if (state.status === 'waiting' && state.pending_calls) {
       return res.status(200).json({

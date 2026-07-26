@@ -13,7 +13,7 @@ import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveSessionKey, resolveOutputBucketSessionKey, SessionKeyResolutionError, parseUploadSessionKeyInput, type SessionKeyInput } from '../session-key';
 import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from '../queue';
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
-import { env, planLimits, resolveLanguage } from '../config';
+import { env, planLimits, resolveLanguage, resolveRequestedRunTimeout } from '../config';
 import { createPayload } from '../payload';
 import {
   SESSION_STATE_FILE_ID,
@@ -220,17 +220,23 @@ if redis.call('EXISTS', KEYS[1]) == 0 then return 1 end
 return redis.call('DECR', KEYS[1])`;
 
 /* How long the `finally` block below keeps waiting for its own still-queued
- * job before giving up and releasing the ref anyway -- past max run time +
- * a generous queue-wait margin, so neither a crash nor a backed-up queue can
- * hold a ref forever. */
-const SNAPSHOT_REF_TTL_SECONDS = Math.ceil(env.JOB_TIMEOUT / 1000) + 60;
+ * job before giving up and releasing the ref anyway -- past the longest a job
+ * can legitimately occupy a worker + a generous queue-wait margin, so neither a
+ * crash nor a backed-up queue can hold a ref forever.
+ *
+ * Derived from JOB_WAIT_TIMEOUT, not JOB_TIMEOUT: the request's own wait is
+ * what this has to outlast, and it is the longer of the two (it covers
+ * prime + compile + run + graces). Keying this off JOB_TIMEOUT while the wait
+ * grew would shrink the margin below into the ordinary handler overhead. */
+const SNAPSHOT_REF_TTL_SECONDS = Math.ceil(env.JOB_WAIT_TIMEOUT / 1000) + 60;
 
 /* TTL on the `snapshotrefs:<id>` KEY itself -- deliberately LONGER than any
  * single claim can legitimately be held. A claim is taken before the
- * request's own JOB_TIMEOUT-bounded wait, and the finally block waits at
+ * request's own JOB_WAIT_TIMEOUT-bounded wait, and the finally block waits at
  * most SNAPSHOT_REF_TTL_SECONDS more before releasing unconditionally, so a
- * live claim spans at most ~(JOB_TIMEOUT + SNAPSHOT_REF_TTL_SECONDS), which
- * this doubles past. The key outliving every live claim is what makes the
+ * live claim spans at most ~(JOB_WAIT_TIMEOUT + SNAPSHOT_REF_TTL_SECONDS),
+ * which this doubles past (both terms now derive from JOB_WAIT_TIMEOUT, so the
+ * margin holds however the ladder is configured). The key outliving every live claim is what makes the
  * refcount trustworthy: if it merely matched the claim TTL, a long-queued
  * run's ref could expire while still outstanding, a later run's claim would
  * recreate the key at a fresh count of 1, and draining that count to zero
@@ -347,6 +353,22 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     return res.status(400).json({ error: `Unsupported language: ${rawLang}` });
   }
 
+  /* Caller-supplied wall-clock budget. Reject malformed values outright rather
+   * than ignoring them (the previous behavior: a client asking for a 3s cap
+   * silently got the full 5-minute one, holding a scarce sandbox slot and its
+   * HTTP connection open for the whole run). Valid values are clamped down to
+   * the server ceiling, never up. */
+  const requestedRunTimeout = resolveRequestedRunTimeout(body.run_timeout, env.MAX_RUN_TIMEOUT);
+  if (requestedRunTimeout === null) {
+    return res.status(400).json({ error: 'run_timeout must be a positive integer number of milliseconds' });
+  }
+  /* Always forward a budget, even when the request omits one, so the ladder
+   * holds by construction rather than by operator discipline: a runner whose
+   * SANDBOX_RUN_TIMEOUT exceeds this service's JOB_TIMEOUT would otherwise
+   * grant an unasked-for run longer than the waits watching it. The sandbox
+   * still clamps to its own ceiling, so this can only ever shorten a run. */
+  body.run_timeout = requestedRunTimeout ?? env.MAX_RUN_TIMEOUT;
+
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
@@ -395,6 +417,12 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   // snapshot ref -- see the finally block below.
   let job: Job<t.JobData, t.JobResult, Jobs.execute> | undefined;
   let queueEvents: QueueEvents | undefined;
+  /* Set once the job has been deleted from the queue (client disconnect, or the
+   * saturated-queue branch below). A removed job can never emit a completion
+   * event, so the `finally` block must not wait for one -- it would hold the
+   * handler and its snapshot ref open for the full wait margin, under exactly
+   * the queue pressure that triggered the removal. */
+  let jobRemoved = false;
 
   try {
     if (!isSyntheticRequest) {
@@ -563,6 +591,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     req.on('close', async () => {
       try {
         await currentJob.remove();
+        jobRemoved = true;
         logger.info(`[${INSTANCE_ID}] Job ${currentJob.id} removed due to client disconnect`);
       } catch (error) {
         logger.error(`[${INSTANCE_ID}] Error removing job ${currentJob.id} on client disconnect:`, error);
@@ -573,7 +602,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
-    }, () => currentJob.waitUntilFinished(currentQueueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+    }, () => currentJob.waitUntilFinished(currentQueueEvents, env.JOB_WAIT_TIMEOUT), 'CONSUMER');
 
     /* Track the restore-failure streak: a failed restore feeds it (releasing
      * the pointer once the streak hits the limit); any healthy outcome for a
@@ -665,13 +694,98 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     if (publicFailure) {
       return res.status(publicFailure.status).json(publicFailure.body);
     }
+    /* The timeout ladder bounds one job's time INSIDE a worker, but this
+     * request's wait starts at enqueue, so queue delay is charged to it too: on
+     * a saturated queue the wait can expire while the job has not started, or
+     * while its worker is still legitimately running with budget left. Report
+     * that as the capacity problem it is instead of a generic 500, which reads
+     * as a fault in the submitted code and tells the caller nothing about
+     * whether retrying helps.
+     *
+     * Retryability is NOT the same in the two cases, so they do not share a
+     * status. A job that never started can be removed here, which makes a retry
+     * genuinely safe. A job already ACTIVE cannot be removed (its worker holds
+     * the lock) and will run to completion unobserved -- it may still upload
+     * output files and advance the session pointer -- so telling that caller to
+     * retry would duplicate the work and compound the saturation it is already
+     * suffering from. */
+    const notStarted = new Set(['waiting', 'waiting-children', 'delayed', 'prioritized']);
+    const abandoned = {
+      status: 504,
+      body: {
+        error: 'Execution is still running and its result will not be delivered. ' +
+          'It may still produce output files; retrying will duplicate the work.',
+      },
+    };
+    let jobState = job ? await job.getState().catch(() => 'unknown') : 'unknown';
+
+    if (notStarted.has(jobState)) {
+      /* "Safe to retry" is a promise that this execution never ran, so it needs
+       * positive evidence, not just a state read. `processedOn` is stamped when
+       * a worker picks the job up and survives into completion, so a job that
+       * started and even finished during our wait is still recognisable --
+       * removing a COMPLETED job succeeds, so remove() alone cannot tell us. */
+      const jobQueue = language === Languages.py ? pyQueue : otherQueue;
+      /* Absence is not innocence. `removeOnComplete.count` is 1, so a job that
+       * ran and finished during our wait can already have been evicted by the
+       * next completion -- getJob() then returns undefined while our stale
+       * handle still shows no processedOn. Only a fresh record that positively
+       * says "never picked up" earns the retryable answer; a missing or
+       * unreadable one takes the safe path. */
+      const freshJob = job?.id
+        ? await jobQueue.getJob(job.id).catch(() => undefined)
+        : undefined;
+      const neverStarted = freshJob != null && freshJob.processedOn == null && job?.processedOn == null;
+      if (!neverStarted) {
+        logger.warn(
+          `[${INSTANCE_ID}] Job ${job?.id} may have started (record ${freshJob ? 'shows a pickup' : 'is gone'}); ` +
+          'not advertising a retry',
+        );
+        return res.status(abandoned.status).json(abandoned.body);
+      }
+
+      // Drop it before answering: leaving a request nobody is waiting for in
+      // the queue spends a worker slot on output nobody will read.
+      jobRemoved = (await job?.remove().then(() => true).catch(() => false)) === true;
+      if (!jobRemoved) {
+        /* A worker claimed it between the check above and remove(), so what we
+         * read is already stale. Re-read rather than answering from it: the
+         * only reason removal fails here is that the job went active, and
+         * reporting that as a safely-retryable 503 would invite a duplicate
+         * execution alongside one still writing files. */
+        jobState = job ? await job.getState().catch(() => 'unknown') : 'unknown';
+        if (!notStarted.has(jobState)) {
+          logger.warn(`[${INSTANCE_ID}] Job ${job?.id} went ${jobState} while being removed`);
+          return res.status(abandoned.status).json(abandoned.body);
+        }
+      }
+      logger.warn(
+        `[${INSTANCE_ID}] Request budget expired with job ${job?.id} still ${jobState}; ` +
+        `queue is saturated (removed: ${jobRemoved})`,
+      );
+      return res.status(503).json({
+        error: jobRemoved
+          ? 'Execution did not start in time; the queue is saturated. Safe to retry.'
+          : 'Execution did not start in time; the queue is saturated.',
+      });
+    }
+
+    if (jobState === 'active') {
+      logger.warn(`[${INSTANCE_ID}] Request budget expired while job ${job?.id} was still active`);
+      return res.status(abandoned.status).json(abandoned.body);
+    }
+
     return res.status(500).json({ error: 'Internal server error' });
   } finally {
     // Release this run's ref on the prior snapshot and delete it only once the
     // pointer has advanced past it AND no other in-flight run still holds a ref
     // (which would otherwise 404 its restore). Runs regardless of success/error.
     if (snapshotRefKey && priorSnapshotSession) {
-      if (job && queueEvents) {
+      // A job that was deleted from the queue can never restore from the prior
+      // snapshot and can never emit a completion event, so waiting on one below
+      // would just park this handler (and its ref) for the full margin while
+      // the queue is already saturated. Release immediately instead.
+      if (job && queueEvents && !jobRemoved) {
         // The wait above can reject (or this whole handler can throw) while the
         // job itself is still queued/active -- e.g. the queue is backed up past
         // JOB_TIMEOUT, so our own wait times out before the job even starts. If

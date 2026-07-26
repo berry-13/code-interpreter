@@ -132,10 +132,15 @@ components:
           type: string
         run_timeout:
           type: integer
-          description: Wall-clock run limit in ms. Defaults to `SANDBOX_RUN_TIMEOUT`.
+          description: |
+            Wall-clock run limit in ms. Clamped to `SANDBOX_RUN_TIMEOUT`, which
+            is also the default: this field can only lower the ceiling, never
+            raise it.
         compile_timeout:
           type: integer
-          description: Compile-phase limit in ms. Defaults to `SANDBOX_COMPILE_TIMEOUT`.
+          description: |
+            Compile-phase limit in ms. Clamped to `SANDBOX_COMPILE_TIMEOUT`,
+            which is also the default (lower-only, as with `run_timeout`).
         run_cpu_time:
           type: integer
           description: CPU-time limit for the run phase, in ms.

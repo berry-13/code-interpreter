@@ -47,6 +47,21 @@ spec:
               value: {{ .Values.persistSessions.stateMaxBytes | quote }}
             - name: CODEAPI_SESSION_STATE_TTL_SECONDS
               value: {{ .Values.persistSessions.stateTtlSeconds | quote }}
+            # Timeout ladder: every process that waits on a job must
+            # compute the same one, so these are rendered identically here and
+            # in the worker. See guides/configuration#timeouts.
+            - name: JOB_TIMEOUT
+              value: {{ .Values.workerSandbox.config.jobTimeout | quote }}
+            - name: MAX_RUN_TIMEOUT
+              value: {{ .Values.workerSandbox.config.maxRunTimeout | quote }}
+            - name: JOB_WAIT_GRACE_MS
+              value: {{ .Values.workerSandbox.config.jobWaitGraceMs | quote }}
+            - name: JOB_PRIME_ALLOWANCE_MS
+              value: {{ .Values.workerSandbox.config.jobPrimeAllowanceMs | quote }}
+            - name: JOB_POSTPROCESS_ALLOWANCE_MS
+              value: {{ .Values.workerSandbox.config.jobPostProcessAllowanceMs | quote }}
+            - name: SANDBOX_COMPILE_TIMEOUT
+              value: {{ .Values.workerSandbox.sandbox.compileTimeout | quote }}
             # Redis connection
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
@@ -69,8 +84,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
+            {{- with .Values.egressGrant.ttlSeconds }}
             - name: EGRESS_GRANT_TTL_SECONDS
-              value: {{ .Values.egressGrant.ttlSeconds | quote }}
+              value: {{ . | quote }}
+            {{- end }}
             # Server config
             - name: SERVICE_PORT
               value: {{ .Values.api.service.port | quote }}

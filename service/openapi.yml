@@ -179,6 +179,23 @@ components:
             $ref: '#/components/schemas/RequestFile'
         dependencies:
           $ref: '#/components/schemas/Dependencies'
+        run_timeout:
+          type: integer
+          minimum: 1
+          description: |
+            Wall-clock budget for the run, in milliseconds. Clamped down to
+            `MAX_RUN_TIMEOUT` (default: `JOB_TIMEOUT`, 300000) and again to the
+            sandbox's own `SANDBOX_RUN_TIMEOUT`, so a request can only narrow
+            the deployment's ceiling, never raise it. Omit to get that ceiling.
+            A run that exceeds its budget returns `200` with `status: "TO"`,
+            `code: 137`, `signal: "SIGKILL"`, not an error.
+
+            **Resolution is one whole second.** The runner enforces the limit
+            through NsJail's `--time_limit`, which takes seconds, and rounds
+            up: `1` and `1000` both permit a full second, `1001` permits two.
+            A run can therefore overshoot the requested value by up to one
+            second, never more, and never finishes earlier than asked.
+          example: 3000
 
     ExecResponse:
       type: object
@@ -448,8 +465,29 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    ExecutionAbandoned:
+      description: |
+        The request's budget expired while the execution was still running on a
+        worker. Its result will not be delivered, but the run itself was not
+        cancelled: it may still finish and upload output files, so retrying
+        duplicates the work. Distinct from `503`, where the job never started
+        and was removed, and from a genuine run timeout, which is `200` with
+        `status: "TO"`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
     Unavailable:
-      description: The service is starting up or shutting down.
+      description: |
+        The service is starting up or shutting down, or, on `/exec`, the
+        request's budget expired while the job was **still queued**. The job is
+        removed before this is returned, so nothing is left running and a retry
+        is safe; it means the queue is saturated, not that the submitted code
+        failed. An execution that had already STARTED returns `504` instead
+        (see `ExecutionAbandoned`, where retrying is not safe), and one that
+        genuinely exceeded its own run budget returns `200` with
+        `status: "TO"`.
       content:
         application/json:
           schema:
@@ -545,6 +583,8 @@ paths:
           $ref: '#/components/responses/ServerError'
         '503':
           $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/ExecutionAbandoned'
 
   /exec/programmatic:
     post:

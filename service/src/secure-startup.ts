@@ -31,6 +31,25 @@ function rejectValue(name: string, value: string | undefined): void {
   }
 }
 
+/** Warn when an explicitly configured egress-grant TTL is shorter than the
+ *  sandbox call it has to authorize. Not fatal: the deployment works for every
+ *  execution that finishes sooner, and failing startup over a timing choice
+ *  would be worse than the intermittent rejections it causes. Returns the
+ *  message so callers can log it with their own logger, and tests can assert
+ *  it without capturing output. */
+export function egressGrantTtlWarning(
+  grantTtlSeconds = env.EGRESS_GRANT_TTL_SECONDS,
+  sandboxCallTimeoutMs = env.SANDBOX_CALL_TIMEOUT,
+): string | undefined {
+  const callBudgetSeconds = Math.ceil(sandboxCallTimeoutMs / 1000);
+  if (grantTtlSeconds >= callBudgetSeconds) return undefined;
+  return (
+    `EGRESS_GRANT_TTL_SECONDS (${grantTtlSeconds}s) is shorter than the sandbox call budget ` +
+    `(${callBudgetSeconds}s): a long execution's grant can expire mid-run and its file ` +
+    'operations will be rejected. Unset it to derive the TTL from the timeout ladder.'
+  );
+}
+
 export function validateApiHardenedConfig(): void {
   if (!env.HARDENED_SANDBOX_MODE) return;
   rejectValue('CODEAPI_EGRESS_GRANT_SECRET', process.env.CODEAPI_EGRESS_GRANT_SECRET);

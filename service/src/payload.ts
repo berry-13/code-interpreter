@@ -12,7 +12,7 @@ export function createPayload({
   isPyPlot,
   session_id,
 }: t.CreatePayload): t.PayloadBody {
-  const { lang: rawLang, code: userCode, args, files, dependencies } = req.body as t.RequestBody;
+  const { lang: rawLang, code: userCode, args, files, dependencies, run_timeout } = req.body as t.RequestBody;
   const language = resolveLanguage(rawLang);
   if (language === undefined) {
     throw new Error(`Unsupported language: ${rawLang}`);
@@ -67,6 +67,13 @@ export function createPayload({
 
   if (dependencies) {
     payload.dependencies = dependencies;
+  }
+
+  /* The router has already validated and clamped this against MAX_RUN_TIMEOUT
+   * (resolveRequestedRunTimeout) and rejected malformed values, so anything
+   * reaching here is a safe positive integer. Absent means "sandbox default". */
+  if (run_timeout != null) {
+    payload.run_timeout = run_timeout;
   }
 
   if (files && files.length > 0) {

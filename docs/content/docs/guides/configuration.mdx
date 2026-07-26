@@ -102,7 +102,7 @@ supports IRSA authentication on EKS.
 | `SANDBOX_PACKAGES_DIRECTORY` | `/pkgs` | Where runtimes are mounted inside the runner. |
 | `SANDBOX_MAX_CONCURRENT_JOBS` | `8` | Parallel executions per runner. |
 | `SANDBOX_MAX_PROCESS_COUNT` | `100` | PID limit inside the sandbox. |
-| `SANDBOX_RUN_TIMEOUT` | `300000` | Run wall-clock limit (ms). |
+| `SANDBOX_RUN_TIMEOUT` | `300000` | Run wall-clock limit (ms). Also the ceiling for a request's own `run_timeout`. |
 | `SANDBOX_RUN_CPU_TIME` | `300000` | Run CPU-time limit (ms). |
 | `SANDBOX_COMPILE_TIMEOUT` | `30000` | Compile phase limit (ms). |
 | `SANDBOX_RUN_MEMORY_LIMIT` | `-1` | Run memory cgroup limit in bytes; `-1` is unlimited. |
@@ -127,6 +127,98 @@ supports IRSA authentication on EKS.
 | `LAUNCHER_VCPUS` | `2` | vCPUs per sandbox microVM. |
 | `LAUNCHER_RAM_MIB` | `2048` | RAM per sandbox microVM. |
 | `LAUNCHER_LOG_LEVEL` | `3` | libkrun log verbosity. |
+
+## Timeouts
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `JOB_TIMEOUT` | `300000` | Budget for one job (ms), and the default ceiling for `run_timeout`. |
+| `MAX_RUN_TIMEOUT` | `JOB_TIMEOUT` | Ceiling for a request's own `run_timeout` (ms). Capped at `JOB_TIMEOUT`. |
+| `JOB_WAIT_GRACE_MS` | `15000` | Margin between the timeout layers (ms). |
+| `JOB_PRIME_ALLOWANCE_MS` | `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS` | Time reserved for the sandbox's prime phase (ms). |
+| `JOB_POSTPROCESS_ALLOWANCE_MS` | `60000` | Time reserved for post-run output uploads (ms). |
+
+A request may pass `run_timeout` (ms) to cap its own run. It is clamped down to
+`MAX_RUN_TIMEOUT`, and again to the runner's `SANDBOX_RUN_TIMEOUT`: a caller can
+only narrow the deployment's ceiling, never raise it. Setting `MAX_RUN_TIMEOUT`
+above `JOB_TIMEOUT` has no effect, since a run that outlives the waits watching
+it is the failure this ordering exists to prevent. Raise `JOB_TIMEOUT` instead.
+
+```bash
+curl -sX POST http://localhost:3112/v1/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"lang":"py","code":"while True: pass","run_timeout":3000}'
+```
+
+The limit is enforced by NsJail's `--time_limit`, which takes **whole
+seconds** and is rounded up, so a run can overshoot the requested value by up
+to one second (never more, and never less than asked): `run_timeout: 1001`
+permits two seconds.
+
+A run that exceeds its budget is a **successful** HTTP response describing a
+killed process, not an error:
+
+```json
+{ "status": "TO", "code": 137, "signal": "SIGKILL", "stdout": "", "stderr": "" }
+```
+
+The three layers are deliberately staggered by `JOB_WAIT_GRACE_MS`: the sandbox
+kills the run, the worker waits one grace longer than everything the sandbox
+does with the job, and the API waits one grace longer than the worker. Each
+layer therefore outlives the one it is waiting on, so the structured timeout
+above propagates to the caller instead of racing an outer give-up and surfacing
+as a generic 500. Raise `JOB_TIMEOUT` and the rest follow automatically.
+
+A sandbox spends its budget in sequence, not in parallel, so the worker's layer
+has to cover the sum of every phase:
+
+| Phase | Bounded by | Spent |
+| --- | --- | --- |
+| Prime | `JOB_PRIME_ALLOWANCE_MS` (default `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS`, 120000) | Input downloads, workspace restore, any pip install |
+| Compile | `SANDBOX_COMPILE_TIMEOUT` | Before the run, for compiled languages like Java |
+| Run | `SANDBOX_RUN_TIMEOUT` or the request's `run_timeout` | The program itself |
+| Post | `JOB_POSTPROCESS_ALLOWANCE_MS` (60000) | Walking the workspace and uploading outputs, after the run ends |
+| Gateway | `EGRESS_GATEWAY_REQUEST_TIMEOUT_MS` x2 | In hardened mode, the grant-creation and result-restore round trips that bracket the call |
+
+The sandbox does not answer when the run ends: it still has to walk the
+workspace and upload artifacts. The post allowance is sized for ordinary
+output, not for the pathological case where every one of
+`SANDBOX_MAX_OUTPUT_FILES` hits its own 30-second upload timeout (with the
+defaults, `ceil(50/8) * 30s` = 210s, which means the file server is broken
+rather than busy). Raise it if a deployment routinely emits many large
+artifacts.
+
+Most of these are the **runner's** variables. The service reads them to size
+its own layers, so **if you raise one on the runner, set it on the API and
+worker too**, or those layers under-provision by the difference. The shipped
+Compose files and Helm chart already forward all of them to every process that
+computes the ladder.
+
+<Callout type="info">
+The ladder bounds one job's time *inside a worker*. Queue delay sits outside it:
+the API's wait starts at enqueue, the worker's budget only once a worker picks
+the job up. On a saturated queue the API's wait can therefore expire before the
+job finishes, and what the caller should do about it depends on whether it ever
+started:
+
+| Response | Meaning | Retry? |
+| --- | --- | --- |
+| `503` | The job never started and was removed from the queue. | **Yes**, nothing is running. |
+| `504` | A worker had already claimed it. The execution continues unobserved and may still upload output files. | **No**, a retry duplicates it. |
+| `200` + `status: "TO"` | The run itself exceeded its budget and was killed. | Not an error; fix the code or raise the budget. |
+
+The `503` is only ever returned on positive evidence that no worker picked the
+job up; anything ambiguous is reported as `504`.
+</Callout>
+
+<Callout type="warn">
+`run_timeout` is a **cooperative** cap: a client that omits it still gets the
+full `SANDBOX_RUN_TIMEOUT`, and with `PYTHON_CONCURRENCY=1` one runaway
+submission occupies a worker's Python slot for that entire window. On a
+deployment reachable by untrusted callers, lower `SANDBOX_RUN_TIMEOUT` to what
+your workloads genuinely need and scale `PYTHON_CONCURRENCY` with it, rather
+than relying on callers to cap themselves.
+</Callout>
 
 ## Worker concurrency
 

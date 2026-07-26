@@ -38,7 +38,16 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-export const EXECUTION_STATE_TTL = 600;
+/** TTL on `exec_state:<id>` and its `tool_history:<id>` hash.
+ *
+ *  Must outlive the longest a continuation can sit blocked on its job, which is
+ *  the request's own wait (`env.JOB_WAIT_TIMEOUT`, itself prime + compile + run
+ *  + post + graces). Otherwise the pair expires mid-execution: the completion
+ *  path recreates `exec_state` via setExecutionState, but NOT the tool-history
+ *  hash, so a later replay re-emits tool calls that were already resolved.
+ *  Floored at the historical 10 minutes so a short JOB_TIMEOUT cannot shrink
+ *  the window. */
+export const EXECUTION_STATE_TTL = Math.max(600, Math.ceil(env.JOB_WAIT_TIMEOUT / 1000) + 60);
 export const MAX_REPLAY_CALLS = 200;
 
 /** Cap on the serialized `exec_state:<id>` JSON blob (request inputs +
@@ -49,12 +58,14 @@ export const MAX_REPLAY_CALLS = 200;
  * proportionally. */
 export const MAX_EXECUTION_STATE_BYTES = 10_000_000;
 
-/** Per-execution continuation lock TTL. Must exceed the worst-case sandbox
- * run (`env.JOB_TIMEOUT`) plus bookkeeping overhead, otherwise the lock can
- * expire while the holder is still executing and a second continuation
- * would be able to mutate `tool_history`/`exec_state` concurrently. Floor
- * at 10 minutes so short job timeouts don't produce a tiny lock window. */
-export const REPLAY_LOCK_TTL_MS = Math.max(10 * 60 * 1000, env.JOB_TIMEOUT * 2 + 30_000);
+/** Per-execution continuation lock TTL. Must exceed the worst-case iteration
+ * (`env.JOB_WAIT_TIMEOUT`, which is what runReplayIteration actually blocks on:
+ * prime + compile + run + post + gateway + graces) plus bookkeeping overhead,
+ * otherwise the lock can expire while the holder is still executing and a
+ * second continuation would be able to launch a duplicate iteration or mutate
+ * `tool_history`/`exec_state` concurrently. Floor at 10 minutes so short job
+ * timeouts don't produce a tiny lock window. */
+export const REPLAY_LOCK_TTL_MS = Math.max(10 * 60 * 1000, env.JOB_WAIT_TIMEOUT * 2 + 30_000);
 
 /** Per-entry cap for a single serialized tool result (JSON bytes). Keeps the
  * Redis hash and the `_ptc_history.json` injected into the sandbox bounded
