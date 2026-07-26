@@ -145,6 +145,12 @@ export function clampTimeout(requested: number | undefined, ceiling: number): nu
   if (typeof requested !== 'number' || !Number.isFinite(requested)) {
     return requested;
   }
+  /* A non-positive ceiling means "no configured limit" -- validateConstraints
+   * skips those (`configured <= 0`), so clamping to it would turn every
+   * request into a zero budget on a runtime that deliberately has none. */
+  if (!(ceiling > 0)) {
+    return requested;
+  }
   return Math.min(requested, ceiling);
 }
 

@@ -150,6 +150,11 @@ curl -sX POST http://localhost:3112/v1/exec \
   -d '{"lang":"py","code":"while True: pass","run_timeout":3000}'
 ```
 
+The limit is enforced by NsJail's `--time_limit`, which takes **whole
+seconds** and is rounded up, so a run can overshoot the requested value by up
+to one second (never more, and never less than asked): `run_timeout: 1001`
+permits two seconds.
+
 A run that exceeds its budget is a **successful** HTTP response describing a
 killed process, not an error:
 

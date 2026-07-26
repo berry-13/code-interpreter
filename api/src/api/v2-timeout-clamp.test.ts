@@ -21,6 +21,14 @@ describe('clampTimeout', () => {
     expect(clampTimeout(20_000, 15_000)).toBe(15_000);
   });
 
+  test('a non-positive ceiling means no configured limit, so nothing is clamped', () => {
+    // validateConstraints skips ceilings <= 0 as "unset". Clamping to one would
+    // turn every request into a zero budget on a runtime that deliberately has
+    // no limit, and buildArgs would floor that at its 1-second minimum.
+    expect(clampTimeout(5_000, 0)).toBe(5_000);
+    expect(clampTimeout(5_000, -1)).toBe(5_000);
+  });
+
   test('values validateConstraints must still reject pass through unchanged', () => {
     // Replacing these with the ceiling would swallow the type error and the
     // negative-value error that validateConstraints is there to report.

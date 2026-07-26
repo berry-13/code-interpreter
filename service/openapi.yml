@@ -189,6 +189,12 @@ components:
             the deployment's ceiling, never raise it. Omit to get that ceiling.
             A run that exceeds its budget returns `200` with `status: "TO"`,
             `code: 137`, `signal: "SIGKILL"`, not an error.
+
+            **Resolution is one whole second.** The runner enforces the limit
+            through NsJail's `--time_limit`, which takes seconds, and rounds
+            up: `1` and `1000` both permit a full second, `1001` permits two.
+            A run can therefore overshoot the requested value by up to one
+            second, never more, and never finishes earlier than asked.
           example: 3000
 
     ExecResponse:

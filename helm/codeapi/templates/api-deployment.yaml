@@ -84,8 +84,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
+            {{- with .Values.egressGrant.ttlSeconds }}
             - name: EGRESS_GRANT_TTL_SECONDS
-              value: {{ .Values.egressGrant.ttlSeconds | quote }}
+              value: {{ . | quote }}
+            {{- end }}
             # Server config
             - name: SERVICE_PORT
               value: {{ .Values.api.service.port | quote }}

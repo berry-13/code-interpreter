@@ -81,7 +81,7 @@ export function firstSetEnv(...values: Array<string | undefined>): string | unde
  *   run budget         <= MAX_RUN_TIMEOUT (itself <= JOB_TIMEOUT)
  *   < worker's abort   prime+compile+JOB_TIMEOUT+post+gateway+1 grace
  *                                                     (SANDBOX_CALL_TIMEOUT)
- *   < service's wait   the same + 1 more grace          (JOB_WAIT_TIMEOUT)
+ *   < service's wait   the same + revoke + 1 more grace   (JOB_WAIT_TIMEOUT)
  *
  * Before this, all three sat at 300000: a runaway program's SIGKILL result was
  * produced at the same instant every layer above it gave up. The graces only
@@ -131,6 +131,13 @@ const POSTPROCESS_ALLOWANCE_MS = positiveIntEnv(process.env.JOB_POSTPROCESS_ALLO
 const GATEWAY_ROUND_TRIPS = 2;
 const GATEWAY_ALLOWANCE_MS =
   GATEWAY_ROUND_TRIPS * positiveIntEnv(process.env.EGRESS_GATEWAY_REQUEST_TIMEOUT_MS, 30_000);
+/* processJobInner() awaits grant revocation in its finally block, so BullMQ
+ * only marks the job finished after that completes. The API's wait therefore
+ * has to clear the worker's budget AND the revoke, not just one grace: with a
+ * grace configured below EGRESS_GATEWAY_REVOKE_TIMEOUT_MS the API would
+ * otherwise expire while the worker was tidying up an execution that had
+ * already succeeded. */
+const REVOKE_ALLOWANCE_MS = positiveIntEnv(process.env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS, 5_000);
 
 /** Build the timeout ladder from its inputs, enforcing the ordering above.
  *
@@ -145,12 +152,13 @@ export function resolveTimeoutLadder(args: {
   primeAllowanceMs: number;
   postProcessAllowanceMs: number;
   gatewayAllowanceMs: number;
+  revokeAllowanceMs: number;
   graceMs: number;
   maxRunTimeoutRaw?: string;
 }): { maxRunTimeoutMs: number; sandboxCallTimeoutMs: number; jobWaitTimeoutMs: number } {
   const {
     jobTimeoutMs, compileAllowanceMs, primeAllowanceMs, postProcessAllowanceMs,
-    gatewayAllowanceMs, graceMs, maxRunTimeoutRaw,
+    gatewayAllowanceMs, revokeAllowanceMs, graceMs, maxRunTimeoutRaw,
   } = args;
   const sandboxCallTimeoutMs =
     jobTimeoutMs + compileAllowanceMs + primeAllowanceMs + postProcessAllowanceMs
@@ -158,7 +166,9 @@ export function resolveTimeoutLadder(args: {
   return {
     maxRunTimeoutMs: Math.min(positiveIntEnv(maxRunTimeoutRaw, jobTimeoutMs), jobTimeoutMs),
     sandboxCallTimeoutMs,
-    jobWaitTimeoutMs: sandboxCallTimeoutMs + graceMs,
+    // + revoke: the worker still has to release the egress grant before the
+    // job counts as finished, and that happens after the sandbox call returns.
+    jobWaitTimeoutMs: sandboxCallTimeoutMs + revokeAllowanceMs + graceMs,
   };
 }
 
@@ -168,6 +178,7 @@ const timeoutLadder = resolveTimeoutLadder({
   primeAllowanceMs: PRIME_ALLOWANCE_MS,
   postProcessAllowanceMs: POSTPROCESS_ALLOWANCE_MS,
   gatewayAllowanceMs: GATEWAY_ALLOWANCE_MS,
+  revokeAllowanceMs: REVOKE_ALLOWANCE_MS,
   graceMs: JOB_WAIT_GRACE_MS,
   maxRunTimeoutRaw: process.env.MAX_RUN_TIMEOUT,
 });

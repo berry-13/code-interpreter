@@ -56,6 +56,7 @@ describe('timeout ladder', () => {
     primeAllowanceMs: 120_000,
     postProcessAllowanceMs: 60_000,
     gatewayAllowanceMs: 60_000,
+    revokeAllowanceMs: 5_000,
     graceMs: 15_000,
   };
 
@@ -79,6 +80,16 @@ describe('timeout ladder', () => {
       + LADDER.postProcessAllowanceMs
       + LADDER.gatewayAllowanceMs,
     );
+  });
+
+  test('the request wait clears the worker budget plus grant revocation', () => {
+    // The worker revokes the egress grant in its finally block, so BullMQ only
+    // marks the job finished after that. A grace shorter than the revoke would
+    // otherwise expire the API wait while the worker tidied up a SUCCESSFUL
+    // execution -- the same outer-timeout race, one layer up.
+    const tightGrace = { ...LADDER, graceMs: 1_000, revokeAllowanceMs: 5_000 };
+    const { sandboxCallTimeoutMs, jobWaitTimeoutMs } = resolveTimeoutLadder(tightGrace);
+    expect(jobWaitTimeoutMs).toBeGreaterThan(sandboxCallTimeoutMs + tightGrace.revokeAllowanceMs);
   });
 
   test('the replay-state TTL outlives the request wait', () => {
@@ -131,6 +142,7 @@ describe('timeout ladder', () => {
       primeAllowanceMs: 120_000,
       postProcessAllowanceMs: 60_000,
       gatewayAllowanceMs: 60_000,
+      revokeAllowanceMs: 5_000,
       graceMs: 15_000,
     });
     expect(ladder.maxRunTimeoutMs).toBe(25_000);

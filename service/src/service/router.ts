@@ -710,19 +710,37 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
      * retry would duplicate the work and compound the saturation it is already
      * suffering from. */
     const notStarted = new Set(['waiting', 'waiting-children', 'delayed', 'prioritized']);
-    const jobState = job ? await job.getState().catch(() => 'unknown') : 'unknown';
+    const abandoned = {
+      status: 504,
+      body: {
+        error: 'Execution is still running and its result will not be delivered. ' +
+          'It may still produce output files; retrying will duplicate the work.',
+      },
+    };
+    let jobState = job ? await job.getState().catch(() => 'unknown') : 'unknown';
 
     if (notStarted.has(jobState)) {
       // Drop it before answering: leaving a request nobody is waiting for in
       // the queue spends a worker slot on output nobody will read.
-      const removed = await job?.remove().then(() => true).catch(() => false);
-      jobRemoved = removed === true;
+      jobRemoved = (await job?.remove().then(() => true).catch(() => false)) === true;
+      if (!jobRemoved) {
+        /* A worker claimed it between getState() and remove(), so the state we
+         * read is already stale. Re-read rather than answering from it: the
+         * only reason removal fails here is that the job went active, and
+         * reporting that as a safely-retryable 503 would invite a duplicate
+         * execution alongside one still writing files. */
+        jobState = job ? await job.getState().catch(() => 'unknown') : 'unknown';
+        if (!notStarted.has(jobState)) {
+          logger.warn(`[${INSTANCE_ID}] Job ${job?.id} went ${jobState} while being removed`);
+          return res.status(abandoned.status).json(abandoned.body);
+        }
+      }
       logger.warn(
         `[${INSTANCE_ID}] Request budget expired with job ${job?.id} still ${jobState}; ` +
-        `queue is saturated (removed: ${removed})`,
+        `queue is saturated (removed: ${jobRemoved})`,
       );
       return res.status(503).json({
-        error: removed
+        error: jobRemoved
           ? 'Execution did not start in time; the queue is saturated. Safe to retry.'
           : 'Execution did not start in time; the queue is saturated.',
       });
@@ -730,10 +748,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
 
     if (jobState === 'active') {
       logger.warn(`[${INSTANCE_ID}] Request budget expired while job ${job?.id} was still active`);
-      return res.status(504).json({
-        error: 'Execution is still running and its result will not be delivered. ' +
-          'It may still produce output files; retrying will duplicate the work.',
-      });
+      return res.status(abandoned.status).json(abandoned.body);
     }
 
     return res.status(500).json({ error: 'Internal server error' });

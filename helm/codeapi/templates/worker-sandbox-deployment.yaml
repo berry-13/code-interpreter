@@ -154,8 +154,10 @@ spec:
                   key: codeapi-execution-manifest-private-key
             - name: EXECUTION_MANIFEST_TTL_SECONDS
               value: {{ .Values.executionManifest.ttlSeconds | quote }}
+            {{- with .Values.egressGrant.ttlSeconds }}
             - name: EGRESS_GRANT_TTL_SECONDS
-              value: {{ .Values.egressGrant.ttlSeconds | quote }}
+              value: {{ . | quote }}
+            {{- end }}
             - name: PYTHON_CONCURRENCY
               value: {{ .Values.workerSandbox.config.pythonConcurrency | quote }}
             - name: OTHER_CONCURRENCY
