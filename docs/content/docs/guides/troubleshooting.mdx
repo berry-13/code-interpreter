@@ -145,6 +145,15 @@ what your workloads actually need and raise `PYTHON_CONCURRENCY` so one
 submission cannot monopolise a worker. See
 [Timeouts](/docs/guides/configuration#timeouts).
 
+### Requests return 503 "the queue is saturated"
+
+The request's budget expired before its job finished, with the job still queued
+or still running on a worker. This is capacity, not a fault in the submitted
+code: something ahead of it is occupying the workers. Check
+`codeapi_bullmq_queue_jobs`, then add worker capacity or raise concurrency, as
+in [scaling](/docs/guides/operations#scaling). A run that exceeded its own
+budget looks different: `200` with `status: "TO"`.
+
 ### Output is truncated
 
 `SANDBOX_OUTPUT_MAX_SIZE` (65536 by default) caps stdout and stderr. Write large

@@ -135,6 +135,7 @@ supports IRSA authentication on EKS.
 | `JOB_TIMEOUT` | `300000` | Budget for one job (ms), and the default ceiling for `run_timeout`. |
 | `MAX_RUN_TIMEOUT` | `JOB_TIMEOUT` | Ceiling for a request's own `run_timeout` (ms). Capped at `JOB_TIMEOUT`. |
 | `JOB_WAIT_GRACE_MS` | `15000` | Margin between the timeout layers (ms). |
+| `JOB_PRIME_ALLOWANCE_MS` | `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS` | Time reserved for the sandbox's prime phase (ms). |
 
 A request may pass `run_timeout` (ms) to cap its own run. It is clamped down to
 `MAX_RUN_TIMEOUT`, and again to the runner's `SANDBOX_RUN_TIMEOUT`: a caller can
@@ -156,17 +157,34 @@ killed process, not an error:
 ```
 
 The three layers are deliberately staggered by `JOB_WAIT_GRACE_MS`: the sandbox
-kills the run, the worker waits one grace longer than the whole compile-plus-run
-path, and the API waits one grace longer than the worker. Each layer therefore
-outlives the one it is waiting on, so the structured timeout above propagates to
-the caller instead of racing an outer give-up and surfacing as a generic 500.
-Raise `JOB_TIMEOUT` and the rest follow automatically.
+kills the run, the worker waits one grace longer than everything the sandbox
+does with the job, and the API waits one grace longer than the worker. Each
+layer therefore outlives the one it is waiting on, so the structured timeout
+above propagates to the caller instead of racing an outer give-up and surfacing
+as a generic 500. Raise `JOB_TIMEOUT` and the rest follow automatically.
 
-The compile term matters for compiled languages: a Java job spends up to
-`SANDBOX_COMPILE_TIMEOUT` compiling and only then starts its run budget, so the
-worker has to cover both. The service reads `SANDBOX_COMPILE_TIMEOUT` to size
-that layer, which means **if you raise it on the runner, set it on the API and
-worker too**, or the worker under-provisions by the difference.
+A sandbox spends its budget in sequence, not in parallel, so the worker's layer
+has to cover the sum of all three phases:
+
+| Phase | Bounded by | Spent |
+| --- | --- | --- |
+| Prime | `JOB_PRIME_ALLOWANCE_MS` (default `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS`, 120000) | Input downloads, workspace restore, any pip install |
+| Compile | `SANDBOX_COMPILE_TIMEOUT` | Before the run, for compiled languages like Java |
+| Run | `SANDBOX_RUN_TIMEOUT` or the request's `run_timeout` | The program itself |
+
+These are the **runner's** variables. The service reads them to size its own
+layers, so **if you raise one on the runner, set it on the API and worker too**,
+or those layers under-provision by the difference.
+
+<Callout type="info">
+The ladder bounds one job's time *inside a worker*. Queue delay sits outside it:
+the API's wait starts at enqueue, the worker's budget only once a worker picks
+the job up. On a saturated queue the API's wait can therefore expire while the
+job has not started, or while its worker is still legitimately running. That
+case returns **`503`** with a "queue is saturated" message, distinct from the
+`200` + `status: "TO"` of a genuine run timeout, so a caller can tell "retry
+later" apart from "your code ran too long".
+</Callout>
 
 <Callout type="warn">
 `run_timeout` is a **cooperative** cap: a client that omits it still gets the

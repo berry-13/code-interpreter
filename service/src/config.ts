@@ -68,21 +68,35 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
  * sandbox's timeout result (`code: 137, signal: SIGKILL, status: "TO"`):
  *
  *   run budget           <= MAX_RUN_TIMEOUT (itself <= JOB_TIMEOUT)
- *   < worker's abort     JOB_TIMEOUT + compile + 1 grace (SANDBOX_CALL_TIMEOUT)
- *   < service's wait     JOB_TIMEOUT + compile + 2 grace (JOB_WAIT_TIMEOUT)
+ *   < worker's abort     prime + compile + JOB_TIMEOUT + 1 grace  (SANDBOX_CALL_TIMEOUT)
+ *   < service's wait     prime + compile + JOB_TIMEOUT + 2 grace  (JOB_WAIT_TIMEOUT)
  *
  * Before this, all three sat at 300000: a runaway program's SIGKILL result was
  * produced at the same instant every layer above it gave up. The graces only
  * extend how long each layer waits for a result already on its way; they never
  * extend how long user code may run, which the sandbox alone decides.
  *
- * The compile term matters for compiled runtimes: Job.execute() spends up to
- * compile_timeout and THEN up to run_timeout, sequentially, so a java job that
- * compiles slowly and then runs to its deadline needs both budgets covered.
- * SANDBOX_COMPILE_TIMEOUT is the runner's variable; set it here too if you
- * raise it there, or this layer under-provisions by the difference. */
+ * The ladder covers one job's time INSIDE a worker. Queue delay sits outside
+ * it: the service's wait starts at enqueue, the worker's abort only once a
+ * worker picks the job up, so on a backed-up queue the outer wait can still
+ * expire first. That case is reported distinctly (see the handler's queue-delay
+ * branch), not dressed up as an execution failure.
+ *
+ * The terms, in the order the sandbox spends them:
+ *  - prime: input downloads, workspace restore, and -- when dynamic
+ *    dependencies are enabled -- a pip install bounded by
+ *    CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS, all BEFORE compile starts.
+ *  - compile: SANDBOX_COMPILE_TIMEOUT, spent before the run for java.
+ *  - run: the run budget itself.
+ * Job.execute() spends them sequentially, so the worker has to cover the sum.
+ * These are the RUNNER's variables: set them here too if you raise them there,
+ * or this layer under-provisions by the difference. */
 const JOB_WAIT_GRACE_MS = positiveIntEnv(process.env.JOB_WAIT_GRACE_MS, 15_000);
 const COMPILE_ALLOWANCE_MS = positiveIntEnv(process.env.SANDBOX_COMPILE_TIMEOUT, 30_000);
+const PRIME_ALLOWANCE_MS = positiveIntEnv(
+  process.env.JOB_PRIME_ALLOWANCE_MS ?? process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS,
+  120_000,
+);
 
 /** Build the timeout ladder from its inputs, enforcing the ordering above.
  *
@@ -94,11 +108,12 @@ const COMPILE_ALLOWANCE_MS = positiveIntEnv(process.env.SANDBOX_COMPILE_TIMEOUT,
 export function resolveTimeoutLadder(args: {
   jobTimeoutMs: number;
   compileAllowanceMs: number;
+  primeAllowanceMs: number;
   graceMs: number;
   maxRunTimeoutRaw?: string;
 }): { maxRunTimeoutMs: number; sandboxCallTimeoutMs: number; jobWaitTimeoutMs: number } {
-  const { jobTimeoutMs, compileAllowanceMs, graceMs, maxRunTimeoutRaw } = args;
-  const sandboxCallTimeoutMs = jobTimeoutMs + compileAllowanceMs + graceMs;
+  const { jobTimeoutMs, compileAllowanceMs, primeAllowanceMs, graceMs, maxRunTimeoutRaw } = args;
+  const sandboxCallTimeoutMs = jobTimeoutMs + compileAllowanceMs + primeAllowanceMs + graceMs;
   return {
     maxRunTimeoutMs: Math.min(positiveIntEnv(maxRunTimeoutRaw, jobTimeoutMs), jobTimeoutMs),
     sandboxCallTimeoutMs,
@@ -109,16 +124,18 @@ export function resolveTimeoutLadder(args: {
 const timeoutLadder = resolveTimeoutLadder({
   jobTimeoutMs: defaultJobTimeoutMs,
   compileAllowanceMs: COMPILE_ALLOWANCE_MS,
+  primeAllowanceMs: PRIME_ALLOWANCE_MS,
   graceMs: JOB_WAIT_GRACE_MS,
   maxRunTimeoutRaw: process.env.MAX_RUN_TIMEOUT,
 });
 
 /** Resolve a caller-supplied `run_timeout` (ms) against the server ceiling.
  *
- *  Returns `undefined` when absent (the sandbox applies its own default),
- *  `null` when present but malformed -- callers surface that as a 400 rather
- *  than silently ignoring it, which is the behavior this replaces -- and
- *  otherwise the value clamped down to `maxMs`. Clamping is one-directional
+ *  Returns `undefined` when absent (the router substitutes MAX_RUN_TIMEOUT, so
+ *  every job carries an explicit budget), `null` when present but malformed --
+ *  callers surface that as a 400 rather than silently ignoring it, which is the
+ *  behavior this replaces -- and otherwise the value clamped down to `maxMs`.
+ *  Clamping is one-directional
  *  BY DESIGN: a request may only narrow the operator's ceiling, never raise it,
  *  so a client cannot buy itself a longer hold on a sandbox slot than the
  *  deployment allows. */

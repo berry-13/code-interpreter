@@ -4,7 +4,7 @@ import { resolveRequestedRunTimeout, resolveTimeoutLadder, env } from './config'
 const MAX = 300_000;
 
 describe('resolveRequestedRunTimeout', () => {
-  test('absent stays absent, so the sandbox applies its own default', () => {
+  test('absent stays absent; the router substitutes MAX_RUN_TIMEOUT', () => {
     expect(resolveRequestedRunTimeout(undefined, MAX)).toBeUndefined();
     expect(resolveRequestedRunTimeout(null, MAX)).toBeUndefined();
   });
@@ -30,7 +30,12 @@ describe('resolveRequestedRunTimeout', () => {
 describe('timeout ladder', () => {
   /* Each layer must outlive the one it waits on, or a timed-out run's
    * structured result loses the race and the caller gets a generic 500. */
-  const LADDER = { jobTimeoutMs: 300_000, compileAllowanceMs: 30_000, graceMs: 15_000 };
+  const LADDER = {
+    jobTimeoutMs: 300_000,
+    compileAllowanceMs: 30_000,
+    primeAllowanceMs: 120_000,
+    graceMs: 15_000,
+  };
 
   test('the shipped configuration is ordered', () => {
     expect(env.MAX_RUN_TIMEOUT).toBeLessThanOrEqual(env.JOB_TIMEOUT);
@@ -38,18 +43,30 @@ describe('timeout ladder', () => {
     expect(env.JOB_WAIT_TIMEOUT).toBeGreaterThan(env.SANDBOX_CALL_TIMEOUT);
   });
 
-  test('the worker budget covers the full compile-plus-run path', () => {
-    // A java job compiles for up to compile_timeout and THEN runs to its own
-    // deadline; a worker budget that only covered the run would abort before
-    // the sandbox could hand back its structured TO result.
+  test('the worker budget covers the full prime-compile-run path', () => {
+    // The sandbox spends these sequentially: a pip install during prime(), then
+    // a java compile, then the run itself. A worker budget covering only the
+    // run would abort before the sandbox could hand back its structured TO
+    // result.
     const { sandboxCallTimeoutMs } = resolveTimeoutLadder(LADDER);
     expect(sandboxCallTimeoutMs).toBeGreaterThan(
-      LADDER.jobTimeoutMs + LADDER.compileAllowanceMs,
+      LADDER.jobTimeoutMs + LADDER.compileAllowanceMs + LADDER.primeAllowanceMs,
     );
   });
 
+  test('the snapshot-ref margin survives the longest legitimate hold', () => {
+    // The ref key must outlive (request wait + the finally block's extra wait),
+    // or a long-queued run's ref expires while still outstanding and a later
+    // run can delete the snapshot it was about to restore.
+    const { jobWaitTimeoutMs } = resolveTimeoutLadder(LADDER);
+    const refTtlSeconds = Math.ceil(jobWaitTimeoutMs / 1000) + 60;
+    const keyTtlSeconds = 2 * refTtlSeconds;
+    const longestHoldSeconds = Math.ceil(jobWaitTimeoutMs / 1000) + refTtlSeconds;
+    expect(keyTtlSeconds).toBeGreaterThan(longestHoldSeconds);
+  });
+
   test('an over-configured MAX_RUN_TIMEOUT is clamped to the job budget', () => {
-    // Accepting 600s of run budget under a 345s wait would reintroduce exactly
+    // Accepting 600s of run budget under a shorter wait would reintroduce exactly
     // the 500-instead-of-TO failure the ladder exists to prevent.
     const { maxRunTimeoutMs, jobWaitTimeoutMs } = resolveTimeoutLadder({
       ...LADDER,
@@ -71,7 +88,7 @@ describe('timeout ladder', () => {
 
   test('the ordering holds for the shipped helm values too', () => {
     // helm/codeapi/values.yaml: jobTimeout 25000, runTimeout 15000.
-    const ladder = resolveTimeoutLadder({ jobTimeoutMs: 25_000, compileAllowanceMs: 30_000, graceMs: 15_000 });
+    const ladder = resolveTimeoutLadder({ jobTimeoutMs: 25_000, compileAllowanceMs: 30_000, primeAllowanceMs: 120_000, graceMs: 15_000 });
     expect(ladder.maxRunTimeoutMs).toBe(25_000);
     expect(ladder.sandboxCallTimeoutMs).toBeGreaterThan(ladder.maxRunTimeoutMs);
     expect(ladder.jobWaitTimeoutMs).toBeGreaterThan(ladder.sandboxCallTimeoutMs);

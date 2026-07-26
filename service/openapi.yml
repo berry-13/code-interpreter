@@ -460,7 +460,13 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Unavailable:
-      description: The service is starting up or shutting down.
+      description: |
+        The service is starting up or shutting down, or, on `/exec`, the
+        request's budget expired while the job was still queued (or still
+        running on a worker that has budget left). The latter means the queue
+        is saturated, not that the submitted code failed: retry shortly. A run
+        that genuinely exceeded its own budget returns `200` with
+        `status: "TO"` instead.
       content:
         application/json:
           schema:
