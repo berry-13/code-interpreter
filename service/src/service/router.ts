@@ -726,13 +726,21 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
        * started and even finished during our wait is still recognisable --
        * removing a COMPLETED job succeeds, so remove() alone cannot tell us. */
       const jobQueue = language === Languages.py ? pyQueue : otherQueue;
-      const startedAt = job?.id
-        ? await jobQueue.getJob(job.id)
-          .then(fresh => fresh?.processedOn ?? job.processedOn ?? null)
-          .catch(() => job.processedOn ?? null)
-        : null;
-      if (startedAt) {
-        logger.warn(`[${INSTANCE_ID}] Job ${job?.id} had already started; not advertising a retry`);
+      /* Absence is not innocence. `removeOnComplete.count` is 1, so a job that
+       * ran and finished during our wait can already have been evicted by the
+       * next completion -- getJob() then returns undefined while our stale
+       * handle still shows no processedOn. Only a fresh record that positively
+       * says "never picked up" earns the retryable answer; a missing or
+       * unreadable one takes the safe path. */
+      const freshJob = job?.id
+        ? await jobQueue.getJob(job.id).catch(() => undefined)
+        : undefined;
+      const neverStarted = freshJob != null && freshJob.processedOn == null && job?.processedOn == null;
+      if (!neverStarted) {
+        logger.warn(
+          `[${INSTANCE_ID}] Job ${job?.id} may have started (record ${freshJob ? 'shows a pickup' : 'is gone'}); ` +
+          'not advertising a retry',
+        );
         return res.status(abandoned.status).json(abandoned.body);
       }
 

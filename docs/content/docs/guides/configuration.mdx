@@ -197,11 +197,18 @@ computes the ladder.
 <Callout type="info">
 The ladder bounds one job's time *inside a worker*. Queue delay sits outside it:
 the API's wait starts at enqueue, the worker's budget only once a worker picks
-the job up. On a saturated queue the API's wait can therefore expire while the
-job has not started, or while its worker is still legitimately running. That
-case returns **`503`** with a "queue is saturated" message, distinct from the
-`200` + `status: "TO"` of a genuine run timeout, so a caller can tell "retry
-later" apart from "your code ran too long".
+the job up. On a saturated queue the API's wait can therefore expire before the
+job finishes, and what the caller should do about it depends on whether it ever
+started:
+
+| Response | Meaning | Retry? |
+| --- | --- | --- |
+| `503` | The job never started and was removed from the queue. | **Yes**, nothing is running. |
+| `504` | A worker had already claimed it. The execution continues unobserved and may still upload output files. | **No**, a retry duplicates it. |
+| `200` + `status: "TO"` | The run itself exceeded its budget and was killed. | Not an error; fix the code or raise the budget. |
+
+The `503` is only ever returned on positive evidence that no worker picked the
+job up; anything ambiguous is reported as `504`.
 </Callout>
 
 <Callout type="warn">

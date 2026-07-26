@@ -1322,7 +1322,13 @@ async function handleBlocking(
         executionId: execution_id,
         sessionId: session_id,
         callbackToken: toolCallResponse.data.callback_token,
-        timeoutSeconds: timeoutMsToGrantSeconds(timeout),
+        /* The token is minted here, before enqueue, but is only used once
+         * user code makes a tool call -- after priming (dependency installs,
+         * input downloads) and any compile. Sizing it on the run budget alone
+         * expired it mid-run on exactly the jobs that prime slowest. Widening
+         * it does lengthen the window a stolen token stays usable, so it adds
+         * only what the sandbox demonstrably spends first, not a round number. */
+        timeoutSeconds: timeoutMsToGrantSeconds(timeout + env.JOB_PRE_RUN_ALLOWANCE),
         allowedToolNames: tools.map(tool => tool.name),
       });
     } catch (error) {

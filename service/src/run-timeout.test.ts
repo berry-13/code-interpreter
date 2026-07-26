@@ -92,6 +92,20 @@ describe('timeout ladder', () => {
     expect(jobWaitTimeoutMs).toBeGreaterThan(sandboxCallTimeoutMs + tightGrace.revokeAllowanceMs);
   });
 
+  test('the worker budget reserves the seconds NsJail actually enforces', () => {
+    // NsJail takes whole seconds and rounds up, so a 1001ms run budget really
+    // permits 2000ms. With a sub-second grace, reserving the raw milliseconds
+    // would have the worker abort inside the rounding.
+    const { sandboxCallTimeoutMs } = resolveTimeoutLadder({
+      ...LADDER, jobTimeoutMs: 1_001, compileAllowanceMs: 1_001, graceMs: 100,
+    });
+    const effectiveSandboxMs = 2_000 + 2_000;
+    expect(sandboxCallTimeoutMs).toBeGreaterThan(
+      effectiveSandboxMs + LADDER.primeAllowanceMs + LADDER.postProcessAllowanceMs
+      + LADDER.gatewayAllowanceMs,
+    );
+  });
+
   test('the replay-state TTL outlives the request wait', () => {
     // exec_state and its tool_history hash must survive a continuation blocked
     // on its job: if they expire mid-execution the completion path recreates

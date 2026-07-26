@@ -147,12 +147,22 @@ submission cannot monopolise a worker. See
 
 ### Requests return 503 "the queue is saturated"
 
-The request's budget expired before its job finished, with the job still queued
-or still running on a worker. This is capacity, not a fault in the submitted
-code: something ahead of it is occupying the workers. Check
-`codeapi_bullmq_queue_jobs`, then add worker capacity or raise concurrency, as
-in [scaling](/docs/guides/operations#scaling). A run that exceeded its own
-budget looks different: `200` with `status: "TO"`.
+The request's budget expired before a worker ever picked the job up, and the job
+was removed from the queue. This is capacity, not a fault in the submitted code:
+something ahead of it is occupying the workers. Nothing is left running, so the
+caller can safely retry. Check `codeapi_bullmq_queue_jobs`, then add worker
+capacity or raise concurrency, as in
+[scaling](/docs/guides/operations#scaling).
+
+### Requests return 504 "execution is still running"
+
+Same cause, later stage: a worker had already claimed the job when the request's
+budget expired. The execution was **not** cancelled. It continues unobserved and
+may still upload output files and advance the session state, so retrying
+duplicates the work rather than replacing it. Either wait and list the session's
+files, or raise `JOB_TIMEOUT` so the wait covers what your workloads actually
+need. A run that exceeded its own budget looks different again: `200` with
+`status: "TO"`.
 
 ### Output is truncated
 

@@ -139,6 +139,12 @@ const GATEWAY_ALLOWANCE_MS =
  * already succeeded. */
 const REVOKE_ALLOWANCE_MS = positiveIntEnv(process.env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS, 5_000);
 
+/** Round a millisecond budget up to the whole second NsJail will actually
+ *  enforce, so the ladder reserves what the sandbox really spends. */
+function ceilToWholeSecondMs(ms: number): number {
+  return Math.max(1, Math.ceil(ms / 1000)) * 1000;
+}
+
 /** Build the timeout ladder from its inputs, enforcing the ordering above.
  *
  *  `maxRun` is clamped to the job budget rather than trusted: an operator who
@@ -160,9 +166,14 @@ export function resolveTimeoutLadder(args: {
     jobTimeoutMs, compileAllowanceMs, primeAllowanceMs, postProcessAllowanceMs,
     gatewayAllowanceMs, revokeAllowanceMs, graceMs, maxRunTimeoutRaw,
   } = args;
+  /* NsJail enforces both compile and run limits as whole seconds, rounded UP
+   * (`Math.ceil(timeout / 1000)` in nsjail.ts), so a 1001ms budget really
+   * permits 2000ms. Reserve the EFFECTIVE values here: with a grace under a
+   * second the raw millisecond sum would leave the worker aborting inside the
+   * rounding, right before the sandbox produced its structured result. */
   const sandboxCallTimeoutMs =
-    jobTimeoutMs + compileAllowanceMs + primeAllowanceMs + postProcessAllowanceMs
-    + gatewayAllowanceMs + graceMs;
+    ceilToWholeSecondMs(jobTimeoutMs) + ceilToWholeSecondMs(compileAllowanceMs)
+    + primeAllowanceMs + postProcessAllowanceMs + gatewayAllowanceMs + graceMs;
   return {
     maxRunTimeoutMs: Math.min(positiveIntEnv(maxRunTimeoutRaw, jobTimeoutMs), jobTimeoutMs),
     sandboxCallTimeoutMs,
@@ -274,6 +285,11 @@ export const env = {
    * so the worker's own outcome (including a timeout result) always arrives
    * first. See the ladder at JOB_WAIT_GRACE_MS. */
   JOB_WAIT_TIMEOUT: timeoutLadder.jobWaitTimeoutMs,
+  /* Everything the sandbox spends BEFORE user code starts. Anything minted at
+   * enqueue whose lifetime is meant to cover the run (the PTC callback token)
+   * has to add this, or priming alone can consume it before the first line
+   * executes. Queue delay is still not covered -- see the ladder comment. */
+  JOB_PRE_RUN_ALLOWANCE: PRIME_ALLOWANCE_MS + COMPILE_ALLOWANCE_MS + GATEWAY_ALLOWANCE_MS,
   /* Ceiling on a caller-supplied `run_timeout`, never above JOB_TIMEOUT: a run
    * budget that outlives the waits observing it defeats the ladder. The sandbox
    * clamps to its own SANDBOX_RUN_TIMEOUT on top of this. */
