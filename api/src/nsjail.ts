@@ -166,12 +166,46 @@ const SECCOMP_POLICY = [
   '    pidfd_send_signal,',
   /* Block direct network and kernel-control socket domains from sandboxed
    * code. AF_ALG covers the Linux kernel crypto API used by Copy Fail, and
-   * AF_RXRPC covers the RxRPC family used by Dirty Frag. */
+   * AF_RXRPC covers the RxRPC family used by Dirty Frag.
+   *
+   * This rule is UNCONDITIONAL, including for jobs with sandbox networking
+   * enabled. Those reach the egress proxy through net-shim.c, which turns the
+   * client's AF_INET connect into an AF_UNIX one, so nothing in the sandbox
+   * ever needs an AF_INET socket. Relaxing this line was tried and reverted:
+   * under libkrun the guest kernel's TSI forwards AF_INET past the jail's
+   * network namespace to the host, so this rule — not clone_newnet — is what
+   * keeps user code off the network. See net-shim.c. */
   '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC || domain == AF_ALG }',
   '  }',
   '}',
   'USE sandbox DEFAULT ALLOW',
 ].filter(line => line !== '').join('\n');
+
+/* Fixed inside the jail: the per-job socket is bind-mounted onto this path, so
+ * nothing job-specific ends up in the sandbox's view of the filesystem or in
+ * its environment. */
+export const NET_SOCKET_JAIL_PATH = '/tmp/net.sock';
+export const NET_SHIM_LIBRARY = '/usr/local/lib/net-shim.so';
+export const NET_PROXY_PORT = 8080;
+const NET_PROXY_URL = `http://127.0.0.1:${NET_PROXY_PORT}`;
+
+/* Both cases of each variable: Python's urllib/requests read the lowercase
+ * form, most other tooling reads the uppercase one, and curl reads both.
+ * NO_PROXY is empty on purpose — there is no destination the sandbox may reach
+ * directly, so nothing should ever bypass the proxy. */
+const NETWORK_PROXY_ENV: Record<string, string> = {
+  /* The shim is what makes the proxy URL reachable at all: it rewrites the
+   * client's connect() onto the bind-mounted unix socket. Without it the
+   * connect fails at the seccomp layer, which is the intended fail-closed
+   * behavior rather than a fallback. */
+  LD_PRELOAD: NET_SHIM_LIBRARY,
+  HTTP_PROXY: NET_PROXY_URL,
+  HTTPS_PROXY: NET_PROXY_URL,
+  http_proxy: NET_PROXY_URL,
+  https_proxy: NET_PROXY_URL,
+  NO_PROXY: '',
+  no_proxy: '',
+};
 
 export { SIGNALS };
 
@@ -249,6 +283,8 @@ interface ExecuteOptions {
   enableToolCallSocket?: boolean;
   suppressSuccessLogs?: boolean;
   depsDir?: string;
+  /** Per-job net-egress-proxy socket; enables sandbox networking when set. */
+  netSocketPath?: string;
 }
 
 export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate = defaultNsJailSetupGate): Promise<NsJailResult> {
@@ -266,6 +302,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     enableToolCallSocket,
     suppressSuccessLogs,
     depsDir,
+    netSocketPath,
   } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
@@ -284,6 +321,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     extraPkgdirs,
     identity,
     enableToolCallSocket,
+    netSocketPath,
   });
 
   const startTime = Date.now();
@@ -642,6 +680,10 @@ interface BuildArgsOptions {
   extraPkgdirs?: string[];
   identity: SandboxJobIdentity;
   enableToolCallSocket?: boolean;
+  /** Path to this job's net-egress-proxy unix socket. Present only when
+   * sandbox networking is enabled for the job; its absence is what keeps the
+   * jail's network posture unchanged for everyone else. */
+  netSocketPath?: string;
 }
 
 export function buildArgs(opts: BuildArgsOptions): string[] {
@@ -656,9 +698,11 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
     extraPkgdirs,
     identity,
     enableToolCallSocket,
+    netSocketPath,
   } = opts;
 
   const timeoutSecs = Math.max(1, Math.ceil(timeout / 1000));
+  const networkEnabled = typeof netSocketPath === 'string' && netSocketPath.length > 0;
 
   const args: string[] = [
     '--config', cfgPath ?? config.nsjail_config,
@@ -713,7 +757,22 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
     args.push('-B', `${socketPath}:${socketPath}`);
   }
 
-  for (const [key, value] of Object.entries(envVars)) {
+  /* Loopback stays DOWN for every job, networked or not: with the shim there
+   * is nothing to listen on it. `iface_no_lo` lives here rather than in
+   * sandbox.cfg because NsJail's config is protobuf text format, where
+   * re-setting a singular field per job cannot be expressed by appending to
+   * the base file. */
+  args.push('--iface_no_lo');
+
+  if (networkEnabled) {
+    args.push('-B', `${netSocketPath}:${NET_SOCKET_JAIL_PATH}`);
+    /* TLS verification needs a trust store. Read-only, and public data: this
+     * is the same bundle every Debian image ships. */
+    args.push('-R', '/etc/ssl/certs:/etc/ssl/certs');
+  }
+
+  const jobEnv = networkEnabled ? { ...envVars, ...NETWORK_PROXY_ENV } : envVars;
+  for (const [key, value] of Object.entries(jobEnv)) {
     args.push('-E', `${key}=${value}`);
   }
 

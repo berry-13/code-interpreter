@@ -219,8 +219,9 @@ Read-only inputs get `0444`; staged files get `0600`.
 <Step>
 ### Dependency install
 
-If `dependencies.pip` is present and the feature is enabled,
-`api/src/dependencies.ts` validates every spec against a strict grammar, then
+If the submitted code carries a `# requirements:` declaration and the feature
+is enabled, `api/src/dependencies.ts` parses it out of the source and validates
+every spec against a strict grammar, then
 pip installs with `--only-binary=:all:` **in the trusted runner**, as the
 per-job UID, with a minimal environment. The result is mounted read-only into
 the sandbox on `PYTHONPATH`.

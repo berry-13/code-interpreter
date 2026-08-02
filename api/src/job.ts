@@ -18,6 +18,11 @@ import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
 import type { ValidatedDependencies } from './dependencies';
+import { createNetEgressProxy } from './net-egress-proxy';
+
+/* How Python and Node each spell "you imported something that isn't there". */
+const MISSING_MODULE_RE = /\b(ModuleNotFoundError|ImportError: No module named)\b/;
+const MISSING_NODE_MODULE_RE = /\b(Cannot find module|ERR_MODULE_NOT_FOUND|Cannot find package)\b/;
 import { internalServiceHeaders } from './internal-service-auth';
 import { EGRESS_GRANT_HEADER } from './egress';
 import { injectTraceHeaders } from './telemetry';
@@ -1029,24 +1034,47 @@ export class Job {
    * (see safeCall / renderJobConfigOverlay); the jail itself gains no network.
    */
   private async installDependencies(): Promise<void> {
-    const pipSpecs = this.dependencies?.pip;
-    if (!pipSpecs || pipSpecs.length === 0) return;
+    const pipSpecs = this.dependencies?.pip ?? [];
+    const npmSpecs = this.dependencies?.npm ?? [];
+    if (pipSpecs.length === 0 && npmSpecs.length === 0) return;
 
     const identity = this.sandboxIdentity();
     const workspaceId = this.workspaceLease?.workspaceId ?? nanoid();
     const parent = path.dirname(this.submissionDir);
     const depsDir = path.join(parent, `deps_${workspaceId}`);
-    const reqPath = path.join(parent, `deps_req_${workspaceId}.txt`);
 
     await fsp.mkdir(depsDir, { recursive: true, mode: 0o711 });
     await applySandboxPathPermissions(depsDir, identity, 0o711);
     this.depsDir = depsDir;
 
+    if (pipSpecs.length > 0) await this.installPip(pipSpecs, depsDir, parent, workspaceId, identity);
+    if (npmSpecs.length > 0) await this.installNpm(npmSpecs, depsDir, identity);
+
+    /* One budget across both managers: the cap is on what the jail will be able
+     * to see, not on any single installer. */
+    const installedBytes = await dirSizeBytes(depsDir);
+    if (installedBytes > config.dependency_max_bytes) {
+      throw new ValidationError(
+        `installed dependencies (${installedBytes} bytes) exceed the limit of ${config.dependency_max_bytes} bytes`,
+      );
+    }
+    if (!this.isSynthetic) {
+      this.log.info({ bytes: installedBytes }, 'Dependencies installed');
+    }
+  }
+
+  private async installPip(
+    pipSpecs: string[],
+    depsDir: string,
+    parent: string,
+    workspaceId: string,
+    identity: SandboxJobIdentity,
+  ): Promise<void> {
+    const reqPath = path.join(parent, `deps_req_${workspaceId}.txt`);
     await fsp.writeFile(reqPath, pipSpecs.join('\n') + '\n', { mode: 0o600 });
     await applySandboxPathPermissionsNoFollow(reqPath, identity, 0o400, 'file');
 
     const requireHashes = pipSpecs.some(s => s.includes('--hash='));
-    const pipPath = path.join(this.runtime.pkgdir, 'bin', 'pip3');
     const args = [
       'install',
       '--requirement', reqPath,
@@ -1064,38 +1092,107 @@ export class Job {
     }
 
     try {
-      await this.runInstaller(pipPath, args, depsDir, identity);
+      await this.runInstaller(this.resolvePipPath(), args, depsDir, identity);
     } finally {
       await fsp.rm(reqPath, { force: true }).catch(() => {});
     }
-
-    const installedBytes = await dirSizeBytes(depsDir);
-    if (installedBytes > config.dependency_max_bytes) {
-      throw new ValidationError(
-        `installed dependencies (${installedBytes} bytes) exceed the limit of ${config.dependency_max_bytes} bytes`,
-      );
-    }
-    if (!this.isSynthetic) {
-      this.log.info({ bytes: installedBytes }, 'Dependencies installed');
-    }
   }
 
-  private runInstaller(
-    pipPath: string,
-    args: string[],
+  /**
+   * npm's equivalent of pip's `--only-binary=:all:` is `--ignore-scripts`: it
+   * is what stops a package's install/postinstall hook from executing HERE, in
+   * the trusted runner, which would be a far worse outcome than anything the
+   * sandbox can do. Everything else is noise reduction and determinism.
+   *
+   * Packages land in `<depsDir>/node_modules`, alongside pip's flat layout in
+   * the same directory, and the jail sees them through NODE_PATH.
+   */
+  private async installNpm(
+    npmSpecs: string[],
     depsDir: string,
     identity: SandboxJobIdentity,
   ): Promise<void> {
+    const args = [
+      'install',
+      '--prefix', depsDir,
+      '--ignore-scripts',
+      '--no-save',
+      '--no-audit',
+      '--no-fund',
+      '--no-package-lock',
+      '--registry', config.dependency_npm_registry,
+      '--',
+      ...npmSpecs,
+    ];
+
+    if (!this.isSynthetic) {
+      this.log.info({ count: npmSpecs.length }, 'Installing npm dependencies');
+    }
+    await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, {
+      /* npm writes its cache and any temp state relative to these; point both
+       * inside the per-job dir so nothing lands in the runner's HOME and
+       * concurrent jobs cannot collide in a shared cache. */
+      npm_config_cache: path.join(depsDir, '.npm-cache'),
+      npm_config_update_notifier: 'false',
+    });
+  }
+
+  /**
+   * pip lives in the python runtime, which is not necessarily the runtime this
+   * job runs under: LibreChat's code tool commonly submits bash that shells out
+   * to python3, and that job's pkgdir is the bash package. Fall back to the
+   * newest installed python so a bash job can declare requirements too — the
+   * install target (/mnt/deps) and PYTHONPATH are language-agnostic.
+   */
+  private resolvePipPath(): string {
+    const own = path.join(this.runtime.pkgdir, 'bin', 'pip3');
+    if (this.runtime.language === 'python') return own;
+
+    const runtimes = getRuntimes();
+    const python = runtimes
+      .filter(r => r.language === 'python')
+      .sort((a, b) => semver.rcompare(a.version.raw, b.version.raw))[0];
+    if (!python) {
+      throw new ValidationError(
+        'requirements were declared but no python runtime is installed to install them with',
+      );
+    }
+    return path.join(python.pkgdir, 'bin', 'pip3');
+  }
+
+  /** Same reasoning as resolvePipPath: npm lives in the node runtime, which is
+   * usually not the runtime of a job that declares npm packages (a bash job
+   * shelling out to `node`, most often). */
+  private resolveNpmPath(): string {
+    const node = getRuntimes()
+      .filter(r => r.language === 'node')
+      .sort((a, b) => semver.rcompare(a.version.raw, b.version.raw))[0];
+    if (!node) {
+      throw new ValidationError(
+        'npm requirements were declared but no node runtime is installed to install them with',
+      );
+    }
+    return path.join(node.pkgdir, 'bin', 'npm');
+  }
+
+  private runInstaller(
+    installerPath: string,
+    args: string[],
+    depsDir: string,
+    identity: SandboxJobIdentity,
+    extraEnv: Record<string, string> = {},
+  ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       // Minimal env: the installer inherits none of the runner's secrets, only
-      // what pip needs to run and reach the allowlisted index over HTTPS.
+      // what it needs to run and reach the allowlisted index over HTTPS.
       const env: Record<string, string> = {
-        PATH: `${path.join(this.runtime.pkgdir, 'bin')}:/usr/local/bin:/usr/bin:/bin`,
+        PATH: `${path.join(this.runtime.pkgdir, 'bin')}:${path.dirname(installerPath)}:/usr/local/bin:/usr/bin:/bin`,
         HOME: depsDir,
         PIP_DISABLE_PIP_VERSION_CHECK: '1',
         PYTHONDONTWRITEBYTECODE: '1',
+        ...extraEnv,
       };
-      const child = spawn(pipPath, args, {
+      const child = spawn(installerPath, args, {
         cwd: depsDir,
         env,
         uid: identity.uid,
@@ -2396,6 +2493,11 @@ export class Job {
       // take precedence over the baked-in site-packages. Set after spreading
       // runtime.env_vars so this wins over any PYTHONPATH from the runtime .env.
       envVars.PYTHONPATH = envVars.PYTHONPATH ? `/mnt/deps:${envVars.PYTHONPATH}` : '/mnt/deps';
+      // npm installs under <depsDir>/node_modules, which is where node and bun
+      // both look when NODE_PATH points at it.
+      envVars.NODE_PATH = envVars.NODE_PATH
+        ? `/mnt/deps/node_modules:${envVars.NODE_PATH}`
+        : '/mnt/deps/node_modules';
     }
 
     let extraPkgdirs: string[] | undefined;
@@ -2405,7 +2507,7 @@ export class Job {
       ensureNodeModulesSymlink(this.submissionDir, linkTarget.nodeModulesPath);
     }
 
-    return execute({
+    const executeOptions = {
       command,
       envVars,
       submissionDir: this.submissionDir,
@@ -2419,7 +2521,77 @@ export class Job {
       enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
       suppressSuccessLogs: this.isSynthetic,
       depsDir: this.depsDir,
-    });
+    };
+
+    /* Sandbox networking covers the user's program only: a compile step has no
+     * business reaching the internet, and prewarm/synthetic jobs run trusted
+     * canned code. Everything else keeps the historical no-network posture. */
+    if (!config.allow_sandbox_network || script !== 'run' || this.isSynthetic) {
+      return execute(executeOptions);
+    }
+    return this.executeWithNetwork(executeOptions);
+  }
+
+  /**
+   * Run the jail with a per-job egress proxy alive for exactly the duration of
+   * the run. The socket is created here rather than in prime() so it never
+   * exists while no jail is running, and it is closed in a finally so a failed
+   * or timed-out execution cannot leave a listener behind.
+   */
+  private async executeWithNetwork(
+    executeOptions: Parameters<typeof execute>[0],
+  ): Promise<NsJailResult> {
+    const identity = this.sandboxIdentity();
+    /* Kept short and outside submissionDir: AF_UNIX paths are capped at 108
+     * bytes, and a deep workspace path plus a job id can approach that. */
+    const socketPath = path.join(os.tmpdir(), `netegress-${nanoid()}.sock`);
+
+    /* If the proxy cannot be started — the runner cannot chown the socket to
+     * the job UID, the path is unusable, FDs are exhausted — run the job
+     * WITHOUT networking rather than failing it. The sandbox then finds
+     * nothing listening on the proxy port, which is the same behavior as the
+     * feature being off. The error is logged loudly so this never looks like
+     * a working configuration. */
+    let proxy: Awaited<ReturnType<typeof createNetEgressProxy>>;
+    try {
+      proxy = await createNetEgressProxy({
+        socketPath,
+        policy: {
+          allowedHosts: config.sandbox_network_allowed_hosts,
+          allowedPorts: config.sandbox_network_allowed_ports,
+        },
+        socketUid: identity.uid,
+        socketGid: identity.gid,
+        maxConnections: config.sandbox_network_max_connections,
+        maxRequests: config.sandbox_network_max_requests,
+        maxTotalBytes: config.sandbox_network_max_bytes,
+        idleTimeoutMs: config.sandbox_network_idle_timeout_ms,
+        log: this.log,
+      });
+    } catch (error) {
+      this.log.error({ err: error }, 'Failed to start the sandbox egress proxy; running without network access');
+      await fsp.rm(socketPath, { force: true }).catch(() => {});
+      return execute(executeOptions);
+    }
+
+    try {
+      return await execute({ ...executeOptions, netSocketPath: socketPath });
+    } finally {
+      const stats = proxy.stats();
+      if (stats.requests > 0) {
+        this.log.info(
+          {
+            requests: stats.requests,
+            allowed: stats.allowed,
+            denied: stats.denied,
+            bytes_up: stats.bytesUp,
+            bytes_down: stats.bytesDown,
+          },
+          'Sandbox network usage',
+        );
+      }
+      await proxy.close().catch(() => {});
+    }
   }
 
   async execute(): Promise<ExecuteResult> {
@@ -2464,6 +2636,7 @@ export class Job {
         this.memory_limits.run,
         this.stdin,
       );
+      this.hintMissingModule(run);
     }
 
     await this.handleSessionFiles();
@@ -2476,6 +2649,42 @@ export class Job {
       session_id: this.outputSessionId,
       files: this.sessionFiles,
     };
+  }
+
+  /**
+   * Teach the caller the requirements convention at the only moment it is
+   * relevant: when an import just failed.
+   *
+   * There is no other channel. The LLM callers this serves reach the sandbox
+   * through a fixed tool schema whose description we do not control, so a
+   * declaration syntax they are never told about would go unused. A one-line
+   * hint appended to stderr is read by the model on the very turn it hit the
+   * error, and it retries with the header. Appended only when the feature is
+   * actually enabled and the job did not already declare requirements, so it
+   * can never suggest something that would fail.
+   */
+  private hintMissingModule(run: NsJailResult | undefined): void {
+    if (!run || !config.allow_dynamic_dependencies) return;
+    if (this.dependencies?.pip?.length || this.dependencies?.npm?.length) return;
+
+    const text = `${run.stderr}\n${run.output}`;
+    const python = MISSING_MODULE_RE.test(text);
+    const node = MISSING_NODE_MODULE_RE.test(text);
+    if (!python && !node) return;
+
+    /* Show the syntax in the comment style of the language that failed, and
+     * pin only when the deployment requires it — a hint that produces a
+     * rejected declaration would be worse than none. */
+    const pinned = config.dependency_require_pinned;
+    const hint = node
+      ? `\nHint: this package is not installed. Declare it with a '// requirements: name' ` +
+        `comment at the top of your code (for example '// requirements: ` +
+        `${pinned ? 'lodash@4.17.21' : 'lodash'}'); it is installed before your code runs.\n`
+      : `\nHint: this package is not installed. Declare it with a '# requirements: name' ` +
+        `comment at the top of your code (for example '# requirements: ` +
+        `${pinned ? 'cowsay==6.1' : 'cowsay'}'); it is installed before your code runs.\n`;
+    run.stderr += hint;
+    run.output += hint;
   }
 
   private async handleSessionFiles(): Promise<void> {

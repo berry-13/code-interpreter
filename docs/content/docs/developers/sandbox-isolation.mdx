@@ -61,7 +61,8 @@ memory, the seccomp policy, environment) are passed as CLI arguments by
 
 ```ini
 keep_caps: false        # no capabilities retained
-clone_newnet: true      # empty network namespace
+clone_newnet: true      # empty network namespace (always, even with
+                        # sandbox networking enabled)
 clone_newcgroup: true
 mount_proc: false       # procfs mounted explicitly, not implicitly
 

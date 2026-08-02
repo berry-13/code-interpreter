@@ -32,6 +32,14 @@ COPY api/src/spec-guard.c /tmp/spec-guard.c
 RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
     && chmod 0111 /usr/local/bin/spec-guard
 
+# net-shim redirects a client's connect() to the egress proxy onto the per-job
+# unix socket, so sandbox networking never needs an AF_INET socket and the
+# seccomp block on AF_INET stays in force. Shared object: it is LD_PRELOADed
+# into the user's process inside the jail.
+COPY api/src/net-shim.c /tmp/net-shim.c
+RUN gcc -O2 -Wall -Wextra -Werror -fPIC -shared -o /usr/local/lib/net-shim.so /tmp/net-shim.c -ldl \
+    && chmod 0444 /usr/local/lib/net-shim.so
+
 # ============================================================================
 # Stage 1b: Build language runtime packages (only consumed by sandbox-runner-baked)
 #
@@ -108,6 +116,7 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+COPY --from=nsjail-builder /usr/local/lib/net-shim.so /usr/local/lib/net-shim.so
 RUN chmod +x /usr/sbin/nsjail
 
 # The tool-call socket proxy must run under Node, not Bun. Bun's node:http

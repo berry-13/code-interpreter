@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { resolveDependencies, validatePipDependencies } from './dependencies';
+import { resolveDependencies, validateNpmDependencies, validatePipDependencies } from './dependencies';
 
 const LIMITS = { maxCount: 5 };
 
@@ -61,23 +61,237 @@ describe('validatePipDependencies', () => {
 });
 
 describe('resolveDependencies', () => {
-  test('returns undefined when none declared', () => {
-    expect(resolveDependencies(undefined, 'python', { allow: true, maxCount: 5 })).toBeUndefined();
-    expect(resolveDependencies({}, 'python', { allow: true, maxCount: 5 })).toBeUndefined();
+  const OPTS = { allow: true, maxCount: 5 };
+
+  test('returns undefined when no header is present', () => {
+    expect(resolveDependencies(['print("hi")'], OPTS)).toBeUndefined();
+    expect(resolveDependencies([], OPTS)).toBeUndefined();
+    expect(resolveDependencies([''], OPTS)).toBeUndefined();
+  });
+
+  test('parses a pinned header', () => {
+    expect(resolveDependencies(['# requirements: cowsay==6.1\nimport cowsay'], OPTS))
+      .toEqual({ pip: ['cowsay==6.1'] });
+  });
+
+  test('accepts several packages on one line', () => {
+    expect(resolveDependencies(['# requirements: cowsay==6.1, requests==2.32.3'], OPTS))
+      .toEqual({ pip: ['cowsay==6.1', 'requests==2.32.3'] });
+  });
+
+  test('is tolerant of spacing and case, as an LLM will write it', () => {
+    for (const header of [
+      '#requirements:cowsay==6.1',
+      '#   Requirements :   cowsay==6.1   ',
+      '\t# REQUIREMENTS: cowsay==6.1',
+    ]) {
+      expect(resolveDependencies([header], OPTS)).toEqual({ pip: ['cowsay==6.1'] });
+    }
+  });
+
+  test('finds the header anywhere in the file, not only the first line', () => {
+    expect(resolveDependencies(['import os\n\n# requirements: cowsay==6.1\n'], OPTS))
+      .toEqual({ pip: ['cowsay==6.1'] });
+  });
+
+  test('collects across files and de-duplicates', () => {
+    expect(resolveDependencies([
+      '# requirements: cowsay==6.1',
+      '# requirements: cowsay==6.1, six==1.16.0',
+    ], OPTS)).toEqual({ pip: ['cowsay==6.1', 'six==1.16.0'] });
   });
 
   test('refuses when the feature is disabled', () => {
-    expect(messageOf(() => resolveDependencies({ pip: ['numpy==2.1.0'] }, 'python', { allow: false, maxCount: 5 })))
+    expect(messageOf(() => resolveDependencies(['# requirements: numpy==2.1.0'], { allow: false, maxCount: 5 })))
       .toMatch(/disabled/);
   });
 
-  test('refuses pip on non-python runtimes', () => {
-    expect(messageOf(() => resolveDependencies({ pip: ['numpy==2.1.0'] }, 'bash', { allow: true, maxCount: 5 })))
-      .toMatch(/only supported for python/);
+  test('applies the pinned-spec grammar to declared packages', () => {
+    // Unpinned, and the shell-metacharacter smuggling the grammar exists for.
+    expect(messageOf(() => resolveDependencies(['# requirements: cowsay'], OPTS)))
+      .toMatch(/pinned/);
+    expect(messageOf(() => resolveDependencies(['# requirements: --index-url=http://evil/'], OPTS)))
+      .toMatch(/pin|invalid/);
+    // A shell metacharacter never survives: it lands in the version field,
+    // which only accepts PEP 440 characters.
+    expect(messageOf(() => resolveDependencies(['# requirements: cowsay==6.1; rm -rf /'], OPTS)))
+      .toMatch(/pin|invalid/);
   });
 
-  test('validates and returns pip specs', () => {
-    expect(resolveDependencies({ pip: ['numpy==2.1.0'] }, 'python', { allow: true, maxCount: 5 }))
-      .toEqual({ pip: ['numpy==2.1.0'] });
+  test('enforces the per-job package cap', () => {
+    const many = Array.from({ length: 6 }, (_, i) => `pkg${i}==1.0`).join(', ');
+    expect(messageOf(() => resolveDependencies([`# requirements: ${many}`], OPTS)))
+      .toMatch(/maximum/);
+  });
+
+  test('ignores a header buried past the scan window', () => {
+    const padded = 'x'.repeat(70 * 1024) + '\n# requirements: cowsay==6.1';
+    expect(resolveDependencies([padded], OPTS)).toBeUndefined();
+  });
+
+  test('does not treat prose mentioning requirements as a declaration', () => {
+    expect(resolveDependencies(['# requirements are documented in README'], OPTS)).toBeUndefined();
+  });
+});
+
+describe('unpinned mode (CODEAPI_DEPENDENCY_REQUIRE_PINNED=false)', () => {
+  const LOOSE = { maxCount: 10, requirePinned: false };
+
+  test('accepts the shapes an LLM actually writes', () => {
+    for (const spec of [
+      'cowsay',
+      'cowsay==6.1',
+      'requests>=2.32',
+      'numpy~=2.1',
+      'pandas>=2,<3',
+      'requests[socks]',
+      'requests[socks,use_chardet_on_py3]>=2.32.3',
+      'ruamel.yaml',
+      'zope.interface==7.0',
+      'a',
+    ]) {
+      expect(validatePipDependencies([spec], LOOSE)).toEqual([spec]);
+    }
+  });
+
+  /* The threat model here is pip OPTION injection, not shell injection: specs
+   * are written to a requirements file and pip is spawned with an argv array,
+   * never through a shell. A requirements file does interpret lines beginning
+   * with '-' as options, which is what the leading-character rule stops. */
+  test('still refuses pip options, URLs, paths, markers and metacharacters', () => {
+    for (const spec of [
+      '--index-url=http://evil/',
+      '-r/etc/passwd',
+      '-e.',
+      'requests @ https://evil/x.whl',
+      'requests;os.system("x")',
+      'requests; python_version<"3.9"',
+      './local/path',
+      '/abs/path',
+      'requests`whoami`',
+      'requests$(whoami)',
+      'requests|tee',
+      "requests'",
+      'req uests',
+    ]) {
+      expect(() => validatePipDependencies([spec], LOOSE)).toThrow();
+    }
+  });
+
+  test('a nonsense version is left for pip to reject, not treated as injection', () => {
+    // '>' is a legitimate version operator; with no shell in the path this is
+    // just an unsatisfiable requirement, and pip fails the job cleanly.
+    expect(validatePipDependencies(['requests>evil.txt'], LOOSE)).toEqual(['requests>evil.txt']);
+  });
+
+  test('pinned mode is unchanged and still rejects a bare name', () => {
+    expect(() => validatePipDependencies(['cowsay'], { maxCount: 10 })).toThrow();
+    expect(() => validatePipDependencies(['cowsay'], { maxCount: 10, requirePinned: true })).toThrow();
+  });
+
+  test('the per-job cap and hash rules still apply', () => {
+    const many = Array.from({ length: 11 }, (_, i) => `pkg${i}`);
+    expect(() => validatePipDependencies(many, LOOSE)).toThrow(/maximum/ as unknown as string);
+    const h = '--hash=sha256:' + 'a'.repeat(64);
+    expect(() => validatePipDependencies([`a==1 ${h}`, 'b==2'], LOOSE)).toThrow();
+  });
+});
+
+describe('validateNpmDependencies', () => {
+  const LOOSE = { maxCount: 10, requirePinned: false };
+  const PINNED = { maxCount: 10 };
+
+  test('accepts registry names, scopes and ranges', () => {
+    for (const spec of [
+      'lodash',
+      'lodash@4.17.21',
+      'left-pad@^1.3',
+      '@types/node',
+      '@types/node@20.11.0',
+      'react@>=18',
+      'foo@1.x',
+      'bar@1.2.3-beta.1',
+    ]) {
+      expect(validateNpmDependencies([spec], LOOSE)).toEqual([spec]);
+    }
+  });
+
+  test('refuses every way of installing from somewhere other than the registry', () => {
+    for (const spec of [
+      'git+https://evil/x.git',
+      'https://evil/x.tgz',
+      'http://evil/x.tgz',
+      'file:../x',
+      './local',
+      '/abs/path',
+      'evil@git+ssh://git@h/x.git',
+      'alias@npm:other',
+      '--registry=http://evil/',
+      '-g',
+      'pkg;rm -rf /',
+      'pkg`whoami`',
+      'pkg$(whoami)',
+      'pkg with space',
+      '@scope',
+      '@/bad',
+    ]) {
+      expect(() => validateNpmDependencies([spec], LOOSE)).toThrow();
+    }
+  });
+
+  test('pinned mode requires an exact semver', () => {
+    expect(validateNpmDependencies(['lodash@4.17.21'], PINNED)).toEqual(['lodash@4.17.21']);
+    for (const spec of ['lodash', 'lodash@^4', 'lodash@latest', 'lodash@4', 'lodash@4.17']) {
+      expect(() => validateNpmDependencies([spec], PINNED)).toThrow();
+    }
+  });
+
+  test('enforces the per-job package cap', () => {
+    const many = Array.from({ length: 11 }, (_, i) => `pkg${i}`);
+    expect(() => validateNpmDependencies(many, LOOSE)).toThrow();
+  });
+});
+
+describe('resolveDependencies across managers', () => {
+  const OPTS = { allow: true, maxCount: 10, requirePinned: false };
+
+  test('a bare header means the language default', () => {
+    expect(resolveDependencies(['# requirements: cowsay'], { ...OPTS, defaultManager: 'pip' }))
+      .toEqual({ pip: ['cowsay'] });
+    expect(resolveDependencies(['// requirements: lodash'], { ...OPTS, defaultManager: 'npm' }))
+      .toEqual({ npm: ['lodash'] });
+  });
+
+  test('an explicit qualifier overrides the default, in either comment style', () => {
+    expect(resolveDependencies(['# requirements(npm): lodash'], { ...OPTS, defaultManager: 'pip' }))
+      .toEqual({ npm: ['lodash'] });
+    expect(resolveDependencies(['// requirements(pip): cowsay'], { ...OPTS, defaultManager: 'npm' }))
+      .toEqual({ pip: ['cowsay'] });
+  });
+
+  test('a bash job can declare both', () => {
+    expect(resolveDependencies(
+      ['# requirements: cowsay\n# requirements(npm): lodash'],
+      { ...OPTS, defaultManager: 'pip' },
+    )).toEqual({ pip: ['cowsay'], npm: ['lodash'] });
+  });
+
+  test('merges what the service extracted with what it finds in the source', () => {
+    expect(resolveDependencies(['// requirements: lodash'], {
+      ...OPTS,
+      defaultManager: 'npm',
+      declared: { pip: ['cowsay'] },
+    })).toEqual({ pip: ['cowsay'], npm: ['lodash'] });
+  });
+
+  test('an unimplemented manager fails loudly rather than being ignored', () => {
+    expect(messageOf(() => resolveDependencies(['# requirements(cargo): serde'], OPTS)))
+      .toMatch(/cargo\).*not supported/);
+  });
+
+  test('each manager gets its own grammar', () => {
+    // '@' is a version separator for npm and part of nothing for pip.
+    expect(messageOf(() => resolveDependencies(['# requirements: lodash@4.17.21'], OPTS)))
+      .toMatch(/not a valid package requirement/);
   });
 });

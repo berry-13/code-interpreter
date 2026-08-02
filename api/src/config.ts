@@ -1,3 +1,5 @@
+import { parseAllowedHosts, parseAllowedPorts } from './net-policy';
+
 type LimitOverrides = Record<string, Record<string, number> | undefined>;
 
 function parseLimitOverrides(raw: string): LimitOverrides {
@@ -96,11 +98,45 @@ export const config = {
    * pip --only-binary=:all: (wheels only -> no build/setup.py code runs) into a
    * per-job dir mounted READ-ONLY into the jail. The jail itself gains no
    * network; only the trusted runner fetches from the allowlisted index. */
+  /* ADDING A CODEAPI_* KNOB? It must be listed in TWO allowlists or it will be
+   * silently absent at runtime and fall back to its default:
+   *   1. `ALLOWED_CODEAPI_ENV` in secure-startup.ts — hardened mode otherwise
+   *      refuses to boot with it set.
+   *   2. `ALLOW_EXACT` in launcher/src/main.rs — the KVM launcher filters which
+   *      variables cross into the microVM guest, and CODEAPI_ is a deny prefix.
+   * Both have bitten this feature already; there is no runtime error, just a
+   * flag that appears to be set and does nothing. */
   allow_dynamic_dependencies: process.env.CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES === 'true',
+  /* Sandbox network egress (opt-in, OFF by default). When enabled, a per-job
+   * HTTP proxy (net-egress-proxy.ts) listens on a unix socket bind-mounted
+   * into the jail, and net-shim.c (LD_PRELOAD) rewrites a client's connect()
+   * to 127.0.0.1:8080 onto that socket, so ordinary HTTP_PROXY-aware clients
+   * work while the seccomp block on AF_INET stays fully in force. Every
+   * destination is decided by the proxy on the trusted side.
+   *
+   * With no host allowlist the policy is "any publicly routable address":
+   * private, loopback, link-local (cloud metadata), CGNAT, ULA and the other
+   * special-purpose ranges are refused unconditionally and cannot be opened
+   * up by configuration. */
+  allow_sandbox_network: process.env.CODEAPI_ALLOW_SANDBOX_NETWORK === 'true',
+  sandbox_network_allowed_hosts: parseAllowedHosts(process.env.SANDBOX_NET_ALLOWED_HOSTS),
+  sandbox_network_allowed_ports: parseAllowedPorts(process.env.SANDBOX_NET_ALLOWED_PORTS, [80, 443]),
+  sandbox_network_max_bytes: safeInt(process.env.SANDBOX_NET_MAX_BYTES, 268435456),
+  sandbox_network_max_requests: safeInt(process.env.SANDBOX_NET_MAX_REQUESTS, 512),
+  sandbox_network_max_connections: safeInt(process.env.SANDBOX_NET_MAX_CONNECTIONS, 32),
+  sandbox_network_idle_timeout_ms: safeInt(process.env.SANDBOX_NET_IDLE_TIMEOUT_MS, 60000),
   // `||` (not `??`): compose passes an empty string when the var is unset, and
   // an empty index URL would break pip.
   dependency_index_url: process.env.CODEAPI_DEPENDENCY_INDEX_URL || 'https://pypi.org/simple',
+  dependency_npm_registry: process.env.CODEAPI_DEPENDENCY_NPM_REGISTRY || 'https://registry.npmjs.org',
   dependency_max_count: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_COUNT, 50),
+  /* Pinned `name==version` is required by default: it makes a run reproducible,
+   * and it means a compromised NEW release of a package cannot change what an
+   * already-working job installs. Set false to accept bare names and ranges and
+   * let pip resolve the version — far friendlier for an LLM, which rarely knows
+   * real version numbers and will otherwise pin one that does not exist, at the
+   * cost of both of those properties. */
+  dependency_require_pinned: (process.env.CODEAPI_DEPENDENCY_REQUIRE_PINNED ?? 'true') === 'true',
   dependency_install_timeout_ms: safeInt(process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS, 120000),
   dependency_max_bytes: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_BYTES, 262144000),
   require_execution_manifest: requireExecutionManifest,

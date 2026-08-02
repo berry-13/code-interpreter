@@ -178,16 +178,6 @@ components:
             `SANDBOX_REQUIRE_EGRESS_MANIFEST=true` (the default).
         persist_session:
           $ref: '#/components/schemas/PersistSession'
-        dependencies:
-          type: object
-          description: |
-            Per-job packages installed before user code runs, wheels only.
-            Rejected unless `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES=true`.
-          properties:
-            pip:
-              type: array
-              items:
-                type: string
 
     FileRef:
       type: object

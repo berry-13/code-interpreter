@@ -68,6 +68,67 @@ jobs:
           test "$PARENT_FDS" -ge 8 || { echo "FAIL: parent did not actually inherit extra FDs"; exit 1; }
           test "$CHILD_FDS" -le 5 || { echo "FAIL: spec-guard did not close inherited FDs (child saw $CHILD_FDS)"; exit 1; }
 
+      - name: Compile + smoke net-shim
+        # net-shim.c is otherwise only compiled by the sandbox Dockerfiles. The
+        # smoke test drives the real thing through an unmodified HTTP client:
+        # HTTP_PROXY traffic must land on the unix socket, and every other
+        # destination must be refused rather than redirected.
+        working-directory: api/src
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -fPIC -shared -o /tmp/net-shim.so net-shim.c -ldl
+          python3 - <<'SMOKE'
+          import os, socket, subprocess, sys, tempfile, threading
+
+          sock_path = os.path.join(tempfile.mkdtemp(), "net.sock")
+          seen = []
+
+          def serve():
+              srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+              srv.bind(sock_path)
+              srv.listen(8)
+              while True:
+                  conn, _ = srv.accept()
+                  data = b""
+                  while b"\r\n\r\n" not in data:
+                      chunk = conn.recv(4096)
+                      if not chunk:
+                          break
+                      data += chunk
+                  seen.append(data)
+                  conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong")
+                  conn.shutdown(socket.SHUT_WR)
+                  conn.close()
+
+          threading.Thread(target=serve, daemon=True).start()
+
+          client = (
+              "import socket, urllib.request\n"
+              "r = urllib.request.urlopen('http://example.com/', timeout=10)\n"
+              "print('PROXIED:', r.status, r.read().decode())\n"
+              "try:\n"
+              "    socket.create_connection(('93.184.216.34', 80), timeout=5)\n"
+              "    print('DIRECT REACHED - BAD')\n"
+              "except OSError as e:\n"
+              "    print('direct refused:', type(e).__name__)\n"
+              "try:\n"
+              "    socket.create_connection(('127.0.0.1', 9999), timeout=5)\n"
+              "    print('OTHER PORT REACHED - BAD')\n"
+              "except OSError as e:\n"
+              "    print('other port refused:', type(e).__name__)\n"
+          )
+
+          env = dict(os.environ, LD_PRELOAD="/tmp/net-shim.so", NET_SHIM_SOCKET=sock_path,
+                    NET_SHIM_PORT="8080", HTTP_PROXY="http://127.0.0.1:8080",
+                    http_proxy="http://127.0.0.1:8080")
+          proc = subprocess.run([sys.executable, "-c", client], env=env,
+                                capture_output=True, timeout=60, text=True)
+          print(proc.stdout, proc.stderr[:300])
+          assert "PROXIED: 200 pong" in proc.stdout, "proxied request did not reach the unix socket"
+          assert "BAD" not in proc.stdout, "shim redirected something it must refuse"
+          assert seen and seen[0].startswith(b"GET http://example.com/"), "unix side saw nothing"
+          print("net-shim smoke OK")
+          SMOKE
+
       - name: Bun tests
         run: bun run test
 

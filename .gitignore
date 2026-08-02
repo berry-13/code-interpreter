@@ -20,5 +20,8 @@ helm/*/Chart.lock
 data/
 
 
+# Rust build output for the microVM launcher (Cargo.lock is committed)
+launcher/target/
+
 # Editor config
 .vscode/

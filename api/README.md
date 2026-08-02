@@ -22,7 +22,7 @@ Each code execution runs in a fresh NsJail sandbox with the following isolation:
 | **rlimits** | AS, fsize, nofile, nproc, cpu | Per-process resource caps |
 | **User mapping** | UID/GID 65534 (`nobody`) | No privilege escalation |
 | **Filesystem** | Read-only `/usr`, tmpfs `/tmp`, writable `/mnt/data` only | Minimal writable surface |
-| **Network** | `clone_newnet` (empty network namespace) | No outbound connectivity by default |
+| **Network** | `clone_newnet` (empty network namespace) | No outbound connectivity. With `CODEAPI_ALLOW_SANDBOX_NETWORK=true` the namespace stays empty and loopback comes up, reaching only a per-job proxy on the trusted side (see the Sandbox networking guide) |
 
 ## Configuration
 
@@ -38,7 +38,14 @@ All prefixed with `SANDBOX_` unless noted:
 |----------|---------|-------------|
 | `SANDBOX_LOG_LEVEL` | `INFO` | Log verbosity |
 | `SANDBOX_PACKAGES_DIRECTORY` | `/pkgs` | Directory containing language packages |
-| `SANDBOX_DISABLE_NETWORKING` | `true` | Isolate sandbox from the network |
+| `SANDBOX_DISABLE_NETWORKING` | `true` | **Unused.** Parsed but read by nothing; network isolation is unconditional (`clone_newnet` plus a seccomp block on `AF_INET`/`AF_INET6`). Setting it to `false` does not grant network access — see `CODEAPI_ALLOW_SANDBOX_NETWORK` |
+| `CODEAPI_ALLOW_SANDBOX_NETWORK` | `false` | Opt-in outbound HTTP/HTTPS for user code via a per-job proxy |
+| `SANDBOX_NET_ALLOWED_HOSTS` | *(empty)* | Host allowlist; empty or `*` means any publicly routable host |
+| `SANDBOX_NET_ALLOWED_PORTS` | `80,443` | Destination ports the sandbox may reach |
+| `SANDBOX_NET_MAX_BYTES` | `268435456` | Bytes proxied per job, both directions |
+| `SANDBOX_NET_MAX_REQUESTS` | `512` | Requests per job |
+| `SANDBOX_NET_MAX_CONNECTIONS` | `32` | Concurrent proxied connections per job |
+| `SANDBOX_NET_IDLE_TIMEOUT_MS` | `60000` | Idle time before a proxied connection is torn down |
 | `SANDBOX_ALLOWED_LOCAL_NETWORK_PORT` | `0` | Allow sandbox to reach this host port (for tool calling) |
 | `SANDBOX_OUTPUT_MAX_SIZE` | `1024` | Max stdout/stderr bytes before truncation |
 | `SANDBOX_MAX_PROCESS_COUNT` | `64` | Max PIDs inside the sandbox |

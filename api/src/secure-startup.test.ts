@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { config } from './config';
-import { validateHardenedSandboxStartup } from './secure-startup';
+import { validateHardenedSandboxStartup, validateSandboxNetworkStartup } from './secure-startup';
 
 const savedEnv = { ...process.env };
 const saved = {
@@ -137,6 +137,13 @@ describe('hardened sandbox-runner startup config', () => {
     delete process.env.CODEAPI_DEPENDENCY_MAX_BYTES;
   });
 
+  test('allows the sandbox-network flag in hardened mode', () => {
+    setValidHardenedConfig();
+    process.env.CODEAPI_ALLOW_SANDBOX_NETWORK = 'true';
+    expect(() => validateHardenedSandboxStartup()).not.toThrow();
+    delete process.env.CODEAPI_ALLOW_SANDBOX_NETWORK;
+  });
+
   test('rejects missing manifest verifier and wrong forwarding target', () => {
     setValidHardenedConfig();
     config.egress_gateway_url = '';
@@ -171,5 +178,27 @@ describe('hardened sandbox-runner startup config', () => {
     config.job_uid_base = 200000;
     config.workspace_reaper_max_age_seconds = 10;
     expect(() => validateHardenedSandboxStartup()).toThrow('SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS');
+  });
+});
+
+
+describe('validateSandboxNetworkStartup', () => {
+  test('does nothing when sandbox networking is disabled', () => {
+    expect(() => validateSandboxNetworkStartup({ enabled: false, binaryPath: '/nope/net-shim.so' })).not.toThrow();
+  });
+
+  test('hardened mode is supported now that seccomp is no longer relaxed', () => {
+    expect(() => validateSandboxNetworkStartup({ enabled: true, binaryPath: process.execPath })).not.toThrow();
+  });
+
+  test('refuses to start when the shim is missing from the image', () => {
+    // Otherwise every process in every job would run with an unresolvable
+    // LD_PRELOAD, and ld.so would write an error into the user's stderr.
+    expect(() => validateSandboxNetworkStartup({ enabled: true, binaryPath: '/nope/net-shim.so' }))
+      .toThrow('net-shim');
+  });
+
+  test('starts when the shim is present', () => {
+    expect(() => validateSandboxNetworkStartup({ enabled: true, binaryPath: process.execPath })).not.toThrow();
   });
 });

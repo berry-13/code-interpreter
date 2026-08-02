@@ -14,6 +14,7 @@ import { classifySandboxSafeError } from '../safe-error';
 import { withSpan } from '../telemetry';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
 import { resolveDependencies } from '../dependencies';
+import { defaultManagerFor } from '../../../shared/requirements-header';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
@@ -45,7 +46,11 @@ export interface ExecuteRequestBody {
    *  `/mnt/data` back to `output_session_id/<file_id>`. Covered by the manifest
    *  body hash like every other field. */
   persist_session?: { file_id: string; filename: string; restore_session_id?: string };
-  dependencies?: { pip?: string[] };
+  /* Internal only: specs the service extracted from the raw user code. Not
+   * part of the public /v1/exec surface -- with persistent sessions the code
+   * reaches us base64-encoded, so the service must parse the header while it
+   * still has the original. See shared/requirements-header.ts. */
+  dependencies?: { pip?: string[]; npm?: string[] };
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;
@@ -234,10 +239,20 @@ function getJob(
     );
   }
 
-  const dependencies = resolveDependencies(body.dependencies, rt.language, {
-    allow: config.allow_dynamic_dependencies,
-    maxCount: config.dependency_max_count,
-  });
+  /* Declared in the code itself (`# requirements: name==version`) rather than
+   * in a request field: the LLM callers this serves write code through a fixed
+   * tool schema they cannot add fields to. Only inline text is scanned; files
+   * referenced by id are fetched later and are data, not declarations. */
+  const dependencies = resolveDependencies(
+    effectiveFiles.map(f => (typeof f.content === 'string' ? f.content : '')),
+    {
+      allow: config.allow_dynamic_dependencies,
+      maxCount: config.dependency_max_count,
+      declared: body.dependencies,
+      requirePinned: config.dependency_require_pinned,
+      defaultManager: defaultManagerFor(rt.language),
+    },
+  );
 
   return new Job({
     session_id: session_id ?? null,

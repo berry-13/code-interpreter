@@ -122,24 +122,12 @@ export type ExecuteResponse = {
   files: FileRefs;
 };
 
-/**
- * Request-declared runtime dependencies installed per-job before user code
- * runs. MVP supports pip only; each entry is a pinned spec (`name==version`,
- * optionally with one or more ` --hash=sha256:...`). `npm`/`bun` keys are
- * reserved for the follow-up. Installation is gated by
- * CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES and uses wheels only (no build scripts).
- */
-export interface Dependencies {
-  pip?: string[];
-}
-
 export interface RequestBody {
   code: string;
   lang: string;
   args?: string[];
   user_id?: string;
   files?: RequestFile[];
-  dependencies?: Dependencies;
   /** Wall-clock budget for the run, in milliseconds. Positive integer,
    *  clamped down to MAX_RUN_TIMEOUT (and again to the sandbox's own
    *  SANDBOX_RUN_TIMEOUT) -- a request can only narrow the operator's
@@ -204,11 +192,13 @@ export interface PayloadBody {
   tool_call_socket?: boolean;
   args?: string[];
   /**
-   * Request-declared dependencies installed per-job by the sandbox before user
-   * code runs (pip wheels only for the MVP). Rides in the body so it is bound
-   * by the execution manifest's body hash.
+   * Packages this job declared with a `# requirements:` comment in its code,
+   * extracted by the service before wrapping and validated by the sandbox.
+   * Internal to the service->sandbox payload: the public request body has no
+   * dependencies field, because the LLM callers this serves cannot add one.
+   * Rides in the body so it is bound by the execution manifest's body hash.
    */
-  dependencies?: Dependencies;
+  dependencies?: { pip?: string[]; npm?: string[] };
   /**
    * Extra environment variables to inject into the sandboxed process via nsjail -E.
    * NOTE: PTC replay mode delivers tool-result history as a payload file
