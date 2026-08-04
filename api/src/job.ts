@@ -219,6 +219,63 @@ export function bakedNodeModulesFor(
   return fs.existsSync(conventional) ? conventional : undefined;
 }
 
+/**
+ * Assert every package npm installed came from `registry`.
+ *
+ * `--registry` only routes the specs we hand npm. A package on the configured
+ * registry is free to declare a dependency as `git+ssh://…`, `https://…tgz` or
+ * `file:…`, and npm fetches those from wherever they point — so the registry
+ * setting and the validator's no-URLs rule both stop at the top level. The
+ * lockfile npm writes records a `resolved` per package, which is the one place
+ * the whole resolved tree is visible.
+ *
+ * Fails closed: an entry with no `resolved` that is not the root and not
+ * bundled inside its parent's tarball is refused rather than assumed fine.
+ */
+export function assertRegistryOnlyTree(lockJson: string, registry: string): void {
+  let parsed: { packages?: Record<string, { resolved?: string; link?: boolean; inBundle?: boolean }> };
+  try {
+    parsed = JSON.parse(lockJson);
+  } catch {
+    throw new ValidationError('npm install produced no readable lockfile to verify against the registry');
+  }
+  const packages = parsed.packages;
+  if (packages === undefined) {
+    throw new ValidationError('npm install produced no readable lockfile to verify against the registry');
+  }
+
+  let expected: string;
+  try {
+    expected = new URL(registry).origin;
+  } catch {
+    throw new ValidationError(`CODEAPI_DEPENDENCY_NPM_REGISTRY is not a valid URL: ${registry}`);
+  }
+
+  for (const [name, entry] of Object.entries(packages)) {
+    // '' is the synthetic root manifest; it is never fetched.
+    if (name === '') continue;
+    // Bundled deps ship inside a parent tarball that was itself checked.
+    if (entry.inBundle === true) continue;
+    if (entry.link === true) {
+      throw new ValidationError(`dependency '${name}' resolves to a local link, which is not allowed`);
+    }
+    if (typeof entry.resolved !== 'string' || entry.resolved.length === 0) {
+      throw new ValidationError(`dependency '${name}' has no recorded source and cannot be verified`);
+    }
+    let origin: string;
+    try {
+      origin = new URL(entry.resolved).origin;
+    } catch {
+      throw new ValidationError(`dependency '${name}' resolves to '${entry.resolved}', which is not a registry URL`);
+    }
+    if (origin !== expected) {
+      throw new ValidationError(
+        `dependency '${name}' resolves to '${origin}', outside the configured npm registry '${expected}'`,
+      );
+    }
+  }
+}
+
 function rememberPreferredNodeModules(
   source: string,
   linkTarget: { nodeModulesPath?: string },
@@ -1136,14 +1193,32 @@ export class Job {
     identity: SandboxJobIdentity,
     deadlineAt: number,
   ): Promise<void> {
+    /* `--registry` constrains the specs WE pass; it does not constrain what a
+     * package on that registry asks for. npm resolves a transitive
+     * `"dep": "git+https://..."` or a bare tarball URL by fetching it, so a
+     * selected package could pull code from a host the operator never
+     * configured -- past both CODEAPI_DEPENDENCY_NPM_REGISTRY and the no-URLs
+     * rule the spec grammar enforces on user input. npm has no config that
+     * forbids this, so the tree is verified after the fact instead: a manifest
+     * in the prefix makes npm record a `resolved` URL per package, and
+     * assertRegistryOnlyTree rejects any that did not come from the configured
+     * registry. --ignore-scripts means nothing has executed at that point, so
+     * failing here is still before any of it can matter. */
+    const manifestPath = path.join(depsDir, 'package.json');
+    const lockPath = path.join(depsDir, 'package-lock.json');
+    await fsp.writeFile(
+      manifestPath,
+      JSON.stringify({ name: 'codeapi-job-deps', version: '0.0.0', private: true }) + '\n',
+      { mode: 0o600 },
+    );
+    await applySandboxPathPermissionsNoFollow(manifestPath, identity, 0o400, 'file');
+
     const args = [
       'install',
       '--prefix', depsDir,
       '--ignore-scripts',
-      '--no-save',
       '--no-audit',
       '--no-fund',
-      '--no-package-lock',
       '--registry', config.dependency_npm_registry,
       '--',
       ...npmSpecs,
@@ -1152,13 +1227,23 @@ export class Job {
     if (!this.isSynthetic) {
       this.log.info({ count: npmSpecs.length }, 'Installing npm dependencies');
     }
-    await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, deadlineAt, {
-      /* npm writes its cache and any temp state relative to these; point both
-       * inside the per-job dir so nothing lands in the runner's HOME and
-       * concurrent jobs cannot collide in a shared cache. */
-      npm_config_cache: path.join(depsDir, '.npm-cache'),
-      npm_config_update_notifier: 'false',
-    });
+    try {
+      await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, deadlineAt, {
+        /* npm writes its cache and any temp state relative to these; point both
+         * inside the per-job dir so nothing lands in the runner's HOME and
+         * concurrent jobs cannot collide in a shared cache. */
+        npm_config_cache: path.join(depsDir, '.npm-cache'),
+        npm_config_update_notifier: 'false',
+      });
+      assertRegistryOnlyTree(
+        await fsp.readFile(lockPath, 'utf8').catch(() => ''),
+        config.dependency_npm_registry,
+      );
+    } finally {
+      // Neither belongs in the read-only tree the jail sees.
+      await fsp.rm(lockPath, { force: true }).catch(() => {});
+      await fsp.rm(manifestPath, { force: true }).catch(() => {});
+    }
   }
 
   /**
@@ -2623,6 +2708,7 @@ export class Job {
           allowedHosts: config.sandbox_network_allowed_hosts,
           denyAllHosts: config.sandbox_network_deny_all_hosts,
           allowedPorts: config.sandbox_network_allowed_ports,
+          denyAllPorts: config.sandbox_network_deny_all_ports,
         },
         socketUid: identity.uid,
         socketGid: identity.gid,

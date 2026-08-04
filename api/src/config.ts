@@ -1,4 +1,4 @@
-import { parseAllowedHostsConfig, parseAllowedPorts } from './net-policy';
+import { parseAllowedHostsConfig, parseAllowedPortsConfig } from './net-policy';
 
 type LimitOverrides = Record<string, Record<string, number> | undefined>;
 
@@ -10,6 +10,21 @@ function parseLimitOverrides(raw: string): LimitOverrides {
   } catch {
     return {};
   }
+}
+
+/**
+ * Parses a boolean env var, treating blank the same as unset.
+ *
+ * That distinction is the whole point: compose forwards `${VAR:-}`, so an unset
+ * knob reaches the process as an empty string, not undefined. Comparing
+ * `(raw ?? 'true') === 'true'` therefore read blank as an explicit "not true"
+ * and silently flipped every default-on flag OFF for compose deployments that
+ * left it alone.
+ */
+export function envFlag(raw: string | undefined, fallback: boolean): boolean {
+  const value = raw?.trim();
+  if (value === undefined || value.length === 0) return fallback;
+  return value === 'true';
 }
 
 /**
@@ -31,6 +46,7 @@ const requireExecutionManifest = (
 ) === 'true';
 const sandboxStartedAtSeconds = Math.floor(Date.now() / 1000);
 const sandboxNetAllowedHosts = parseAllowedHostsConfig(process.env.SANDBOX_NET_ALLOWED_HOSTS);
+const sandboxNetAllowedPorts = parseAllowedPortsConfig(process.env.SANDBOX_NET_ALLOWED_PORTS, [80, 443]);
 
 function cleanDirectory(raw: string | undefined): string | undefined {
   if (!raw?.trim()) return undefined;
@@ -53,8 +69,8 @@ export const config = {
   packages_directory: cleanDirectory(process.env.SANDBOX_PACKAGES_DIRECTORY)
     ?? legacyPackagesDirectory(process.env.SANDBOX_DATA_DIRECTORY)
     ?? '/pkgs',
-  disable_networking: (process.env.SANDBOX_DISABLE_NETWORKING ?? 'true') === 'true',
-  use_cgroupv2: (process.env.SANDBOX_USE_CGROUPV2 ?? 'true') === 'true',
+  disable_networking: envFlag(process.env.SANDBOX_DISABLE_NETWORKING, true),
+  use_cgroupv2: envFlag(process.env.SANDBOX_USE_CGROUPV2, true),
   allowed_local_network_port: Number(process.env.SANDBOX_ALLOWED_LOCAL_NETWORK_PORT ?? 0),
   output_max_size: Number(process.env.SANDBOX_OUTPUT_MAX_SIZE ?? 1024),
   max_process_count: Number(process.env.SANDBOX_MAX_PROCESS_COUNT ?? 64),
@@ -67,7 +83,7 @@ export const config = {
   compile_memory_limit: Number(process.env.SANDBOX_COMPILE_MEMORY_LIMIT ?? -1),
   run_memory_limit: Number(process.env.SANDBOX_RUN_MEMORY_LIMIT ?? -1),
   max_concurrent_jobs: safeInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS, 8),
-  per_job_uids: (process.env.SANDBOX_PER_JOB_UIDS ?? 'true') === 'true',
+  per_job_uids: envFlag(process.env.SANDBOX_PER_JOB_UIDS, true),
   job_uid_base: safeInt(process.env.SANDBOX_JOB_UID_BASE, 200000),
   job_gid_base: safeInt(process.env.SANDBOX_JOB_GID_BASE, 200000),
   job_uid_count: safeInt(
@@ -125,7 +141,8 @@ export const config = {
    * allowlist". Startup refuses this too; both halves are kept so neither is
    * load-bearing on its own. */
   sandbox_network_deny_all_hosts: sandboxNetAllowedHosts.denyAll,
-  sandbox_network_allowed_ports: parseAllowedPorts(process.env.SANDBOX_NET_ALLOWED_PORTS, [80, 443]),
+  sandbox_network_allowed_ports: sandboxNetAllowedPorts.ports,
+  sandbox_network_deny_all_ports: sandboxNetAllowedPorts.denyAll,
   sandbox_network_max_bytes: safeInt(process.env.SANDBOX_NET_MAX_BYTES, 268435456),
   sandbox_network_max_requests: safeInt(process.env.SANDBOX_NET_MAX_REQUESTS, 512),
   sandbox_network_max_connections: safeInt(process.env.SANDBOX_NET_MAX_CONNECTIONS, 32),
@@ -140,8 +157,14 @@ export const config = {
    * already-working job installs. Set false to accept bare names and ranges and
    * let pip resolve the version — far friendlier for an LLM, which rarely knows
    * real version numbers and will otherwise pin one that does not exist, at the
-   * cost of both of those properties. */
-  dependency_require_pinned: (process.env.CODEAPI_DEPENDENCY_REQUIRE_PINNED ?? 'true') === 'true',
+   * cost of both of those properties.
+   *
+   * envFlag (not `??`): compose forwards `${VAR:-}`, so an unset knob arrives
+   * as an empty string rather than undefined. With `??` that blank counted as
+   * an explicit "not true" and silently turned pinning OFF for every Compose
+   * deployment that left it alone — the opposite of the documented default and
+   * of the security posture. Same reason the index URL above uses `||`. */
+  dependency_require_pinned: envFlag(process.env.CODEAPI_DEPENDENCY_REQUIRE_PINNED, true),
   dependency_install_timeout_ms: safeInt(process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS, 120000),
   dependency_max_bytes: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_BYTES, 262144000),
   require_execution_manifest: requireExecutionManifest,

@@ -35,6 +35,11 @@ export interface NetPolicy {
    * half of the same guarantee. */
   denyAllHosts?: boolean;
   allowedPorts: number[];
+  /** Deny every port regardless of `allowedPorts`. Set when the operator
+   * configured SANDBOX_NET_ALLOWED_PORTS but no entry parsed; the alternative
+   * is falling back to the 80,443 default, which would widen a policy written
+   * to narrow it. Startup refuses this configuration too. */
+  denyAllPorts?: boolean;
 }
 
 export type PolicyVerdict = { allowed: true } | { allowed: false; reason: string };
@@ -139,6 +144,7 @@ export function checkHost(host: string, policy: NetPolicy): PolicyVerdict {
 
 export function checkPort(port: number, policy: NetPolicy): PolicyVerdict {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return deny('invalid port');
+  if (policy.denyAllPorts) return deny('SANDBOX_NET_ALLOWED_PORTS contained no usable entries');
   if (!policy.allowedPorts.includes(port)) return deny(`port ${port} is not in SANDBOX_NET_ALLOWED_PORTS`);
   return ALLOW;
 }
@@ -587,17 +593,43 @@ export function parseAllowedHosts(raw: string | undefined): string[] {
   return parseAllowedHostsConfig(raw).hosts;
 }
 
-/** Parse SANDBOX_NET_ALLOWED_PORTS; falls back to the given default when the
- * value is absent or contains nothing usable. */
-export function parseAllowedPorts(raw: string | undefined, fallback: number[]): number[] {
-  if (!raw) return [...fallback];
+export interface AllowedPortsConfig {
+  ports: number[];
+  /** The operator configured a port list, but not one entry parsed. */
+  denyAll: boolean;
+}
+
+/**
+ * Parse SANDBOX_NET_ALLOWED_PORTS.
+ *
+ * Absent means the caller's default. Configured-but-unusable ('443/tcp',
+ * 'https') is NOT the default: falling back there would open the standard ports
+ * on the strength of a typo in a policy meant to narrow them. Reported the same
+ * way {@link parseAllowedHostsConfig} reports it, and refused at startup.
+ */
+export function parseAllowedPortsConfig(
+  raw: string | undefined,
+  fallback: number[],
+): AllowedPortsConfig {
+  if (!raw) return { ports: [...fallback], denyAll: false };
   const out: number[] = [];
+  let sawEntry = false;
   for (const piece of raw.split(',')) {
     const entry = piece.trim();
     if (entry.length === 0) continue;
+    sawEntry = true;
     if (!/^[0-9]{1,5}$/.test(entry)) continue;
     const port = Number(entry);
     if (port >= 1 && port <= 65535 && !out.includes(port)) out.push(port);
   }
-  return out.length > 0 ? out : [...fallback];
+  if (out.length > 0) return { ports: out, denyAll: false };
+  if (sawEntry) return { ports: [], denyAll: true };
+  return { ports: [...fallback], denyAll: false };
+}
+
+/** The port list alone. Prefer {@link parseAllowedPortsConfig} where the
+ * "configured but unusable" case has to be distinguished. */
+export function parseAllowedPorts(raw: string | undefined, fallback: number[]): number[] {
+  const parsed = parseAllowedPortsConfig(raw, fallback);
+  return parsed.denyAll ? [] : parsed.ports;
 }

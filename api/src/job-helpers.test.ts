@@ -1,4 +1,4 @@
-import { describe, it, expect, mock } from 'bun:test';
+import { describe, it, test, expect, mock } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -7,6 +7,8 @@ import {
   isNormalizedObjectForSession,
   markerConflictsWithExplicitFile,
   aggregateBashExtras,
+  assertRegistryOnlyTree,
+  bakedNodeModulesFor,
   ensureNodeModulesSymlink,
   isHiddenDirectory,
   inputsLiveUnder,
@@ -647,5 +649,74 @@ describe('tarLongNameOverheadBytes', () => {
     expect(tarLongNameOverheadBytes('あ'.repeat(40))).toBeGreaterThan(0);
     // 30 * 3-byte chars = 90 bytes <= 100 -> fits.
     expect(tarLongNameOverheadBytes('あ'.repeat(30))).toBe(0);
+  });
+});
+
+describe('assertRegistryOnlyTree', () => {
+  const REGISTRY = 'https://registry.npmjs.org';
+  const lock = (packages: Record<string, unknown>): string => JSON.stringify({ packages });
+
+  test('accepts a tree that came entirely from the configured registry', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': { name: 'codeapi-job-deps' },
+      'node_modules/left-pad': { resolved: 'https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz' },
+      'node_modules/ms': { resolved: 'https://registry.npmjs.org/ms/-/ms-2.1.3.tgz' },
+    }), REGISTRY)).not.toThrow();
+  });
+
+  test('refuses a transitive git dependency', () => {
+    /* `--registry` only routes the specs we pass. A package on the registry can
+     * still declare `"dep": "git+https://..."`, and npm fetches it. */
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/ok': { resolved: 'https://registry.npmjs.org/ok/-/ok-1.0.0.tgz' },
+      'node_modules/sneaky': { resolved: 'git+ssh://git@github.com/attacker/pkg.git#deadbeef' },
+    }), REGISTRY)).toThrow(/sneaky/);
+  });
+
+  test('refuses a tarball from another host', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/sneaky': { resolved: 'https://evil.example.com/pkg.tgz' },
+    }), REGISTRY)).toThrow(/evil.example.com/);
+  });
+
+  test('refuses a package whose source was not recorded', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/mystery': {},
+    }), REGISTRY)).toThrow(/cannot be verified/);
+  });
+
+  test('refuses a local link', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/linked': { link: true, resolved: 'file:../elsewhere' },
+    }), REGISTRY)).toThrow(/local link/);
+  });
+
+  test('allows a bundled dependency, which rode inside a checked tarball', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/parent': { resolved: 'https://registry.npmjs.org/parent/-/parent-1.0.0.tgz' },
+      'node_modules/parent/node_modules/child': { inBundle: true },
+    }), REGISTRY)).not.toThrow();
+  });
+
+  test('honours a self-hosted registry', () => {
+    const internal = 'https://npm.corp.internal/repo';
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.internal/repo/pkg/-/pkg-1.0.0.tgz' },
+    }), internal)).not.toThrow();
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz' },
+    }), internal)).toThrow(/registry.npmjs.org/);
+  });
+
+  test('refuses an install that produced no lockfile to check', () => {
+    expect(() => assertRegistryOnlyTree('', REGISTRY)).toThrow(/no readable lockfile/);
+    expect(() => assertRegistryOnlyTree('{}', REGISTRY)).toThrow(/no readable lockfile/);
   });
 });

@@ -12,6 +12,7 @@ import {
   parseAllowedHosts,
   parseAllowedHostsConfig,
   parseAllowedPorts,
+  parseAllowedPortsConfig,
   parseIpv4,
   parseIpv6,
   verifyPinnedAddress,
@@ -215,11 +216,28 @@ describe('config parsing', () => {
     expect(parseAllowedHosts('nonsense')).toEqual([]);
   });
 
-  test('parseAllowedPorts falls back when nothing usable is configured', () => {
+  test('parseAllowedPorts uses the default only when nothing was configured', () => {
     expect(parseAllowedPorts('443, 80', [80])).toEqual([443, 80]);
-    expect(parseAllowedPorts('abc', [80, 443])).toEqual([80, 443]);
     expect(parseAllowedPorts(undefined, [80, 443])).toEqual([80, 443]);
-    expect(parseAllowedPorts('0, 70000', [443])).toEqual([443]);
+    expect(parseAllowedPorts('', [80, 443])).toEqual([80, 443]);
+    /* Configured-but-unusable is NOT the default: falling back would open 80
+     * and 443 on the strength of a typo in a policy written to narrow them. */
+    expect(parseAllowedPorts('abc', [80, 443])).toEqual([]);
+    expect(parseAllowedPorts('0, 70000', [443])).toEqual([]);
+  });
+
+  test('parseAllowedPortsConfig reports a port list that parsed to nothing', () => {
+    expect(parseAllowedPortsConfig('443/tcp', [80, 443])).toEqual({ ports: [], denyAll: true });
+    expect(parseAllowedPortsConfig('https', [80, 443])).toEqual({ ports: [], denyAll: true });
+    expect(parseAllowedPortsConfig(undefined, [80, 443])).toEqual({ ports: [80, 443], denyAll: false });
+    expect(parseAllowedPortsConfig('  ', [80, 443])).toEqual({ ports: [80, 443], denyAll: false });
+    expect(parseAllowedPortsConfig('8443, junk', [80])).toEqual({ ports: [8443], denyAll: false });
+  });
+
+  test('checkPort denies everything when the port list parsed to nothing', () => {
+    const broken: NetPolicy = { allowedHosts: [], allowedPorts: [], denyAllPorts: true };
+    expect(checkPort(443, broken).allowed).toBe(false);
+    expect(checkPort(80, broken).allowed).toBe(false);
   });
 });
 

@@ -97,7 +97,7 @@ function forbiddenEnvNames(): string[] {
  * is supported again — the AF_INET block is now unconditional.
  */
 export function validateSandboxNetworkStartup(
-  opts: { enabled?: boolean; binaryPath?: string; denyAllHosts?: boolean } = {},
+  opts: { enabled?: boolean; binaryPath?: string; denyAllHosts?: boolean; denyAllPorts?: boolean } = {},
 ): void {
   const enabled = opts.enabled ?? config.allow_sandbox_network;
   const binaryPath = opts.binaryPath ?? NET_SHIM_LIBRARY;
@@ -120,6 +120,14 @@ export function validateSandboxNetworkStartup(
     throw new SandboxSecureStartupError(
       'SANDBOX_NET_ALLOWED_HOSTS is set but no entry is a valid host or *.host pattern; ' +
         "fix the entries, or set it to '*' (or leave it unset) to allow any publicly routable host",
+    );
+  }
+
+  const denyAllPorts = opts.denyAllPorts ?? config.sandbox_network_deny_all_ports;
+  if (denyAllPorts) {
+    throw new SandboxSecureStartupError(
+      'SANDBOX_NET_ALLOWED_PORTS is set but no entry is a valid port number; ' +
+        'fix the entries, or leave it unset to allow the default 80,443',
     );
   }
 }

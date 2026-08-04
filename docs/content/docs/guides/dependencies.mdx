@@ -91,6 +91,13 @@ The properties that matter:
   size gets OOM-killed by. The trusted runner has none of those limits.
 - **The sandbox gains no new capability.** Only the trusted runner reaches the
   index (`CODEAPI_DEPENDENCY_INDEX_URL` / `CODEAPI_DEPENDENCY_NPM_REGISTRY`).
+- **Everything installed came from your registry, transitively.** `--registry`
+  only routes the specs the runner passes; a package on the registry is free to
+  declare a dependency as a git or tarball URL, and npm would fetch it. npm has
+  no setting that forbids that, so the resolved tree is verified afterwards
+  instead — every package must record a source under
+  `CODEAPI_DEPENDENCY_NPM_REGISTRY`, or the job fails before it runs. Combined
+  with `--ignore-scripts`, nothing from an unapproved host has executed.
 - **No install-time code executes.** `pip --only-binary=:all:` means wheels
   only, so no `setup.py` runs; `npm --ignore-scripts` is the exact counterpart,
   refusing `preinstall`/`install`/`postinstall` hooks. This is the single most

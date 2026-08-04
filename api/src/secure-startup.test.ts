@@ -221,4 +221,14 @@ describe('validateSandboxNetworkStartup', () => {
       denyAllHosts: false,
     })).not.toThrow();
   });
+
+  test('refuses a port list that parsed to nothing', () => {
+    // '443/tcp' or 'https' would otherwise fall back to the 80,443 default,
+    // widening a policy that was written to narrow it.
+    expect(() => validateSandboxNetworkStartup({
+      enabled: true,
+      binaryPath: process.execPath,
+      denyAllPorts: true,
+    })).toThrow('SANDBOX_NET_ALLOWED_PORTS');
+  });
 });

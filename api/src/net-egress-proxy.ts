@@ -116,7 +116,10 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_CONNECTION_RATE_BURST = 64;
 const DEFAULT_CONNECTION_RATE_REFILL_PER_SEC = 20;
-const MAX_RESOLVED_ADDRESSES = 8;
+/* Every answer is screened, so this is only a sanity bound on how long a list
+ * an attacker-controlled name may make us walk. Well above what any real
+ * round-robin returns. */
+const MAX_SCREENED_ADDRESSES = 64;
 const LISTEN_BACKLOG = 16;
 
 /* TRACE and TRACK are reflection primitives; CONNECT is handled separately.
@@ -586,11 +589,23 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
     if (approved.isConnect) {
       client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     } else {
-      socket.write(buildUpstreamHead(approved));
+      /* The rebuilt head carries the job's own path and headers upstream, so it
+       * is data leaving the sandbox and belongs in the byte budget. Counting
+       * only bodies let a job spend the head limit per request for free. */
+      const upstreamHead = buildUpstreamHead(approved);
+      stats.bytesUp += Buffer.byteLength(upstreamHead);
+      socket.write(upstreamHead);
     }
     if (body.length > 0) {
       bodyForwarded += body.length;
       stats.bytesUp += body.length;
+      /* Same budget check the streaming path applies. A client that coalesced
+       * its body with the head arrives here instead of in 'data', and without
+       * this it got one free body past an exhausted budget. */
+      if (budgetExhausted()) {
+        onOverrun('per-job byte budget exhausted');
+        return;
+      }
       forwardUp(body);
     }
     body = Buffer.alloc(0);
@@ -846,8 +861,18 @@ async function resolveAndScreen(
     throw new RequestRejected(502, 'DNS lookup failed');
   }
   if (results.length === 0) throw new RequestRejected(502, 'DNS lookup returned no addresses');
-  if (results.length > MAX_RESOLVED_ADDRESSES) results = results.slice(0, MAX_RESOLVED_ADDRESSES);
+  /* Refuse an answer set too large to be a real one rather than truncating it.
+   * Screening is pure and cheap, so the only reason for a bound here is to stop
+   * an attacker-controlled name from making us parse an unbounded list. */
+  if (results.length > MAX_SCREENED_ADDRESSES) {
+    throw new RequestRejected(502, 'DNS lookup returned an implausible number of addresses');
+  }
 
+  /* Screen EVERY answer before picking one. Truncating to the first
+   * MAX_RESOLVED_ADDRESSES first would have dropped a private answer sitting at
+   * position nine, and the request would then be allowed on the strength of the
+   * eight in front of it — exactly the split-horizon case the whole-set rule
+   * exists for. */
   for (const result of results) {
     const blocked = screen(result.address);
     if (blocked !== null) {

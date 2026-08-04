@@ -502,6 +502,67 @@ describe('createNetEgressProxy', () => {
     expect(origin.received().toString('latin1')).toBe('not-tls-at-all');
   });
 
+  test('screens every DNS answer instead of truncating the list first', async () => {
+    /* A private address parked past the truncation point used to be dropped
+     * before the address gate ran, and the eight public answers in front of it
+     * carried the request. */
+    const answers = Array.from({ length: 8 }, (_, i) => ({ address: `93.184.216.${i + 1}`, family: 4 }));
+    answers.push({ address: '10.0.0.5', family: 4 });
+    const sock = await startProxy(1, { lookup: async () => answers });
+
+    const response = await proxyRequest(sock, 'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n');
+    expect(response).toContain('403');
+  });
+
+  test('refuses an implausibly large DNS answer set rather than walking it', async () => {
+    const answers = Array.from({ length: 200 }, (_, i) => ({ address: `93.184.${i}.1`, family: 4 }));
+    const sock = await startProxy(1, { lookup: async () => answers });
+
+    const response = await proxyRequest(sock, 'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n');
+    expect(response).toContain('502');
+  });
+
+  test('counts the forwarded request head against the per-job byte budget', async () => {
+    const origin = await startOrigin((_req, res) => res.end('ok'));
+    closers.push(origin.close);
+    const sock = socketPath();
+    const handle = await createNetEgressProxy({
+      socketPath: sock,
+      policy: OPEN,
+      addressScreen: () => null,
+      lookup: async () => [{ address: '127.0.0.1', family: 4 }],
+      connect: () => net.connect({ host: '127.0.0.1', port: origin.port }),
+    } as Parameters<typeof createNetEgressProxy>[0]);
+    closers.push(handle.close);
+
+    await proxyRequest(sock, 'GET http://example.com/some/path HTTP/1.1\r\nHost: example.com\r\n\r\n');
+
+    /* The path and headers leave the sandbox just like a body does. Counting
+     * only bodies let a job spend the head limit per request for free. */
+    expect(handle.stats().bytesUp).toBeGreaterThan(0);
+  });
+
+  test('a coalesced body is refused once the byte budget is gone', async () => {
+    const origin = await startOrigin((req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => res.end('ok'));
+    });
+    closers.push(origin.close);
+    // Budget smaller than the head alone, so it is exhausted by the time the
+    // coalesced body would be forwarded.
+    const sock = await startDataPathProxy(origin.port, { maxTotalBytes: 16 });
+
+    const body = 'x'.repeat(2048);
+    const response = await proxyRequest(
+      sock,
+      'POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\n'
+        + `Content-Length: ${body.length}\r\n\r\n${body}`,
+      { keepOpenMs: 200 },
+    );
+
+    expect(response).not.toContain('200 OK');
+  });
+
   test('creates the socket with 0600 so only the job UID can connect', async () => {
     const sock = await startProxy(1);
     expect(fs.statSync(sock).mode & 0o777).toBe(0o600);
