@@ -84,8 +84,22 @@ The proxy's rules, in order:
 
 Because it is a forward proxy, redirects are **not** followed by the proxy: a
 3xx goes back to the client, which issues a fresh request that runs the full
-gate again. HTTPS is an opaque `CONNECT` tunnel — the proxy never terminates
+gate again. HTTPS rides an opaque `CONNECT` tunnel — the proxy never terminates
 TLS, so there is no certificate handling and no interception surface.
+
+<Callout type="info">
+  **With `SANDBOX_NET_ALLOWED_HOSTS` set, the tunnel is bound to its SNI.** The
+  `CONNECT` authority is the name the host gate approved, but a server decides
+  which virtual host you reach from the TLS SNI — and an allowlisted name on a
+  CDN or shared host usually shares its address with many others. So when an
+  allowlist is in force the proxy reads the SNI out of the first ClientHello
+  (read-only; still no TLS termination) and runs the same host gate on it.
+  A tunnel that opens with something other than a ClientHello is closed, since
+  there is nothing to bind it to.
+
+  With no allowlist this does not apply: the policy is already "any publicly
+  routable address", so the tunnel stays fully opaque and carries any protocol.
+</Callout>
 
 ## Why the shim exists instead of a loopback listener
 

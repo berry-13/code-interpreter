@@ -205,6 +205,13 @@ const NETWORK_PROXY_ENV: Record<string, string> = {
   https_proxy: NET_PROXY_URL,
   NO_PROXY: '',
   no_proxy: '',
+  /* Node's built-in fetch() is the one client that ignores the variables above
+   * unless it is told to read them (`node --use-env-proxy`, or this variable).
+   * Without it a `fetch()` in a JS job dials the destination directly, the
+   * seccomp AF_INET rule refuses the syscall, and the documented JavaScript
+   * flow fails while curl and python in the same jail work. Harmless on
+   * runtimes that do not know the variable. */
+  NODE_USE_ENV_PROXY: '1',
 };
 
 export { SIGNALS };
@@ -227,7 +234,11 @@ function readBaseConfig(): string {
  * embedded backslashes and double-quotes defensively in case future
  * callers pass arbitrary paths in. The cfg syntax is C-like so only those
  * two characters need escaping inside a string literal. */
-export function renderJobConfigOverlay(submissionDir: string, depsDir?: string): string {
+export function renderJobConfigOverlay(
+  submissionDir: string,
+  depsDir?: string,
+  bakedNodeModulesDir?: string,
+): string {
   const escaped = submissionDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const lines = [
     '',
@@ -266,6 +277,27 @@ export function renderJobConfigOverlay(submissionDir: string, depsDir?: string):
     );
   }
 
+  if (bakedNodeModulesDir) {
+    const escapedBaked = bakedNodeModulesDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    lines.push(
+      '# The runtime\'s baked node_modules, one directory above the workspace.',
+      '# When a job installs its own npm packages, /mnt/data/node_modules points',
+      '# at /mnt/deps/node_modules so the declared versions win; Node then walks',
+      '# up and finds the baked set here. NODE_PATH cannot do this job: ESM',
+      '# resolution ignores it entirely, and for CommonJS it is searched AFTER',
+      '# the workspace, which is the wrong precedence.',
+      'mount {',
+      `    src: "${escapedBaked}"`,
+      '    dst: "/mnt/node_modules"',
+      '    is_bind: true',
+      '    rw: false',
+      '    nosuid: true',
+      '    nodev: true',
+      '}',
+      '',
+    );
+  }
+
   return lines.join('\n');
 }
 
@@ -283,6 +315,10 @@ interface ExecuteOptions {
   enableToolCallSocket?: boolean;
   suppressSuccessLogs?: boolean;
   depsDir?: string;
+  /** Runtime's baked node_modules, bound at /mnt/node_modules so it stays
+   * resolvable when the workspace's node_modules is redirected to the per-job
+   * install. Only set when the job installed npm packages. */
+  bakedNodeModulesDir?: string;
   /** Per-job net-egress-proxy socket; enables sandbox networking when set. */
   netSocketPath?: string;
 }
@@ -302,13 +338,18 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     enableToolCallSocket,
     suppressSuccessLogs,
     depsDir,
+    bakedNodeModulesDir,
     netSocketPath,
   } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
   const cfgPath = `/tmp/nsjail-${logId}.cfg`;
 
-  fs.writeFileSync(cfgPath, readBaseConfig() + renderJobConfigOverlay(submissionDir, depsDir), { mode: 0o600 });
+  fs.writeFileSync(
+    cfgPath,
+    readBaseConfig() + renderJobConfigOverlay(submissionDir, depsDir, bakedNodeModulesDir),
+    { mode: 0o600 },
+  );
 
   const nsjailArgs = buildArgs({
     logPath,

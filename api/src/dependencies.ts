@@ -233,7 +233,7 @@ export function resolveDependencies(
   opts: {
     allow: boolean;
     maxCount: number;
-    declared?: { pip?: string[]; npm?: string[] };
+    declared?: { pip?: string[]; npm?: string[]; unsupported?: string[] };
     requirePinned?: boolean;
     defaultManager?: PackageManager;
   },
@@ -251,9 +251,17 @@ export function resolveDependencies(
   const pip = Array.from(new Set([...declaredOf('pip'), ...parsed.pip]));
   const npm = Array.from(new Set([...declaredOf('npm'), ...parsed.npm]));
 
-  if (parsed.unsupported.length > 0) {
+  /* The service's list matters as much as ours: when it wrapped the code for a
+   * persistent session, `sources` is a base64 blob and `parsed.unsupported` is
+   * necessarily empty, so a `requirements(cargo):` header would run as an
+   * ordinary job instead of producing the promised error. */
+  const declaredUnsupported = Array.isArray(opts.declared?.unsupported)
+    ? opts.declared.unsupported.filter(s => typeof s === 'string' && s.length > 0)
+    : [];
+  const unsupported = Array.from(new Set([...declaredUnsupported, ...parsed.unsupported]));
+  if (unsupported.length > 0) {
     fail(
-      `requirements(${parsed.unsupported[0]}) is not supported; ` +
+      `requirements(${unsupported[0]}) is not supported; ` +
         'the available package managers are pip and npm',
     );
   }
@@ -261,6 +269,16 @@ export function resolveDependencies(
 
   if (!opts.allow) {
     fail('dynamic dependencies are disabled (set CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES=true to enable)');
+  }
+
+  /* One budget for the job, not one per manager. A mixed bash job declaring
+   * both would otherwise get 2x the configured fan-out, and the limit is there
+   * to bound install work for the whole job. Counted after de-duplication so
+   * repeating a spec cannot inflate it. */
+  if (pip.length + npm.length > opts.maxCount) {
+    fail(
+      `dependencies across pip and npm exceed the maximum of ${opts.maxCount} packages`,
+    );
   }
 
   const limits = { maxCount: opts.maxCount, requirePinned: opts.requirePinned };

@@ -70,4 +70,24 @@ describe('createPayload requirements extraction', () => {
       (env as { PERSIST_SESSIONS: boolean }).PERSIST_SESSIONS = original;
     }
   });
+
+  /* Same reasoning for the error case: an unsupported manager is only ever
+   * visible in the original source, so if it does not ride along in the
+   * payload the sandbox has nothing to report and the job just runs. */
+  test('forwards an unsupported manager so the sandbox can reject the job', () => {
+    expect(build('# requirements(cargo): serde\nprint(1)').dependencies)
+      .toEqual({ unsupported: ['cargo'] });
+  });
+
+  test('forwards an unsupported manager alongside supported ones', () => {
+    expect(build('# requirements: cowsay==6.1\n# requirements(gem): rails\n').dependencies)
+      .toEqual({ pip: ['cowsay==6.1'], unsupported: ['gem'] });
+  });
+
+  test('keeps a comma that belongs to a version specifier or an extras list', () => {
+    expect(build('# requirements: pandas>=2,<3\n').dependencies)
+      .toEqual({ pip: ['pandas>=2,<3'] });
+    expect(build('# requirements: requests[socks,security], cowsay\n').dependencies)
+      .toEqual({ pip: ['requests[socks,security]', 'cowsay'] });
+  });
 });

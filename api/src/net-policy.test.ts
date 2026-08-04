@@ -6,7 +6,11 @@ import {
   checkPort,
   isIpLiteral,
   normalizeHost,
+  checkTunnelSni,
+  hostAllowlistInForce,
+  inspectClientHelloSni,
   parseAllowedHosts,
+  parseAllowedHostsConfig,
   parseAllowedPorts,
   parseIpv4,
   parseIpv6,
@@ -224,5 +228,146 @@ describe('isIpLiteral', () => {
     expect(isIpLiteral('1.2.3.4')).toBe(true);
     expect(isIpLiteral('::1')).toBe(true);
     expect(isIpLiteral('example.com')).toBe(false);
+  });
+});
+
+describe('an allowlist that parses to nothing', () => {
+  test('is reported as deny-all rather than as no allowlist', () => {
+    expect(parseAllowedHostsConfig('api.example.com/v1')).toEqual({ hosts: [], denyAll: true });
+    expect(parseAllowedHostsConfig('nonsense, also nonsense')).toEqual({ hosts: [], denyAll: true });
+    // Deliberately open, and genuinely unset, stay open.
+    expect(parseAllowedHostsConfig('*')).toEqual({ hosts: [], denyAll: false });
+    expect(parseAllowedHostsConfig(undefined)).toEqual({ hosts: [], denyAll: false });
+    expect(parseAllowedHostsConfig('   ')).toEqual({ hosts: [], denyAll: false });
+    // One good entry is a narrow policy, not an unusable one.
+    expect(parseAllowedHostsConfig('bad/entry, ok.example.com'))
+      .toEqual({ hosts: ['ok.example.com'], denyAll: false });
+  });
+
+  test('denies every host at runtime instead of allowing all public ones', () => {
+    const broken: NetPolicy = { allowedHosts: [], denyAllHosts: true, allowedPorts: [443] };
+    expect(checkHost('example.com', broken).allowed).toBe(false);
+    expect(checkHost('api.github.com', broken).allowed).toBe(false);
+    // The same empty list without the flag is the documented "no allowlist".
+    expect(checkHost('example.com', OPEN).allowed).toBe(true);
+  });
+
+  test('counts as an allowlist being in force', () => {
+    expect(hostAllowlistInForce(OPEN)).toBe(false);
+    expect(hostAllowlistInForce(LISTED)).toBe(true);
+    expect(hostAllowlistInForce({ allowedHosts: [], denyAllHosts: true, allowedPorts: [443] })).toBe(true);
+  });
+});
+
+describe('IPv6 is gated on global unicast, not a denylist', () => {
+  test('refuses reserved space a prefix list would miss', () => {
+    // The one that motivated this: site-local still routes on legacy networks.
+    expect(blockedAddressReason('fec0::1')).not.toBeNull();
+    for (const ip of ['4000::1', '8000::1', 'c000::1', '0200::1', '1000::1']) {
+      expect(blockedAddressReason(ip)).not.toBeNull();
+    }
+  });
+
+  test('still allows real global unicast', () => {
+    expect(blockedAddressReason('2606:4700:4700::1111')).toBeNull();
+    expect(blockedAddressReason('2a00:1450:4001:81f::200e')).toBeNull();
+    // 3ffe::/16 was the 6bone and is ordinary global unicast again.
+    expect(blockedAddressReason('3ffe::1')).toBeNull();
+    expect(blockedAddressReason('3000::1')).toBeNull();
+  });
+
+  test('keeps refusing the carve-outs inside 2000::/3', () => {
+    for (const ip of ['2001:db8::1', '2001::1', '2002:c0a8:0101::1', '2001:1::1', '3fff::1']) {
+      expect(blockedAddressReason(ip)).not.toBeNull();
+    }
+  });
+});
+
+/** Minimal well-formed ClientHello carrying `sni` (or none when null). */
+function clientHello(sni: string | null): Buffer {
+  const extensions: Buffer[] = [];
+  if (sni !== null) {
+    const name = Buffer.from(sni, 'latin1');
+    const entry = Buffer.concat([Buffer.from([0x00]), sizeOf(name.length), name]);
+    const list = Buffer.concat([sizeOf(entry.length), entry]);
+    extensions.push(Buffer.concat([Buffer.from([0x00, 0x00]), sizeOf(list.length), list]));
+  }
+  const extensionBlock = Buffer.concat(extensions);
+  const body = Buffer.concat([
+    Buffer.from([0x03, 0x03]),          // legacy_version
+    Buffer.alloc(32),                    // random
+    Buffer.from([0x00]),                 // session_id (empty)
+    Buffer.from([0x00, 0x02, 0x13, 0x01]), // cipher_suites
+    Buffer.from([0x01, 0x00]),           // compression_methods
+    sizeOf(extensionBlock.length),
+    extensionBlock,
+  ]);
+  const handshake = Buffer.concat([
+    Buffer.from([0x01, (body.length >> 16) & 0xff, (body.length >> 8) & 0xff, body.length & 0xff]),
+    body,
+  ]);
+  return Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), sizeOf(handshake.length), handshake]);
+}
+
+function sizeOf(n: number): Buffer {
+  const out = Buffer.alloc(2);
+  out.writeUInt16BE(n);
+  return out;
+}
+
+describe('inspectClientHelloSni', () => {
+  test('reads the server name out of a ClientHello', () => {
+    expect(inspectClientHelloSni(clientHello('api.github.com')))
+      .toEqual({ status: 'ok', sni: 'api.github.com' });
+  });
+
+  test('reports no SNI when the extension is absent', () => {
+    expect(inspectClientHelloSni(clientHello(null))).toEqual({ status: 'ok', sni: null });
+  });
+
+  test('asks for more while the record is incomplete', () => {
+    const hello = clientHello('api.github.com');
+    expect(inspectClientHelloSni(hello.subarray(0, 3))).toEqual({ status: 'need-more' });
+    expect(inspectClientHelloSni(hello.subarray(0, hello.length - 1))).toEqual({ status: 'need-more' });
+  });
+
+  test('rejects bytes that are not a TLS handshake without buffering them', () => {
+    expect(inspectClientHelloSni(Buffer.from('GET / HTTP/1.1\r\n'))).toEqual({ status: 'not-tls' });
+    expect(inspectClientHelloSni(Buffer.from([0x16]))).toEqual({ status: 'need-more' });
+    expect(inspectClientHelloSni(Buffer.from([0x17, 0x03]))).toEqual({ status: 'not-tls' });
+  });
+
+  test('reports a truncated or lying record as malformed rather than guessing', () => {
+    const hello = clientHello('api.github.com');
+    const lying = Buffer.from(hello);
+    lying.writeUInt16BE(4, 3); // record claims 4 bytes of handshake
+    expect(inspectClientHelloSni(lying).status).toBe('malformed');
+  });
+});
+
+describe('checkTunnelSni', () => {
+  test('lets the tunnel through for the name it was authorized for', () => {
+    expect(checkTunnelSni('api.github.com', 'api.github.com', LISTED).allowed).toBe(true);
+  });
+
+  test('refuses a different name sharing the approved address', () => {
+    // The bypass: CONNECT to an allowlisted host on a CDN, then ask the server
+    // for a co-hosted name it never allowed.
+    const verdict = checkTunnelSni('evil.example.com', 'api.github.com', LISTED);
+    expect(verdict.allowed).toBe(false);
+  });
+
+  test('allows another name that the allowlist itself covers', () => {
+    expect(checkTunnelSni('files.pypi.org', 'api.github.com', LISTED).allowed).toBe(true);
+  });
+
+  test('requires SNI against a named authority and tolerates its absence for a literal', () => {
+    expect(checkTunnelSni(null, 'api.github.com', LISTED).allowed).toBe(false);
+    expect(checkTunnelSni(null, '93.184.216.34', LISTED).allowed).toBe(true);
+  });
+
+  test('refuses an SNI that is not a usable hostname', () => {
+    expect(checkTunnelSni('evil.com/path', 'api.github.com', LISTED).allowed).toBe(false);
+    expect(checkTunnelSni('', 'api.github.com', LISTED).allowed).toBe(false);
   });
 });

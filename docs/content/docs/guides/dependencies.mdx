@@ -98,9 +98,15 @@ The properties that matter:
   the *trusted* context, which would be far worse than anything the sandbox can
   do.
 - **The result is read-only to the sandbox.** The per-job directory is mounted
-  read-only on `PYTHONPATH` and `NODE_PATH`. It is executable — unlike
-  `/mnt/data` — which is why compiled extensions and native npm binaries load
-  from it and not from anything the sandbox can write.
+  read-only at `/mnt/deps`, on `PYTHONPATH` for Python and as the workspace's
+  `node_modules` for JavaScript. It is executable — unlike `/mnt/data` — which
+  is why compiled extensions and native npm binaries load from it and not from
+  anything the sandbox can write.
+- **Declared npm packages win over the baked ones.** `/mnt/data/node_modules`
+  points at the per-job install and the runtime's own packages answer from one
+  directory up, so Node's ordinary resolution finds a declared version first
+  and still falls back to the baked set. `NODE_PATH` alone cannot do this: ESM
+  `import` ignores it, and CommonJS consults it only *after* the workspace.
 - **The spec grammar is the boundary.** A spec can never begin with `-` (so it
   cannot become `--index-url` or `--registry`), can never be a URL, a git ref,
   or a filesystem path, and carries no whitespace. For npm that also rules out

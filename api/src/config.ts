@@ -1,4 +1,4 @@
-import { parseAllowedHosts, parseAllowedPorts } from './net-policy';
+import { parseAllowedHostsConfig, parseAllowedPorts } from './net-policy';
 
 type LimitOverrides = Record<string, Record<string, number> | undefined>;
 
@@ -30,6 +30,7 @@ const requireExecutionManifest = (
   ?? (egressGatewayUrl ? 'true' : 'false')
 ) === 'true';
 const sandboxStartedAtSeconds = Math.floor(Date.now() / 1000);
+const sandboxNetAllowedHosts = parseAllowedHostsConfig(process.env.SANDBOX_NET_ALLOWED_HOSTS);
 
 function cleanDirectory(raw: string | undefined): string | undefined {
   if (!raw?.trim()) return undefined;
@@ -119,7 +120,11 @@ export const config = {
    * special-purpose ranges are refused unconditionally and cannot be opened
    * up by configuration. */
   allow_sandbox_network: process.env.CODEAPI_ALLOW_SANDBOX_NETWORK === 'true',
-  sandbox_network_allowed_hosts: parseAllowedHosts(process.env.SANDBOX_NET_ALLOWED_HOSTS),
+  sandbox_network_allowed_hosts: sandboxNetAllowedHosts.hosts,
+  /* An allowlist that parsed to nothing must deny, not fall back to "no
+   * allowlist". Startup refuses this too; both halves are kept so neither is
+   * load-bearing on its own. */
+  sandbox_network_deny_all_hosts: sandboxNetAllowedHosts.denyAll,
   sandbox_network_allowed_ports: parseAllowedPorts(process.env.SANDBOX_NET_ALLOWED_PORTS, [80, 443]),
   sandbox_network_max_bytes: safeInt(process.env.SANDBOX_NET_MAX_BYTES, 268435456),
   sandbox_network_max_requests: safeInt(process.env.SANDBOX_NET_MAX_REQUESTS, 512),

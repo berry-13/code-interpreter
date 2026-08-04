@@ -216,6 +216,24 @@ describe('renderJobConfigOverlay', () => {
     const srcLines = overlay.split('\n').filter(l => l.includes('src:'));
     expect(srcLines.length).toBe(1);
   });
+
+  test('binds the baked node_modules read-only one level above the workspace', () => {
+    /* Node resolution walks up from /mnt/data, so the runtime's own packages
+     * stay reachable at /mnt/node_modules once /mnt/data/node_modules has been
+     * redirected to the per-job install. */
+    const overlay = renderJobConfigOverlay('/tmp/sandbox/ws_abc', '/tmp/sandbox/deps_abc', '/pkgs/node/24/node_modules');
+    expect(overlay).toMatch(/^\s*src: "\/pkgs\/node\/24\/node_modules"$/m);
+    expect(overlay).toMatch(/^\s*dst: "\/mnt\/node_modules"$/m);
+    const bakedBlock = overlay.slice(overlay.indexOf('/pkgs/node/24/node_modules'));
+    expect(bakedBlock).toMatch(/^\s*rw: false$/m);
+    expect(bakedBlock).toMatch(/^\s*nosuid: true$/m);
+  });
+
+  test('omits the baked node_modules mount when the job installed nothing', () => {
+    expect(renderJobConfigOverlay('/tmp/sandbox/ws_abc')).not.toContain('/mnt/node_modules');
+    expect(renderJobConfigOverlay('/tmp/sandbox/ws_abc', '/tmp/sandbox/deps_abc'))
+      .not.toContain('/mnt/node_modules');
+  });
 });
 
 describe('NsJail seccomp policy', () => {

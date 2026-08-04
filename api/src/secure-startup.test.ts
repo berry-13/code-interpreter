@@ -201,4 +201,24 @@ describe('validateSandboxNetworkStartup', () => {
   test('starts when the shim is present', () => {
     expect(() => validateSandboxNetworkStartup({ enabled: true, binaryPath: process.execPath })).not.toThrow();
   });
+
+  test('refuses an allowlist that parsed to nothing', () => {
+    /* SANDBOX_NET_ALLOWED_HOSTS='api.example.com/v1' produces an empty list,
+     * which is indistinguishable from "no allowlist" unless it is flagged. The
+     * operator asked for a restrictive policy and must not silently get open
+     * egress to every public host. */
+    expect(() => validateSandboxNetworkStartup({
+      enabled: true,
+      binaryPath: process.execPath,
+      denyAllHosts: true,
+    })).toThrow('SANDBOX_NET_ALLOWED_HOSTS');
+  });
+
+  test('accepts a usable allowlist and an intentionally absent one', () => {
+    expect(() => validateSandboxNetworkStartup({
+      enabled: true,
+      binaryPath: process.execPath,
+      denyAllHosts: false,
+    })).not.toThrow();
+  });
 });

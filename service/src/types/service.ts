@@ -198,7 +198,7 @@ export interface PayloadBody {
    * dependencies field, because the LLM callers this serves cannot add one.
    * Rides in the body so it is bound by the execution manifest's body hash.
    */
-  dependencies?: { pip?: string[]; npm?: string[] };
+  dependencies?: { pip?: string[]; npm?: string[]; unsupported?: string[] };
   /**
    * Extra environment variables to inject into the sandboxed process via nsjail -E.
    * NOTE: PTC replay mode delivers tool-result history as a payload file

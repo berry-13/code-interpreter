@@ -295,3 +295,55 @@ describe('resolveDependencies across managers', () => {
       .toMatch(/not a valid package requirement/);
   });
 });
+
+describe('declarations that are not a plain comma-separated list', () => {
+  const OPTS = { allow: true, maxCount: 10, requirePinned: false };
+
+  test('keeps a comma inside a pip version specifier', () => {
+    // `pandas>=2,<3` is one requirement; splitting it yielded the invalid
+    // package `<3`, which unpinned mode then rejected.
+    expect(resolveDependencies(['# requirements: pandas>=2,<3'], OPTS))
+      .toEqual({ pip: ['pandas>=2,<3'] });
+  });
+
+  test('keeps a comma inside an extras list', () => {
+    expect(resolveDependencies(['# requirements: requests[socks,security]'], OPTS))
+      .toEqual({ pip: ['requests[socks,security]'] });
+  });
+
+  test('still splits between requirements', () => {
+    expect(resolveDependencies(['# requirements: cowsay, humanize>=4'], OPTS))
+      .toEqual({ pip: ['cowsay', 'humanize>=4'] });
+    expect(resolveDependencies(['# requirements: pandas>=2,<3, cowsay'], OPTS))
+      .toEqual({ pip: ['pandas>=2,<3', 'cowsay'] });
+    expect(resolveDependencies(['# requirements: requests[socks,security], cowsay'], OPTS))
+      .toEqual({ pip: ['requests[socks,security]', 'cowsay'] });
+  });
+});
+
+describe('limits and errors that span both managers', () => {
+  const OPTS = { allow: true, maxCount: 4, requirePinned: false };
+
+  test('the package cap is one budget for the job, not one per manager', () => {
+    const sources = [
+      '# requirements(pip): a, b, c',
+      '# requirements(npm): d, e, f',
+    ];
+    expect(messageOf(() => resolveDependencies(sources, OPTS))).toMatch(/maximum/);
+  });
+
+  test('a mixed job inside the cap is fine', () => {
+    expect(resolveDependencies(['# requirements(pip): a, b', '# requirements(npm): c, d'], OPTS))
+      .toEqual({ pip: ['a', 'b'], npm: ['c', 'd'] });
+  });
+
+  test('an unsupported manager the service extracted still fails the job', () => {
+    /* With a persistent session the sandbox only sees a base64 wrapper, so
+     * `sources` carries no header at all and the service's list is the only
+     * evidence the declaration existed. */
+    expect(messageOf(() => resolveDependencies(
+      ['print("wrapped")'],
+      { ...OPTS, declared: { unsupported: ['cargo'] } },
+    ))).toMatch(/cargo/);
+  });
+});

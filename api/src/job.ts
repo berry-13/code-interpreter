@@ -203,6 +203,22 @@ export function aggregateBashExtras(
   return extraPkgdirs;
 }
 
+/** The runtime's own baked `node_modules`, taken from its NODE_PATH (what
+ * package-init writes into each runtime's .env) and falling back to the
+ * conventional location under its pkgdir. Undefined for runtimes that ship
+ * none, such as python or bash. */
+export function bakedNodeModulesFor(
+  runtime: { pkgdir: string; env_vars?: Record<string, string> },
+): string | undefined {
+  const fromNodePath = (runtime.env_vars?.NODE_PATH ?? '')
+    .split(':')
+    .filter(Boolean)
+    .find(entry => path.isAbsolute(entry) && path.basename(entry) === 'node_modules');
+  if (fromNodePath) return fromNodePath;
+  const conventional = path.join(runtime.pkgdir, 'node_modules');
+  return fs.existsSync(conventional) ? conventional : undefined;
+}
+
 function rememberPreferredNodeModules(
   source: string,
   linkTarget: { nodeModulesPath?: string },
@@ -1047,8 +1063,14 @@ export class Job {
     await applySandboxPathPermissions(depsDir, identity, 0o711);
     this.depsDir = depsDir;
 
-    if (pipSpecs.length > 0) await this.installPip(pipSpecs, depsDir, parent, workspaceId, identity);
-    if (npmSpecs.length > 0) await this.installNpm(npmSpecs, depsDir, identity);
+    /* One deadline across both managers, like the size cap below. The
+     * installers run in sequence, so giving each the full timeout means a mixed
+     * job can spend 2x CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS in prime -- past
+     * the service's JOB_PRIME_ALLOWANCE_MS, which is sized for one. The service
+     * would then abort the call partway through the second install. */
+    const deadlineAt = Date.now() + config.dependency_install_timeout_ms;
+    if (pipSpecs.length > 0) await this.installPip(pipSpecs, depsDir, parent, workspaceId, identity, deadlineAt);
+    if (npmSpecs.length > 0) await this.installNpm(npmSpecs, depsDir, identity, deadlineAt);
 
     /* One budget across both managers: the cap is on what the jail will be able
      * to see, not on any single installer. */
@@ -1069,6 +1091,7 @@ export class Job {
     parent: string,
     workspaceId: string,
     identity: SandboxJobIdentity,
+    deadlineAt: number,
   ): Promise<void> {
     const reqPath = path.join(parent, `deps_req_${workspaceId}.txt`);
     await fsp.writeFile(reqPath, pipSpecs.join('\n') + '\n', { mode: 0o600 });
@@ -1092,7 +1115,7 @@ export class Job {
     }
 
     try {
-      await this.runInstaller(this.resolvePipPath(), args, depsDir, identity);
+      await this.runInstaller(this.resolvePipPath(), args, depsDir, identity, deadlineAt);
     } finally {
       await fsp.rm(reqPath, { force: true }).catch(() => {});
     }
@@ -1111,6 +1134,7 @@ export class Job {
     npmSpecs: string[],
     depsDir: string,
     identity: SandboxJobIdentity,
+    deadlineAt: number,
   ): Promise<void> {
     const args = [
       'install',
@@ -1128,7 +1152,7 @@ export class Job {
     if (!this.isSynthetic) {
       this.log.info({ count: npmSpecs.length }, 'Installing npm dependencies');
     }
-    await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, {
+    await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, deadlineAt, {
       /* npm writes its cache and any temp state relative to these; point both
        * inside the per-job dir so nothing lands in the runner's HOME and
        * concurrent jobs cannot collide in a shared cache. */
@@ -1180,9 +1204,18 @@ export class Job {
     args: string[],
     depsDir: string,
     identity: SandboxJobIdentity,
+    deadlineAt: number,
     extraEnv: Record<string, string> = {},
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      /* Whatever is left of the phase-wide budget, not a fresh full timeout.
+       * `spawn` treats a non-positive timeout as "no timeout", so an exhausted
+       * budget has to be refused here rather than passed through. */
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        reject(new ValidationError('dependency install timed out or was killed'));
+        return;
+      }
       // Minimal env: the installer inherits none of the runner's secrets, only
       // what it needs to run and reach the allowlisted index over HTTPS.
       const env: Record<string, string> = {
@@ -1198,7 +1231,7 @@ export class Job {
         uid: identity.uid,
         gid: identity.gid,
         stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: config.dependency_install_timeout_ms,
+        timeout: remainingMs,
         killSignal: 'SIGKILL',
       });
 
@@ -2493,18 +2526,45 @@ export class Job {
       // take precedence over the baked-in site-packages. Set after spreading
       // runtime.env_vars so this wins over any PYTHONPATH from the runtime .env.
       envVars.PYTHONPATH = envVars.PYTHONPATH ? `/mnt/deps:${envVars.PYTHONPATH}` : '/mnt/deps';
-      // npm installs under <depsDir>/node_modules, which is where node and bun
-      // both look when NODE_PATH points at it.
+      // npm installs under <depsDir>/node_modules. NODE_PATH alone is not
+      // enough to make those the packages a job actually gets — see
+      // installedNodeModules below — but it stays set for CommonJS lookups
+      // that walk past the workspace.
       envVars.NODE_PATH = envVars.NODE_PATH
         ? `/mnt/deps/node_modules:${envVars.NODE_PATH}`
         : '/mnt/deps/node_modules';
     }
 
     let extraPkgdirs: string[] | undefined;
+    const bakedNodeModules = { nodeModulesPath: bakedNodeModulesFor(this.runtime) };
     if (this.runtime.language === 'bash') {
-      const linkTarget: { nodeModulesPath?: string } = {};
-      extraPkgdirs = aggregateBashExtras(this.runtime.pkgdir, envVars, undefined, linkTarget);
-      ensureNodeModulesSymlink(this.submissionDir, linkTarget.nodeModulesPath);
+      extraPkgdirs = aggregateBashExtras(this.runtime.pkgdir, envVars, undefined, bakedNodeModules);
+    }
+
+    /* Resolution order for declared npm packages.
+     *
+     * NODE_PATH does not carry them: Node's ESM resolver ignores it outright,
+     * so `import pkg from 'pkg'` never sees a declared package, and for
+     * CommonJS it is consulted only AFTER the directory walk — so a declared
+     * pin of an already-baked package silently loses to the baked copy. Both
+     * are the opposite of what declaring a dependency promises.
+     *
+     * So point the workspace's node_modules at the per-job install and let the
+     * baked set answer from /mnt/node_modules one level up (bound by
+     * renderJobConfigOverlay). The directory walk then gives declared packages
+     * precedence and keeps the baked ones reachable, for ESM and CommonJS
+     * alike. Pre-creating the link also stops the runtime `run` script from
+     * pointing /mnt/data/node_modules at the baked set first — it only creates
+     * the link when nothing is there. */
+    const installedNodeModules = this.depsDir
+      ? path.join(this.depsDir, 'node_modules')
+      : undefined;
+    const hasInstalledNodeModules = installedNodeModules !== undefined
+      && fs.existsSync(installedNodeModules);
+    if (hasInstalledNodeModules) {
+      ensureNodeModulesSymlink(this.submissionDir, '/mnt/deps/node_modules');
+    } else {
+      ensureNodeModulesSymlink(this.submissionDir, bakedNodeModules.nodeModulesPath);
     }
 
     const executeOptions = {
@@ -2521,6 +2581,9 @@ export class Job {
       enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
       suppressSuccessLogs: this.isSynthetic,
       depsDir: this.depsDir,
+      // Only bound when the workspace link was redirected; otherwise the baked
+      // set is already what /mnt/data/node_modules points at.
+      bakedNodeModulesDir: hasInstalledNodeModules ? bakedNodeModules.nodeModulesPath : undefined,
     };
 
     /* Sandbox networking covers the user's program only: a compile step has no
@@ -2558,6 +2621,7 @@ export class Job {
         socketPath,
         policy: {
           allowedHosts: config.sandbox_network_allowed_hosts,
+          denyAllHosts: config.sandbox_network_deny_all_hosts,
           allowedPorts: config.sandbox_network_allowed_ports,
         },
         socketUid: identity.uid,

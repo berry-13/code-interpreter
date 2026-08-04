@@ -66,6 +66,40 @@ export function defaultManagerFor(language: string): PackageManager {
 }
 
 /**
+ * Split one declaration into specs.
+ *
+ * Not a plain `split(',')`: a comma is also the separator *inside* a PEP 440
+ * version specifier and inside an extras list, so `pandas>=2,<3` is one
+ * requirement and `requests[socks,security]` is one requirement. Both are
+ * accepted by the sandbox's validator and documented as usable, and splitting
+ * naively turned them into the invalid packages `<3` and `security]`.
+ *
+ * A comma separates requirements only at bracket depth zero and only when what
+ * follows starts a package name rather than another version operator.
+ */
+function splitDeclaredSpecs(text: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === '[') {
+      depth++;
+    } else if (char === ']') {
+      if (depth > 0) depth--;
+    } else if (char === ',' && depth === 0) {
+      let next = i + 1;
+      while (next < text.length && (text[next] === ' ' || text[next] === '\t')) next++;
+      if (next < text.length && '<>=!~^'.includes(text[next])) continue;
+      out.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(text.slice(start));
+  return out.map(spec => spec.trim()).filter(spec => spec.length > 0);
+}
+
+/**
  * Collect declared specs per manager, in order and de-duplicated. Empty lists
  * mean the job declared nothing, which every caller must treat as ordinary
  * rather than as an error.
@@ -95,9 +129,8 @@ export function extractRequirements(
         if (!unsupported.includes(qualifier)) unsupported.push(qualifier);
         continue;
       }
-      for (const piece of match[2].split(',')) {
-        const spec = piece.trim();
-        if (spec.length > 0) collected[manager].push(spec);
+      for (const spec of splitDeclaredSpecs(match[2])) {
+        collected[manager].push(spec);
       }
     }
   }

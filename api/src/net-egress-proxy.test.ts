@@ -155,7 +155,7 @@ function proxyRequest(sock: string, payload: string, opts: { keepOpenMs?: number
     const client = net.connect({ path: sock });
     let data = '';
     const done = (): void => resolve(data);
-    client.on('connect', () => client.write(payload));
+    client.on('connect', () => client.write(Buffer.from(payload, 'latin1')));
     client.on('data', chunk => {
       data += chunk.toString('utf8');
       if (opts.keepOpenMs === undefined) return;
@@ -172,6 +172,52 @@ function proxyRequest(sock: string, payload: string, opts: { keepOpenMs?: number
       done();
     }, 5_000);
   });
+}
+
+/** A raw TCP origin that records the bytes the proxy writes to it. */
+async function startRecordingOrigin(): Promise<{
+  port: number;
+  received: () => Buffer;
+  close: () => Promise<void>;
+}> {
+  let received = Buffer.alloc(0);
+  const server = net.createServer(socket => {
+    socket.on('data', chunk => { received = Buffer.concat([received, chunk]); });
+    socket.on('error', () => {});
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
+  return {
+    port: (server.address() as net.AddressInfo).port,
+    received: () => received,
+    close: () => new Promise<void>(resolve => server.close(() => resolve())),
+  };
+}
+
+/** Minimal well-formed TLS ClientHello carrying `sni`. */
+function clientHelloFor(sni: string): Buffer {
+  const size = (n: number): Buffer => {
+    const out = Buffer.alloc(2);
+    out.writeUInt16BE(n);
+    return out;
+  };
+  const name = Buffer.from(sni, 'latin1');
+  const entry = Buffer.concat([Buffer.from([0x00]), size(name.length), name]);
+  const list = Buffer.concat([size(entry.length), entry]);
+  const extension = Buffer.concat([Buffer.from([0x00, 0x00]), size(list.length), list]);
+  const body = Buffer.concat([
+    Buffer.from([0x03, 0x03]),
+    Buffer.alloc(32),
+    Buffer.from([0x00]),
+    Buffer.from([0x00, 0x02, 0x13, 0x01]),
+    Buffer.from([0x01, 0x00]),
+    size(extension.length),
+    extension,
+  ]);
+  const handshake = Buffer.concat([
+    Buffer.from([0x01, (body.length >> 16) & 0xff, (body.length >> 8) & 0xff, body.length & 0xff]),
+    body,
+  ]);
+  return Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), size(handshake.length), handshake]);
 }
 
 describe('createNetEgressProxy', () => {
@@ -323,6 +369,137 @@ describe('createNetEgressProxy', () => {
       `GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX-Pad: ${padding}\r\n\r\n`,
     );
     expect(response).toContain('431');
+  });
+
+  test('a body coalesced with the head does not count against the head limit', async () => {
+    /* The regression: HTTP clients write headers and `end(body)` in one syscall,
+     * so the first chunk carries both. Sizing the head check on the whole chunk
+     * turned an ordinary upload into 431 request head too large. */
+    let seenLength = 0;
+    const origin = await startOrigin((req, res) => {
+      req.on('data', chunk => { seenLength += chunk.length; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+      });
+    });
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port, { maxRequestHeadBytes: 512 });
+
+    const body = 'x'.repeat(4096);
+    const response = await proxyRequest(
+      sock,
+      'POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\n'
+        + `Content-Length: ${body.length}\r\n\r\n${body}`,
+    );
+
+    expect(response).toContain('200 OK');
+    expect(seenLength).toBe(body.length);
+  });
+
+  test('still rejects a head that is oversized on its own', async () => {
+    const sock = await startProxy(1, { maxRequestHeadBytes: 256 });
+    const response = await proxyRequest(
+      sock,
+      `GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX-Pad: ${'x'.repeat(500)}\r\n\r\n`,
+    );
+    expect(response).toContain('431');
+  });
+
+  test('a client that never terminates the head is still capped', async () => {
+    const sock = await startProxy(1, { maxRequestHeadBytes: 256 });
+    const response = await proxyRequest(
+      sock,
+      `GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX-Pad: ${'x'.repeat(4096)}`,
+    );
+    expect(response).toContain('431');
+  });
+
+  test('CONNECT under an allowlist is bound to the SNI it was authorized for', async () => {
+    /* The bypass this closes: an allowlisted host sharing an address with other
+     * virtual hosts — the normal case on a CDN — lets the sandbox CONNECT to the
+     * allowed name and then ask the server for a different one via TLS SNI. */
+    const LISTED: NetPolicy = { allowedHosts: ['example.com'], allowedPorts: [443] };
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port, { policy: LISTED });
+
+    const response = await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'
+        + clientHelloFor('evil.example.com').toString('latin1'),
+      { keepOpenMs: 250 },
+    );
+
+    // CONNECT itself was allowed, so the 200 goes back; the mismatched
+    // ClientHello is what never reaches upstream.
+    expect(response).toContain('200 Connection Established');
+    expect(origin.received().length).toBe(0);
+  });
+
+  test('CONNECT passes the ClientHello through when the SNI matches', async () => {
+    const LISTED: NetPolicy = { allowedHosts: ['example.com'], allowedPorts: [443] };
+    const hello = clientHelloFor('example.com');
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port, { policy: LISTED });
+
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' + hello.toString('latin1'),
+      { keepOpenMs: 250 },
+    );
+
+    expect(origin.received().equals(hello)).toBe(true);
+  });
+
+  test('CONNECT to another allowlisted name is allowed', async () => {
+    const LISTED: NetPolicy = { allowedHosts: ['example.com', '*.pypi.org'], allowedPorts: [443] };
+    const hello = clientHelloFor('files.pypi.org');
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port, { policy: LISTED });
+
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' + hello.toString('latin1'),
+      { keepOpenMs: 250 },
+    );
+
+    expect(origin.received().equals(hello)).toBe(true);
+  });
+
+  test('CONNECT under an allowlist refuses a tunnel that is not TLS', async () => {
+    const LISTED: NetPolicy = { allowedHosts: ['example.com'], allowedPorts: [443] };
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port, { policy: LISTED });
+
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\nGET / HTTP/1.1\r\nHost: evil.com\r\n\r\n',
+      { keepOpenMs: 250 },
+    );
+
+    // A tunnel we cannot bind to a name is indistinguishable from one being
+    // used to reach a different one.
+    expect(origin.received().length).toBe(0);
+  });
+
+  test('CONNECT with no allowlist stays a fully opaque tunnel', async () => {
+    // Without an allowlist the policy is already "any publicly routable
+    // address", so the ClientHello is not inspected and non-TLS payloads work.
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port);
+
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\nnot-tls-at-all',
+      { keepOpenMs: 250 },
+    );
+
+    expect(origin.received().toString('latin1')).toBe('not-tls-at-all');
   });
 
   test('creates the socket with 0600 so only the job UID can connect', async () => {

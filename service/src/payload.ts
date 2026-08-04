@@ -65,13 +65,20 @@ export function createPayload({
     ]
   };
 
-  /* Forward per manager. `unsupported` is deliberately NOT filtered out here:
-   * it is passed along so the sandbox produces one clear error naming the
-   * manager, instead of this side silently dropping the declaration. */
-  if (requirements.pip.length > 0 || requirements.npm.length > 0) {
+  /* Forward per manager, and forward `unsupported` with them. It has to travel:
+   * the sandbox re-parses `finalCode` for direct callers, but for a persistent
+   * Python session that code is a base64 wrapper, so a `requirements(cargo):`
+   * header is invisible there. Dropping it here is what would silently run the
+   * job instead of producing the promised error naming the manager. */
+  if (
+    requirements.pip.length > 0
+    || requirements.npm.length > 0
+    || requirements.unsupported.length > 0
+  ) {
     payload.dependencies = {
       ...(requirements.pip.length > 0 ? { pip: requirements.pip } : {}),
       ...(requirements.npm.length > 0 ? { npm: requirements.npm } : {}),
+      ...(requirements.unsupported.length > 0 ? { unsupported: requirements.unsupported } : {}),
     };
   }
 

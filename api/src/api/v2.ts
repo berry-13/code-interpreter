@@ -50,7 +50,7 @@ export interface ExecuteRequestBody {
    * part of the public /v1/exec surface -- with persistent sessions the code
    * reaches us base64-encoded, so the service must parse the header while it
    * still has the original. See shared/requirements-header.ts. */
-  dependencies?: { pip?: string[]; npm?: string[] };
+  dependencies?: { pip?: string[]; npm?: string[]; unsupported?: string[] };
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;

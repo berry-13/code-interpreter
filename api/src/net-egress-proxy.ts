@@ -41,7 +41,11 @@ import {
   blockedAddressReason,
   checkHost,
   checkPort,
+  checkTunnelSni,
+  hostAllowlistInForce,
+  inspectClientHelloSni,
   isIpLiteral,
+  MAX_CLIENT_HELLO_BYTES,
   normalizeHost,
   verifyPinnedAddress,
   type NetPolicy,
@@ -487,6 +491,12 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
         { host: pinned.address, port: head.port, family: pinned.family },
         timers,
         connectTimeoutMs,
+        // Publish the socket before it finishes connecting so a teardown during
+        // the dial destroys it now rather than at the connect timeout.
+        pending => {
+          upstream = pending;
+          if (torn) pending.destroy();
+        },
       );
     } catch (error) {
       fail(502, describe(error));
@@ -519,6 +529,60 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
     let bodyForwarded = 0;
     let connBytesDown = 0;
 
+    const onOverrun = (reason: string): void => {
+      log?.warn({ host: approved.host, reason }, 'sandbox egress connection torn down');
+      cleanup();
+    };
+
+    /* CONNECT authorizes an authority, not an IP. When a host allowlist is what
+     * decides access, the tunnel has to actually go to the name that was
+     * allowed: an allowlisted host sharing an address with other virtual hosts
+     * — the normal case on a CDN or shared hosting — would otherwise let the
+     * sandbox CONNECT to the allowed name and put a different one in the TLS
+     * SNI, and the server routes on SNI. So hold the client's first bytes,
+     * read the ClientHello (read-only; TLS is still never terminated) and run
+     * the same host gate on the name it asks for.
+     *
+     * Only when an allowlist is in force: with none, the policy is already "any
+     * publicly routable address", and a different SNI to a screened public
+     * address reaches nothing a second CONNECT could not. */
+    let sniPending = approved.isConnect && hostAllowlistInForce(policy);
+    let helloBuffer = Buffer.alloc(0);
+
+    /** Write client bytes upstream, holding them back while the ClientHello is
+     * still being read. Returns false when the socket asked for backpressure. */
+    const forwardUp = (chunk: Buffer): boolean => {
+      if (!sniPending) return socket.write(chunk);
+
+      helloBuffer = Buffer.concat([helloBuffer, chunk]);
+      if (helloBuffer.length > MAX_CLIENT_HELLO_BYTES) {
+        onOverrun('CONNECT tunnel sent no parseable TLS ClientHello');
+        return false;
+      }
+      const verdict = inspectClientHelloSni(helloBuffer);
+      if (verdict.status === 'need-more') return true;
+      if (verdict.status !== 'ok') {
+        // A tunnel we cannot bind to a name is indistinguishable from one being
+        // used to reach a different one, so it does not get to proceed.
+        onOverrun(`CONNECT tunnel did not open with a TLS ClientHello (${verdict.status})`);
+        return false;
+      }
+      const sniVerdict = checkTunnelSni(verdict.sni, approved.host, policy);
+      if (!sniVerdict.allowed) {
+        stats.denied++;
+        log?.warn(
+          { host: approved.host, sni: verdict.sni, reason: sniVerdict.reason },
+          'sandbox egress denied',
+        );
+        onOverrun(sniVerdict.reason);
+        return false;
+      }
+      sniPending = false;
+      const held = helloBuffer;
+      helloBuffer = Buffer.alloc(0);
+      return socket.write(held);
+    };
+
     if (approved.isConnect) {
       client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     } else {
@@ -527,14 +591,9 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
     if (body.length > 0) {
       bodyForwarded += body.length;
       stats.bytesUp += body.length;
-      socket.write(body);
+      forwardUp(body);
     }
     body = Buffer.alloc(0);
-
-    const onOverrun = (reason: string): void => {
-      log?.warn({ host: approved.host, reason }, 'sandbox egress connection torn down');
-      cleanup();
-    };
 
     client.on('data', chunk => {
       if (!approved.isConnect) {
@@ -552,7 +611,7 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
         return;
       }
       timers.set('idle', () => onOverrun('idle timeout'), idleTimeoutMs);
-      if (!socket.write(chunk)) client.pause();
+      if (!forwardUp(chunk)) client.pause();
     });
     socket.on('drain', () => client.resume());
 
@@ -609,14 +668,25 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
     });
   });
 
-  // Ownership first, then mode: between listen() and chown the socket exists
-  // with the runner's ownership, and 0600 on the wrong owner is still closed
-  // to the job. chmod last means the job-readable state is only ever reached
-  // after the uid is correct.
-  if (socketUid !== undefined && socketGid !== undefined) {
-    await fsp.chown(socketPath, socketUid, socketGid);
+  /* Past this point the server is listening, so anything that throws has to
+   * take the listener down with it. The caller only knows the socket path and
+   * unlinks that; an FD left listening on an unlinked path is unreachable but
+   * still alive, and with networking on that is one leaked listener per job
+   * until the runner is out of descriptors. */
+  try {
+    // Ownership first, then mode: between listen() and chown the socket exists
+    // with the runner's ownership, and 0600 on the wrong owner is still closed
+    // to the job. chmod last means the job-readable state is only ever reached
+    // after the uid is correct.
+    if (socketUid !== undefined && socketGid !== undefined) {
+      await fsp.chown(socketPath, socketUid, socketGid);
+    }
+    await fsp.chmod(socketPath, 0o600);
+  } catch (error) {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await fsp.rm(socketPath, { force: true }).catch(() => {});
+    throw error;
   }
-  await fsp.chmod(socketPath, 0o600);
 
   return {
     stats: () => ({ ...stats, activeConnections: sockets.size }),
@@ -707,18 +777,31 @@ function readRequestHead(
     const onData = (chunk: Buffer): void => {
       chunks.push(chunk);
       size += chunk.length;
-      if (size > maxBytes) {
-        settle(() => reject(new RequestRejected(431, 'request head too large')));
-        return;
-      }
       const buffer = Buffer.concat(chunks);
-      if (buffer.indexOf('\r\n\r\n') >= 0) {
+      const separator = buffer.indexOf('\r\n\r\n');
+      /* Bound the HEAD, not the read. HTTP clients routinely coalesce the
+       * header write with `end(body)`, so the first chunk of an ordinary upload
+       * carries the whole body too; measuring `size` before locating the
+       * terminator turned every POST over ~maxBytes into a 431. Once the
+       * terminator is in hand the head is exactly the bytes before it, and the
+       * body that rode along is bounded by the Content-Length checks the caller
+       * applies. Only a client that never sends a terminator is capped on the
+       * running total. */
+      if (separator >= 0) {
+        if (separator + 4 > maxBytes) {
+          settle(() => reject(new RequestRejected(431, 'request head too large')));
+          return;
+        }
         // Pause before returning: the caller now awaits DNS and connect, and
         // removing the 'data' listener alone would leave the socket flowing
         // with nobody reading — body bytes sent during that window would be
         // silently dropped. The paused socket buffers them until resume().
         client.pause();
         settle(() => resolve(buffer));
+        return;
+      }
+      if (size > maxBytes) {
+        settle(() => reject(new RequestRejected(431, 'request head too large')));
       }
     };
     const onEnd = (): void => settle(() => reject(new RequestRejected(400, 'connection closed before a complete request')));
@@ -790,14 +873,25 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   });
 }
 
+/**
+ * Dial upstream with a bounded connect timeout.
+ *
+ * `register` is handed the socket synchronously, before the connect completes,
+ * so the caller's teardown can destroy an in-flight dial. Without it a client
+ * that disconnects mid-connect releases its `maxConnections` slot immediately
+ * while the outbound socket lives on until its connect timeout — one job could
+ * hold far more pending host connections than the limit advertises.
+ */
 function openUpstream(
   connect: (opts: { host: string; port: number; family: number }) => net.Socket,
   target: { host: string; port: number; family: number },
   timers: TimerSet,
   timeoutMs: number,
+  register?: (socket: net.Socket) => void,
 ): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const socket = connect(target);
+    register?.(socket);
     let done = false;
     const settle = (fn: () => void): void => {
       if (done) return;

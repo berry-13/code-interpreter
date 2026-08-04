@@ -97,7 +97,7 @@ function forbiddenEnvNames(): string[] {
  * is supported again — the AF_INET block is now unconditional.
  */
 export function validateSandboxNetworkStartup(
-  opts: { enabled?: boolean; binaryPath?: string } = {},
+  opts: { enabled?: boolean; binaryPath?: string; denyAllHosts?: boolean } = {},
 ): void {
   const enabled = opts.enabled ?? config.allow_sandbox_network;
   const binaryPath = opts.binaryPath ?? NET_SHIM_LIBRARY;
@@ -109,6 +109,17 @@ export function validateSandboxNetworkStartup(
     throw new SandboxSecureStartupError(
       `CODEAPI_ALLOW_SANDBOX_NETWORK=true requires ${binaryPath} in the sandbox image; ` +
         'rebuild the sandbox runner image so the network shim is present',
+    );
+  }
+
+  /* A restrictive allowlist that parses to nothing is the dangerous typo: the
+   * runtime denies on it (NetPolicy.denyAllHosts), but the operator asked for
+   * a working allowlist and would otherwise only find out from denied jobs. */
+  const denyAllHosts = opts.denyAllHosts ?? config.sandbox_network_deny_all_hosts;
+  if (denyAllHosts) {
+    throw new SandboxSecureStartupError(
+      'SANDBOX_NET_ALLOWED_HOSTS is set but no entry is a valid host or *.host pattern; ' +
+        "fix the entries, or set it to '*' (or leave it unset) to allow any publicly routable host",
     );
   }
 }

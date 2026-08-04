@@ -27,6 +27,13 @@ export interface NetPolicy {
    * ('api.github.com') or a single leading-wildcard label ('*.pypi.org', which
    * matches sub.pypi.org and pypi.org itself). */
   allowedHosts: string[];
+  /** Deny every host regardless of `allowedHosts`. Set when the operator
+   * configured SANDBOX_NET_ALLOWED_HOSTS but no entry survived validation:
+   * an empty `allowedHosts` otherwise means "no allowlist", so without this
+   * a single typo in a restrictive policy would open egress to every public
+   * host. Startup also refuses this configuration; the flag is the runtime
+   * half of the same guarantee. */
+  denyAllHosts?: boolean;
   allowedPorts: number[];
 }
 
@@ -117,6 +124,7 @@ export function checkHost(host: string, policy: NetPolicy): PolicyVerdict {
   for (const suffix of DENIED_HOST_SUFFIXES) {
     if (host.endsWith(suffix)) return deny(`host suffix '${suffix}' is denied by policy`);
   }
+  if (policy.denyAllHosts) return deny('SANDBOX_NET_ALLOWED_HOSTS contained no usable entries');
   if (policy.allowedHosts.length === 0) return ALLOW;
   for (const entry of policy.allowedHosts) {
     if (entry.startsWith('*.')) {
@@ -132,6 +140,162 @@ export function checkHost(host: string, policy: NetPolicy): PolicyVerdict {
 export function checkPort(port: number, policy: NetPolicy): PolicyVerdict {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return deny('invalid port');
   if (!policy.allowedPorts.includes(port)) return deny(`port ${port} is not in SANDBOX_NET_ALLOWED_PORTS`);
+  return ALLOW;
+}
+
+/**
+ * True when the host allowlist is what decides access, rather than the address
+ * gate alone.
+ *
+ * This is the condition under which a CONNECT tunnel has to be bound to the
+ * name it was authorized for. With no allowlist the policy is "any publicly
+ * routable address", so a client that sends a different SNI over the tunnel
+ * reaches another virtual host on an address that was already screened as
+ * public — nothing it could not have reached with a second CONNECT. With an
+ * allowlist the authority IS the boundary, and shared hosting or a CDN will
+ * happily route the tunnel to whichever name the ClientHello asks for.
+ */
+export function hostAllowlistInForce(policy: NetPolicy): boolean {
+  return policy.denyAllHosts === true || policy.allowedHosts.length > 0;
+}
+
+/* ── TLS ClientHello inspection ───────────────────────────────────────────
+ *
+ * Read-only: the proxy never terminates TLS and never rewrites a byte. All
+ * this does is read the SNI out of the first handshake record so checkHost can
+ * be applied to the name the client actually asks the server for. Pure and
+ * incremental so it is testable without a socket.
+ */
+
+export type ClientHelloVerdict =
+  | { status: 'need-more' }
+  | { status: 'not-tls' }
+  | { status: 'malformed' }
+  | { status: 'ok'; sni: string | null };
+
+/** Bytes of ClientHello we are willing to buffer before giving up. A real one
+ * is well under 4 KiB even with a long ALPN list and post-quantum key shares. */
+export const MAX_CLIENT_HELLO_BYTES = 16640;
+
+function readUint24(buf: Buffer, offset: number): number {
+  return (buf[offset] << 16) | (buf[offset + 1] << 8) | buf[offset + 2];
+}
+
+/**
+ * Parse the SNI out of a buffered TLS ClientHello.
+ *
+ * Returns 'need-more' while the record is incomplete, 'not-tls' when the first
+ * bytes cannot be a TLS handshake record, 'malformed' when they claim to be one
+ * but do not parse, and otherwise the server name (null when the client sent no
+ * SNI extension, which is legitimate for an IP-literal target).
+ */
+export function inspectClientHelloSni(data: Buffer): ClientHelloVerdict {
+  // record: type(1) legacy_version(2) length(2)
+  if (data.length < 5) {
+    // A handshake record always starts 0x16 0x03; reject early rather than
+    // buffering an unbounded non-TLS stream waiting for a header.
+    if (data.length >= 1 && data[0] !== 0x16) return { status: 'not-tls' };
+    if (data.length >= 2 && data[1] !== 0x03) return { status: 'not-tls' };
+    return { status: 'need-more' };
+  }
+  if (data[0] !== 0x16 || data[1] !== 0x03) return { status: 'not-tls' };
+
+  const recordLength = data.readUInt16BE(3);
+  if (recordLength === 0 || recordLength > MAX_CLIENT_HELLO_BYTES) return { status: 'malformed' };
+  if (data.length < 5 + recordLength) return { status: 'need-more' };
+
+  const body = data.subarray(5, 5 + recordLength);
+  // handshake: msg_type(1) length(3)
+  if (body.length < 4 || body[0] !== 0x01) return { status: 'malformed' };
+  const handshakeLength = readUint24(body, 1);
+  /* A ClientHello split across several records is legal but never produced by
+   * a real client, and following it would mean reassembling handshake messages
+   * here. Refuse rather than guess. */
+  if (body.length < 4 + handshakeLength) return { status: 'malformed' };
+
+  let p = 4;
+  const hello = body.subarray(0, 4 + handshakeLength);
+  const need = (n: number): boolean => p + n <= hello.length;
+
+  if (!need(2 + 32)) return { status: 'malformed' };
+  p += 2 + 32; // legacy_version, random
+
+  if (!need(1)) return { status: 'malformed' };
+  const sessionIdLength = hello[p];
+  p += 1;
+  if (!need(sessionIdLength)) return { status: 'malformed' };
+  p += sessionIdLength;
+
+  if (!need(2)) return { status: 'malformed' };
+  const cipherSuitesLength = hello.readUInt16BE(p);
+  p += 2;
+  if (!need(cipherSuitesLength)) return { status: 'malformed' };
+  p += cipherSuitesLength;
+
+  if (!need(1)) return { status: 'malformed' };
+  const compressionLength = hello[p];
+  p += 1;
+  if (!need(compressionLength)) return { status: 'malformed' };
+  p += compressionLength;
+
+  // No extensions at all: legal, and means no SNI.
+  if (p === hello.length) return { status: 'ok', sni: null };
+  if (!need(2)) return { status: 'malformed' };
+  const extensionsLength = hello.readUInt16BE(p);
+  p += 2;
+  if (!need(extensionsLength)) return { status: 'malformed' };
+  const end = p + extensionsLength;
+
+  while (p + 4 <= end) {
+    const type = hello.readUInt16BE(p);
+    const length = hello.readUInt16BE(p + 2);
+    p += 4;
+    if (p + length > end) return { status: 'malformed' };
+    if (type !== 0x0000) {
+      p += length;
+      continue;
+    }
+    // server_name_list: length(2) then entries of name_type(1) length(2) name
+    const ext = hello.subarray(p, p + length);
+    if (ext.length < 2) return { status: 'malformed' };
+    const listLength = ext.readUInt16BE(0);
+    if (listLength + 2 > ext.length) return { status: 'malformed' };
+    let q = 2;
+    while (q + 3 <= 2 + listLength) {
+      const nameType = ext[q];
+      const nameLength = ext.readUInt16BE(q + 1);
+      q += 3;
+      if (q + nameLength > 2 + listLength) return { status: 'malformed' };
+      // 0 = host_name; it is the only type ever assigned.
+      if (nameType === 0) {
+        return { status: 'ok', sni: ext.subarray(q, q + nameLength).toString('latin1') };
+      }
+      q += nameLength;
+    }
+    return { status: 'ok', sni: null };
+  }
+  return { status: 'ok', sni: null };
+}
+
+/**
+ * Decide whether a CONNECT tunnel authorized for `authority` may carry a
+ * ClientHello asking for `sni`.
+ *
+ * The name has to survive the same host gate the authority did — an allowlisted
+ * CONNECT target is not a licence to reach every other name the server hosts.
+ */
+export function checkTunnelSni(sni: string | null, authority: string, policy: NetPolicy): PolicyVerdict {
+  if (sni === null) {
+    // No SNI is only expected when the client is talking to an address, not a
+    // name. Against a named authority it would leave the tunnel unbound.
+    if (isIpLiteral(authority)) return ALLOW;
+    return deny('CONNECT tunnel carries no TLS SNI to bind it to the approved host');
+  }
+  const normalized = normalizeHost(sni);
+  if (normalized === null) return deny('CONNECT tunnel sent an invalid TLS SNI');
+  if (normalized === authority) return ALLOW;
+  const verdict = checkHost(normalized, policy);
+  if (!verdict.allowed) return deny(`CONNECT tunnel SNI '${normalized}' is not allowed: ${verdict.reason}`);
   return ALLOW;
 }
 
@@ -339,16 +503,32 @@ function embeddedIpv4(h: number[]): number | null {
   return null;
 }
 
+/**
+ * IPv6 gate. Unlike the v4 table this cannot be a denylist: IANA has assigned
+ * only a fraction of the v6 space, so "every range I remembered to name" leaves
+ * the rest — fec0::/10 site-local, 3ffe::/16, and all of the unassigned
+ * reserved blocks — reachable from the trusted runner. Global unicast is
+ * exactly 2000::/3 (RFC 4291), so require that positively and carve out the
+ * non-reachable prefixes inside it.
+ */
 function blockedIpv6Reason(h: number[]): string | null {
   const isZero = h.every(x => x === 0);
   if (isZero) return 'unspecified address';
   if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0 && h[6] === 0 && h[7] === 1) {
     return 'loopback';
   }
-  if ((h[0] & 0xfe00) === 0xfc00) return 'unique local (ULA)';
-  if ((h[0] & 0xffc0) === 0xfe80) return 'link-local';
-  if ((h[0] & 0xff00) === 0xff00) return 'multicast';
-  if (h[0] === 0x0100 && h[1] === 0 && h[2] === 0 && h[3] === 0) return 'discard-only';
+
+  if ((h[0] & 0xe000) !== 0x2000) {
+    // Name the ranges an operator is likely to see in a log; everything else
+    // outside 2000::/3 is reserved or unassigned and denied on that basis.
+    if ((h[0] & 0xfe00) === 0xfc00) return 'unique local (ULA)';
+    if ((h[0] & 0xffc0) === 0xfe80) return 'link-local';
+    if ((h[0] & 0xffc0) === 0xfec0) return 'site-local (deprecated RFC 3879)';
+    if ((h[0] & 0xff00) === 0xff00) return 'multicast';
+    if (h[0] === 0x0100 && h[1] === 0 && h[2] === 0 && h[3] === 0) return 'discard-only';
+    return 'not global unicast (outside 2000::/3)';
+  }
+
   if (h[0] === 0x2001 && h[1] === 0x0db8) return 'documentation';
   // 2001::/32 Teredo and 2002::/16 6to4 tunnel to an operator-chosen v4
   // endpoint; the embedded address is not in the low bits, so refuse the
@@ -356,21 +536,41 @@ function blockedIpv6Reason(h: number[]): string | null {
   if (h[0] === 0x2001 && h[1] === 0x0000) return 'Teredo tunnel';
   if (h[0] === 0x2002) return '6to4 tunnel';
   if (h[0] === 0x2001 && h[1] <= 0x01ff) return 'IETF protocol assignment';
+  // 3fff::/20, documentation since RFC 9637. Inside 2000::/3, so the positive
+  // gate above lets it through and it needs naming here.
+  if (h[0] === 0x3fff && (h[1] & 0xf000) === 0) return 'documentation';
   return null;
 }
 
 /* ── Config parsing ───────────────────────────────────────────────────── */
 
-/** Parse SANDBOX_NET_ALLOWED_HOSTS. '*' (or an empty value) means "no host
- * allowlist"; entries that are not a valid host or '*.host' pattern are
- * dropped rather than silently widening the policy. */
-export function parseAllowedHosts(raw: string | undefined): string[] {
-  if (!raw) return [];
+export interface AllowedHostsConfig {
+  hosts: string[];
+  /** The operator configured an allowlist, but not one entry survived
+   * validation. See {@link NetPolicy.denyAllHosts}. */
+  denyAll: boolean;
+}
+
+/**
+ * Parse SANDBOX_NET_ALLOWED_HOSTS. '*' (or an empty value) means "no host
+ * allowlist"; entries that are not a valid host or '*.host' pattern are dropped
+ * rather than silently widening the policy.
+ *
+ * An empty result is ambiguous on its own — it is what both "no allowlist
+ * configured" and "every entry was a typo" produce — so the caller is told
+ * which happened. A restrictive policy written as 'api.example.com/v1' parses
+ * to nothing, and treating that as "no allowlist" would turn one typo into
+ * unrestricted egress to every public host.
+ */
+export function parseAllowedHostsConfig(raw: string | undefined): AllowedHostsConfig {
+  if (!raw) return { hosts: [], denyAll: false };
   const out: string[] = [];
+  let sawEntry = false;
   for (const piece of raw.split(',')) {
     const entry = piece.trim().toLowerCase();
     if (entry.length === 0) continue;
-    if (entry === '*') return [];
+    sawEntry = true;
+    if (entry === '*') return { hosts: [], denyAll: false };
     if (entry.startsWith('*.')) {
       if (normalizeHost(entry.slice(2)) !== null) out.push(entry);
       continue;
@@ -378,7 +578,13 @@ export function parseAllowedHosts(raw: string | undefined): string[] {
     const normalized = normalizeHost(entry);
     if (normalized !== null) out.push(normalized);
   }
-  return out;
+  return { hosts: out, denyAll: sawEntry && out.length === 0 };
+}
+
+/** The host list alone. Prefer {@link parseAllowedHostsConfig} where the
+ * "configured but unusable" case has to be distinguished. */
+export function parseAllowedHosts(raw: string | undefined): string[] {
+  return parseAllowedHostsConfig(raw).hosts;
 }
 
 /** Parse SANDBOX_NET_ALLOWED_PORTS; falls back to the given default when the
