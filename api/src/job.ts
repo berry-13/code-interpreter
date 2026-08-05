@@ -18,6 +18,7 @@ import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
 import type { ValidatedDependencies } from './dependencies';
+import { defaultManagerFor, type PackageManager } from '../../shared/requirements-header';
 import { createNetEgressProxy } from './net-egress-proxy';
 
 /* How Python and Node each spell "you imported something that isn't there". */
@@ -244,9 +245,14 @@ export function assertRegistryOnlyTree(lockJson: string, registry: string): void
     throw new ValidationError('npm install produced no readable lockfile to verify against the registry');
   }
 
+  /* Compare the full base URL, not just the origin. An Artifactory-style
+   * registry is path-scoped -- https://npm.corp.example/artifactory/api/npm/vetted/
+   * -- and matching on the host alone would accept any other repository the
+   * same server hosts, which is exactly the boundary the operator drew. */
   let expected: string;
   try {
-    expected = new URL(registry).origin;
+    const url = new URL(registry);
+    expected = url.origin + url.pathname.replace(/\/+$/, '');
   } catch {
     throw new ValidationError(`CODEAPI_DEPENDENCY_NPM_REGISTRY is not a valid URL: ${registry}`);
   }
@@ -262,17 +268,55 @@ export function assertRegistryOnlyTree(lockJson: string, registry: string): void
     if (typeof entry.resolved !== 'string' || entry.resolved.length === 0) {
       throw new ValidationError(`dependency '${name}' has no recorded source and cannot be verified`);
     }
-    let origin: string;
+    let resolvedBase: string;
     try {
-      origin = new URL(entry.resolved).origin;
+      const url = new URL(entry.resolved);
+      resolvedBase = url.origin + url.pathname;
     } catch {
       throw new ValidationError(`dependency '${name}' resolves to '${entry.resolved}', which is not a registry URL`);
     }
-    if (origin !== expected) {
+    // Prefix, with the boundary anchored so '/vetted' cannot match '/vetted-evil'.
+    if (resolvedBase !== expected && !resolvedBase.startsWith(`${expected}/`)) {
       throw new ValidationError(
-        `dependency '${name}' resolves to '${origin}', outside the configured npm registry '${expected}'`,
+        `dependency '${name}' resolves to '${resolvedBase}', outside the configured npm registry '${expected}'`,
       );
     }
+  }
+}
+
+/**
+ * Assert pip fetched every package from its index rather than by direct URL.
+ *
+ * `--index-url` chooses the index; it does not stop a package ON that index
+ * from declaring `Requires-Dist: child @ https://other.example/child.whl`, and
+ * pip honours that by fetching the URL. The top-level grammar rules URLs out of
+ * user input, so any direct reference in the resolved tree came from a package,
+ * not from the caller.
+ *
+ * Checked on pip's own `--report`, via `is_direct`, rather than by comparing
+ * hosts: PyPI serves its index from pypi.org and its files from
+ * files.pythonhosted.org, so a host comparison would reject the default
+ * configuration while telling us nothing extra about a private index.
+ */
+export function assertNoDirectUrlInstalls(reportJson: string): void {
+  let parsed: {
+    install?: { is_direct?: boolean; download_info?: { url?: string }; metadata?: { name?: string } }[];
+  };
+  try {
+    parsed = JSON.parse(reportJson);
+  } catch {
+    throw new ValidationError('pip install produced no readable report to verify its sources against');
+  }
+  if (!Array.isArray(parsed.install)) {
+    throw new ValidationError('pip install produced no readable report to verify its sources against');
+  }
+  for (const entry of parsed.install) {
+    if (entry.is_direct !== true) continue;
+    const name = entry.metadata?.name ?? 'unknown';
+    const url = entry.download_info?.url ?? 'a direct URL';
+    throw new ValidationError(
+      `dependency '${name}' was fetched from '${url}' rather than the configured index`,
+    );
   }
 }
 
@@ -1155,6 +1199,13 @@ export class Job {
     await applySandboxPathPermissionsNoFollow(reqPath, identity, 0o400, 'file');
 
     const requireHashes = pipSpecs.some(s => s.includes('--hash='));
+    /* `--index-url` selects the index; it does not stop a wheel from that index
+     * declaring `Requires-Dist: child @ https://other.example/child.whl`, which
+     * pip resolves by fetching that URL. Same shape as the npm case, and the
+     * same answer: ask pip for a report of what it actually did and refuse a
+     * tree containing anything it fetched by direct URL. `--no-deps` is not an
+     * option here — dependencies are the point. */
+    const reportPath = path.join(parent, `deps_report_${workspaceId}.json`);
     const args = [
       'install',
       '--requirement', reqPath,
@@ -1163,6 +1214,7 @@ export class Job {
       '--no-input',
       '--disable-pip-version-check',
       '--no-cache-dir',
+      '--report', reportPath,
       '--index-url', config.dependency_index_url,
     ];
     if (requireHashes) args.push('--require-hashes');
@@ -1173,8 +1225,10 @@ export class Job {
 
     try {
       await this.runInstaller(this.resolvePipPath(), args, depsDir, identity, deadlineAt);
+      assertNoDirectUrlInstalls(await fsp.readFile(reportPath, 'utf8').catch(() => ''));
     } finally {
       await fsp.rm(reqPath, { force: true }).catch(() => {});
+      await fsp.rm(reportPath, { force: true }).catch(() => {});
     }
   }
 
@@ -2841,17 +2895,26 @@ export class Job {
     const node = MISSING_NODE_MODULE_RE.test(text);
     if (!python && !node) return;
 
-    /* Show the syntax in the comment style of the language that failed, and
-     * pin only when the deployment requires it — a hint that produces a
-     * rejected declaration would be worse than none. */
+    /* The hint has to be valid in the language the job is actually written in,
+     * which is not the language that failed: a bash job shelling out to node
+     * gets a missing-node-module error, but '//' is not a bash comment and
+     * bash's default manager is pip, so the old hint produced either a bogus
+     * '//' command or a pip requirement for an npm package. Take the comment
+     * marker from the job's own language, and name the manager explicitly
+     * whenever it is not the one that language would default to. Pin only when
+     * the deployment requires it — a hint that produces a rejected declaration
+     * would be worse than none. */
     const pinned = config.dependency_require_pinned;
-    const hint = node
-      ? `\nHint: this package is not installed. Declare it with a '// requirements: name' ` +
-        `comment at the top of your code (for example '// requirements: ` +
-        `${pinned ? 'lodash@4.17.21' : 'lodash'}'); it is installed before your code runs.\n`
-      : `\nHint: this package is not installed. Declare it with a '# requirements: name' ` +
-        `comment at the top of your code (for example '# requirements: ` +
-        `${pinned ? 'cowsay==6.1' : 'cowsay'}'); it is installed before your code runs.\n`;
+    const marker = defaultManagerFor(this.runtime.language) === 'npm' ? '//' : '#';
+    const manager: PackageManager = node ? 'npm' : 'pip';
+    const qualifier = defaultManagerFor(this.runtime.language) === manager ? '' : `(${manager})`;
+    const example = node
+      ? (pinned ? 'lodash@4.17.21' : 'lodash')
+      : (pinned ? 'cowsay==6.1' : 'cowsay');
+    const declaration = `${marker} requirements${qualifier}:`;
+    const hint = `\nHint: this package is not installed. Declare it with a '${declaration} name' `
+      + `comment at the top of your code (for example '${declaration} ${example}'); `
+      + 'it is installed before your code runs.\n';
     run.stderr += hint;
     run.output += hint;
   }

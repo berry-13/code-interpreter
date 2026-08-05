@@ -153,13 +153,18 @@ export function checkPort(port: number, policy: NetPolicy): PolicyVerdict {
  * True when the host allowlist is what decides access, rather than the address
  * gate alone.
  *
- * This is the condition under which a CONNECT tunnel has to be bound to the
- * name it was authorized for. With no allowlist the policy is "any publicly
- * routable address", so a client that sends a different SNI over the tunnel
- * reaches another virtual host on an address that was already screened as
- * public — nothing it could not have reached with a second CONNECT. With an
- * allowlist the authority IS the boundary, and shared hosting or a CDN will
- * happily route the tunnel to whichever name the ClientHello asks for.
+ * This decides how strict the CONNECT tunnel check is, NOT whether it runs.
+ * The SNI is always checked against the host gate when the client sends one,
+ * because the infrastructure denylist applies with or without an allowlist —
+ * a split-horizon name like admin.internal can resolve to the same public edge
+ * as an ordinary site, and CONNECT to the ordinary name with the denied name in
+ * the SNI would otherwise reach it.
+ *
+ * What this flag changes is the treatment of a tunnel with NO name in it. With
+ * an allowlist the authority is the boundary, so a tunnel that cannot be bound
+ * to it (no SNI, or not TLS at all) is refused. Without one the destination was
+ * already settled by the address gate and there is no name to smuggle, so the
+ * tunnel stays opaque and carries any protocol.
  */
 export function hostAllowlistInForce(policy: NetPolicy): boolean {
   return policy.denyAllHosts === true || policy.allowedHosts.length > 0;
@@ -295,6 +300,11 @@ export function checkTunnelSni(sni: string | null, authority: string, policy: Ne
     // No SNI is only expected when the client is talking to an address, not a
     // name. Against a named authority it would leave the tunnel unbound.
     if (isIpLiteral(authority)) return ALLOW;
+    /* With no allowlist there is no name to smuggle: the destination was
+     * already settled by the address gate, and an absent SNI cannot reach a
+     * denied name. Requiring one here would break every non-TLS CONNECT in the
+     * default configuration for no gain. */
+    if (!hostAllowlistInForce(policy)) return ALLOW;
     return deny('CONNECT tunnel carries no TLS SNI to bind it to the approved host');
   }
   const normalized = normalizeHost(sni);

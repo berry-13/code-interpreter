@@ -7,6 +7,7 @@ import {
   isNormalizedObjectForSession,
   markerConflictsWithExplicitFile,
   aggregateBashExtras,
+  assertNoDirectUrlInstalls,
   assertRegistryOnlyTree,
   bakedNodeModulesFor,
   ensureNodeModulesSymlink,
@@ -718,6 +719,62 @@ describe('assertRegistryOnlyTree', () => {
   test('refuses an install that produced no lockfile to check', () => {
     expect(() => assertRegistryOnlyTree('', REGISTRY)).toThrow(/no readable lockfile/);
     expect(() => assertRegistryOnlyTree('{}', REGISTRY)).toThrow(/no readable lockfile/);
+  });
+});
+
+describe('assertNoDirectUrlInstalls', () => {
+  const report = (install: unknown[]): string => JSON.stringify({ install });
+
+  test('accepts a tree pip resolved entirely through its index', () => {
+    /* Note the host differs from the index on purpose: PyPI serves its index
+     * from pypi.org and its files from files.pythonhosted.org, which is why
+     * this checks is_direct rather than comparing origins. */
+    expect(() => assertNoDirectUrlInstalls(report([
+      { is_direct: false, metadata: { name: 'requests' }, download_info: { url: 'https://files.pythonhosted.org/x/requests.whl' } },
+      { is_direct: false, metadata: { name: 'idna' }, download_info: { url: 'https://files.pythonhosted.org/y/idna.whl' } },
+    ]))).not.toThrow();
+  });
+
+  test('refuses a transitive direct-URL requirement', () => {
+    // `Requires-Dist: child @ https://other.example/child.whl` on a package
+    // from the configured index.
+    expect(() => assertNoDirectUrlInstalls(report([
+      { is_direct: false, metadata: { name: 'parent' }, download_info: { url: 'https://files.pythonhosted.org/p/parent.whl' } },
+      { is_direct: true, metadata: { name: 'child' }, download_info: { url: 'https://other.example/child.whl' } },
+    ]))).toThrow(/child/);
+  });
+
+  test('refuses an install with no readable report', () => {
+    expect(() => assertNoDirectUrlInstalls('')).toThrow(/no readable report/);
+    expect(() => assertNoDirectUrlInstalls('{}')).toThrow(/no readable report/);
+  });
+});
+
+describe('assertRegistryOnlyTree with a path-scoped registry', () => {
+  const SCOPED = 'https://npm.corp.example/artifactory/api/npm/vetted/';
+  const lock = (packages: Record<string, unknown>): string => JSON.stringify({ packages });
+
+  test('accepts packages from the configured repository', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.example/artifactory/api/npm/vetted/pkg/-/pkg-1.0.0.tgz' },
+    }), SCOPED)).not.toThrow();
+  });
+
+  test('refuses another repository on the same host', () => {
+    /* An Artifactory-style registry is path-scoped, so matching on origin
+     * alone accepted any other repo the same server hosts. */
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.example/artifactory/api/npm/unvetted/pkg/-/pkg-1.0.0.tgz' },
+    }), SCOPED)).toThrow(/unvetted/);
+  });
+
+  test('does not let a prefix match cross a path boundary', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.example/artifactory/api/npm/vetted-evil/pkg.tgz' },
+    }), SCOPED)).toThrow(/vetted-evil/);
   });
 });
 

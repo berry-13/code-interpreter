@@ -559,8 +559,23 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
      * Only when an allowlist is in force: with none, the policy is already "any
      * publicly routable address", and a different SNI to a screened public
      * address reaches nothing a second CONNECT could not. */
-    let sniPending = approved.isConnect && hostAllowlistInForce(policy);
+    let sniPending = approved.isConnect;
     let helloBuffer = Buffer.alloc(0);
+
+    /* A tunnel with no name in it. With an allowlist the authority is the
+     * boundary and an unbindable tunnel is refused; without one the address
+     * gate already settled the destination and there is nothing to smuggle, so
+     * it stays opaque and carries any protocol. */
+    const passThroughUnnamedTunnel = (reason: string): boolean => {
+      if (hostAllowlistInForce(policy)) {
+        onOverrun(reason);
+        return false;
+      }
+      sniPending = false;
+      const held = helloBuffer;
+      helloBuffer = Buffer.alloc(0);
+      return socket.write(held);
+    };
 
     /** Write client bytes upstream, holding them back while the ClientHello is
      * still being read. Returns false when the socket asked for backpressure. */
@@ -569,16 +584,14 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
 
       helloBuffer = Buffer.concat([helloBuffer, chunk]);
       if (helloBuffer.length > MAX_CLIENT_HELLO_BYTES) {
-        onOverrun('CONNECT tunnel sent no parseable TLS ClientHello');
-        return false;
+        return passThroughUnnamedTunnel('CONNECT tunnel sent no parseable TLS ClientHello');
       }
       const verdict = inspectClientHelloSni(helloBuffer);
       if (verdict.status === 'need-more') return true;
       if (verdict.status !== 'ok') {
-        // A tunnel we cannot bind to a name is indistinguishable from one being
-        // used to reach a different one, so it does not get to proceed.
-        onOverrun(`CONNECT tunnel did not open with a TLS ClientHello (${verdict.status})`);
-        return false;
+        return passThroughUnnamedTunnel(
+          `CONNECT tunnel did not open with a TLS ClientHello (${verdict.status})`,
+        );
       }
       const sniVerdict = checkTunnelSni(verdict.sni, approved.host, policy);
       if (!sniVerdict.allowed) {
@@ -603,7 +616,14 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
        * is data leaving the sandbox and belongs in the byte budget. Counting
        * only bodies let a job spend the head limit per request for free. */
       const upstreamHead = buildUpstreamHead(approved);
+      /* Gate before writing, not just account for it: the path and headers are
+       * the job's own data leaving the sandbox, and a budget with a few bytes
+       * left would otherwise still let one full head out. */
       stats.bytesUp += Buffer.byteLength(upstreamHead);
+      if (budgetExhausted()) {
+        onOverrun('per-job byte budget exhausted');
+        return;
+      }
       socket.write(upstreamHead);
       /* Answer the client's expectation ourselves. Expect is hop-by-hop and was
        * stripped, so the origin is already waiting for a length-delimited body;

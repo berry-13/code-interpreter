@@ -673,6 +673,55 @@ describe('createNetEgressProxy', () => {
     expect(response).toContain('502');
   });
 
+  test('a denied SNI is refused even with no allowlist configured', async () => {
+    /* The infrastructure denylist applies with or without an allowlist, so the
+     * SNI check has to run either way: a split-horizon name like admin.internal
+     * can sit on the same public edge as an ordinary site, and CONNECT to the
+     * ordinary name with the denied name in the SNI would otherwise reach it. */
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port);
+
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'
+        + clientHelloFor('admin.internal').toString('latin1'),
+      { keepOpenMs: 250 },
+    );
+
+    expect(origin.received().length).toBe(0);
+  });
+
+  test('an ordinary SNI still passes with no allowlist configured', async () => {
+    const hello = clientHelloFor('other.example.com');
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port);
+
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' + hello.toString('latin1'),
+      { keepOpenMs: 250 },
+    );
+
+    expect(origin.received().equals(hello)).toBe(true);
+  });
+
+  test('the request head is not written once the byte budget is gone', async () => {
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    // Budget smaller than the head the proxy is about to rebuild.
+    const sock = await startDataPathProxy(origin.port, { maxTotalBytes: 8 });
+
+    await proxyRequest(
+      sock,
+      'GET http://example.com/a/fairly/long/path?with=query HTTP/1.1\r\nHost: example.com\r\n\r\n',
+      { keepOpenMs: 200 },
+    );
+
+    expect(origin.received().length).toBe(0);
+  });
+
   test('creates the socket with 0600 so only the job UID can connect', async () => {
     const sock = await startProxy(1);
     expect(fs.statSync(sock).mode & 0o777).toBe(0o600);

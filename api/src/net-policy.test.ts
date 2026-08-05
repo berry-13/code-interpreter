@@ -389,3 +389,25 @@ describe('checkTunnelSni', () => {
     expect(checkTunnelSni('', 'api.github.com', LISTED).allowed).toBe(false);
   });
 });
+
+describe('checkTunnelSni without an allowlist', () => {
+  test('still enforces the infrastructure denylist', () => {
+    // The denylist is part of the host gate with or without an allowlist.
+    expect(checkTunnelSni('admin.internal', 'example.com', OPEN).allowed).toBe(false);
+    expect(checkTunnelSni('metadata.google.internal', 'example.com', OPEN).allowed).toBe(false);
+    expect(checkTunnelSni('foo.cluster.local', 'example.com', OPEN).allowed).toBe(false);
+  });
+
+  test('allows any other public name, as the address gate already did', () => {
+    expect(checkTunnelSni('other.example.com', 'example.com', OPEN).allowed).toBe(true);
+  });
+
+  test('tolerates a tunnel with no name in it', () => {
+    /* Nothing to smuggle: the destination was settled by the address gate, and
+     * requiring an SNI here would break every non-TLS CONNECT by default. */
+    expect(checkTunnelSni(null, 'example.com', OPEN).allowed).toBe(true);
+    // With an allowlist the authority is the boundary, so it must be bindable.
+    expect(checkTunnelSni(null, 'api.github.com', LISTED).allowed).toBe(false);
+  });
+});
+
