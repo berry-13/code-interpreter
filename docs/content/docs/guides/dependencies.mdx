@@ -146,6 +146,12 @@ The properties that matter:
 The count, size and time budgets are shared across both managers: a job
 declaring pip and npm packages gets one 250 MB ceiling, not two.
 
+On Kubernetes these live under the `dependencies` chart value rather than in
+`workerSandbox.sandboxExtraEnv`, which rejects `CODEAPI_`-prefixed names, and
+enabling the feature also opens the sandbox tier's NetworkPolicy far enough to
+reach the index — see
+[Kubernetes](/docs/guides/deployment/kubernetes#dependencies-and-sandbox-networking).
+
 ## What is not supported
 
 - **Source-only packages.** Anything without a prebuilt wheel for the runtime

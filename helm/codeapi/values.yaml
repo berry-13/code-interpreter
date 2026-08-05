@@ -38,6 +38,52 @@ persistSessions:
   # Idle expiry of the session's Redis pointer in seconds (default 7d).
   stateTtlSeconds: 604800
 
+# Code-declared dependencies (opt-in, OFF by default): a request may declare
+# pip/npm packages, which sandbox-runner installs into a per-job directory --
+# outside the jail, before user code runs -- and mounts read-only. MUST be set
+# here rather than through workerSandbox.sandboxExtraEnv, which rejects
+# CODEAPI_-prefixed names. Enabling this makes sandbox-runner reach the package
+# index directly, so it also needs egress past the chart's NetworkPolicy (see
+# networkPolicy.sandboxRunner.allowExternalEgress). See the Dependencies guide.
+dependencies:
+  enabled: false
+  # Package index / registry the installers are pinned to. Point these at an
+  # internal mirror to keep installs inside your own network.
+  indexUrl: "https://pypi.org/simple"
+  npmRegistry: "https://registry.npmjs.org"
+  # Reject unpinned specs ("requests" without "==2.31.0").
+  requirePinned: true
+  # Per-job ceilings on the declared package count, install wall clock, and
+  # installed bytes. installTimeoutMs is spent inside the sandbox call the
+  # worker is waiting on, so workerSandbox.config.jobPrimeAllowanceMs must be
+  # at least this large; the chart refuses to render otherwise.
+  maxCount: 50
+  installTimeoutMs: 120000
+  maxBytes: 262144000
+
+# Outbound network for user code (opt-in, OFF by default): the jail keeps its
+# empty network namespace and reaches only a per-job proxy on the trusted side,
+# which enforces the host/port allowlist and the byte, request, and connection
+# budgets below. MUST be set here rather than through
+# workerSandbox.sandboxExtraEnv, which rejects CODEAPI_-prefixed names. Needs
+# networkPolicy.sandboxRunner.allowExternalEgress for the proxy's own egress.
+# See the Networking guide.
+sandboxNetwork:
+  enabled: false
+  # Comma-separated host allowlist; "*" or empty allows any public host that
+  # survives the proxy's IP checks. Suffix entries (".example.com") match
+  # subdomains.
+  allowedHosts: ""
+  # Comma-separated port allowlist. Keep networkPolicy.sandboxRunner
+  # .externalEgressPorts in sync, or the policy drops what the proxy allows.
+  allowedPorts: "80,443"
+  # Per-job budgets: bytes moved, requests issued, concurrent connections, and
+  # how long an idle connection is held open.
+  maxBytes: 268435456
+  maxRequests: 512
+  maxConnections: 32
+  idleTimeoutMs: 60000
+
 otel:
   enabled: false
   # OTLP/HTTP collector endpoint, e.g. "http://opentelemetry-collector.observability:4318".
@@ -526,3 +572,16 @@ networkPolicy:
     externalCIDRs: []
   toolCallServer:
     allowExternalEgress: false  # Allow tool call server to reach external APIs
+  sandboxRunner:
+    # sandbox-runner may otherwise egress only to the egress gateway. Both
+    # dependencies.enabled and sandboxNetwork.enabled need more than that -- the
+    # installers reach the package index, the per-job proxy reaches allowlisted
+    # hosts -- and both turn this on implicitly. Set it true to grant the same
+    # egress without either feature. Private ranges stay excluded either way; a
+    # sandbox-runner that can reach cluster-internal services is the thing this
+    # boundary exists to prevent.
+    allowExternalEgress: false
+    # Destination ports opened by the rule above. Must cover
+    # sandboxNetwork.allowedPorts plus whatever your index and registry listen
+    # on, or the policy drops connections the proxy considers allowed.
+    externalEgressPorts: [80, 443]

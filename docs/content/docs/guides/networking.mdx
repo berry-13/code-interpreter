@@ -33,6 +33,12 @@ There is no request field to set and nothing for the model to learn — the same
 reason the model cannot install packages on its own applies here, so the
 capability is switched on for every job or for none.
 
+On Kubernetes the flag lives in chart values instead, because
+`workerSandbox.sandboxExtraEnv` rejects `CODEAPI_`-prefixed names. Setting
+`sandboxNetwork.enabled: true` also opens the sandbox tier's NetworkPolicy to
+public addresses, which the proxy needs to reach anything at all — see
+[Kubernetes](/docs/guides/deployment/kubernetes#dependencies-and-sandbox-networking).
+
 ## How it works
 
 ```mermaid

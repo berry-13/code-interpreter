@@ -89,6 +89,25 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.egressGateway.service.port }}
+    {{- if or .Values.networkPolicy.sandboxRunner.allowExternalEgress .Values.dependencies.enabled .Values.sandboxNetwork.enabled }}
+    # Dependency installs and the per-job sandbox proxy both run in
+    # sandbox-runner and both talk to the public internet, so neither works
+    # under the egress-gateway-only rule above. Private ranges stay excluded:
+    # what this boundary exists to prevent is sandbox-runner reaching
+    # cluster-internal services, not it reaching PyPI.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        {{- range .Values.networkPolicy.sandboxRunner.externalEgressPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

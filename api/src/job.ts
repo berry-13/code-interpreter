@@ -1194,6 +1194,10 @@ export class Job {
     identity: SandboxJobIdentity,
     deadlineAt: number,
   ): Promise<void> {
+    // Before anything is written: a job with no python runtime to install with
+    // fails here, with nothing to clean up.
+    const pipPath = this.resolvePipPath();
+
     const reqPath = path.join(parent, `deps_req_${workspaceId}.txt`);
     await fsp.writeFile(reqPath, pipSpecs.join('\n') + '\n', { mode: 0o600 });
     await applySandboxPathPermissionsNoFollow(reqPath, identity, 0o400, 'file');
@@ -1202,10 +1206,18 @@ export class Job {
     /* `--index-url` selects the index; it does not stop a wheel from that index
      * declaring `Requires-Dist: child @ https://other.example/child.whl`, which
      * pip resolves by fetching that URL. Same shape as the npm case, and the
-     * same answer: ask pip for a report of what it actually did and refuse a
-     * tree containing anything it fetched by direct URL. `--no-deps` is not an
-     * option here — dependencies are the point. */
+     * same answer: ask pip for a report of what it resolved and refuse a tree
+     * containing anything it would fetch by direct URL. `--no-deps` is not an
+     * option here — dependencies are the point.
+     *
+     * pip writes the report itself, with a plain `open(path, 'w')`, as the
+     * per-job UID. The workspace root is root-owned 0711: that UID can traverse
+     * it but not create in it, so the file has to exist and belong to the job
+     * before pip runs or every pip install dies on EACCES. */
     const reportPath = path.join(parent, `deps_report_${workspaceId}.json`);
+    await fsp.writeFile(reportPath, '', { mode: 0o600 });
+    await applySandboxPathPermissionsNoFollow(reportPath, identity, 0o600, 'file');
+
     const args = [
       'install',
       '--requirement', reqPath,
@@ -1224,7 +1236,18 @@ export class Job {
     }
 
     try {
-      await this.runInstaller(this.resolvePipPath(), args, depsDir, identity, deadlineAt);
+      /* Resolve first, install second. Reading the report only after the real
+       * install means a package's direct-URL dependency has already been
+       * fetched and unpacked into `--target` by the time it is rejected — the
+       * install is refused, but code from a host the operator never configured
+       * reached the runner's disk. `--dry-run` produces the same report without
+       * installing anything, so the plan is vetoed before the tree exists. The
+       * real install re-checks, because the index is free to resolve
+       * differently the second time. */
+      await this.runInstaller(pipPath, [...args, '--dry-run'], depsDir, identity, deadlineAt);
+      assertNoDirectUrlInstalls(await fsp.readFile(reportPath, 'utf8').catch(() => ''));
+
+      await this.runInstaller(pipPath, args, depsDir, identity, deadlineAt);
       assertNoDirectUrlInstalls(await fsp.readFile(reportPath, 'utf8').catch(() => ''));
     } finally {
       await fsp.rm(reqPath, { force: true }).catch(() => {});
