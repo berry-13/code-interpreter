@@ -12,6 +12,36 @@ import {
   isReservedPtcFilename,
 } from './ptc-constants';
 import { hashToolInput, pendingInputHashesFromRawPayload } from './tool-input-signature';
+import { defaultManagerFor, extractRequirements } from '../../shared/requirements-header';
+
+/**
+ * Read the `# requirements:` declaration off the RAW user code and shape it for
+ * the payload.
+ *
+ * PTC prepends a generated preamble — up to 100 tool stubs with unbounded
+ * descriptions — so by the time the sandbox re-scans the file, a header that
+ * was on line one can sit well past MAX_SOURCE_SCAN_BYTES and be missed. The
+ * declaration then silently does nothing and the job fails later on import.
+ * Same reason createPayload extracts before the session wrapper.
+ */
+function declaredDependencies(
+  userCode: string,
+  language: string,
+): t.PayloadBody['dependencies'] {
+  const requirements = extractRequirements([userCode], defaultManagerFor(language));
+  if (
+    requirements.pip.length === 0
+    && requirements.npm.length === 0
+    && requirements.unsupported.length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    ...(requirements.pip.length > 0 ? { pip: requirements.pip } : {}),
+    ...(requirements.npm.length > 0 ? { npm: requirements.npm } : {}),
+    ...(requirements.unsupported.length > 0 ? { unsupported: requirements.unsupported } : {}),
+  };
+}
 
 // Load async matplotlib template for programmatic tool calling
 const templateCodeAsync = fs.readFileSync(path.join(__dirname, 'matplotlib-async.py'), 'utf8');
@@ -815,6 +845,9 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
     session_id,
   };
 
+  const dependencies = declaredDependencies(userCode, 'python');
+  if (dependencies) payload.dependencies = dependencies;
+
   if (mode === 'replay') {
     payload.files.push({
       name: PTC_HISTORY_FILENAME,
@@ -877,6 +910,9 @@ function buildBashPayload(args: {
     ],
     session_id,
   };
+
+  const dependencies = declaredDependencies(userCode, 'bash');
+  if (dependencies) payload.dependencies = dependencies;
 
   if (files && files.length > 0) {
     for (const obj of files) {

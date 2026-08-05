@@ -563,6 +563,116 @@ describe('createNetEgressProxy', () => {
     expect(response).not.toContain('200 OK');
   });
 
+  test('answers Expect: 100-continue so an upload does not deadlock', async () => {
+    /* Expect is hop-by-hop and gets stripped, so the origin waits for a body
+     * the client will not send until it sees a 100. curl sets this on any
+     * upload over ~1 KiB, so the deadlock was the common path. */
+    let seenBody = '';
+    const origin = await startOrigin((req, res) => {
+      let buf = '';
+      req.on('data', chunk => { buf += chunk.toString(); });
+      req.on('end', () => {
+        seenBody = buf;
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('got it');
+      });
+    });
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port);
+
+    const body = 'payload-bytes';
+    const response = await new Promise<string>(resolve => {
+      const client = net.connect({ path: sock });
+      let data = '';
+      let sentBody = false;
+      client.on('connect', () => client.write(
+        'POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\n'
+          + `Content-Length: ${body.length}\r\nExpect: 100-continue\r\n\r\n`,
+      ));
+      client.on('data', chunk => {
+        data += chunk.toString('utf8');
+        // Behave like a real client: hold the body until the 100 arrives.
+        if (!sentBody && data.includes('100 Continue')) {
+          sentBody = true;
+          client.write(body);
+        }
+      });
+      client.on('close', () => resolve(data));
+      setTimeout(() => { client.destroy(); resolve(data); }, 4_000);
+    });
+
+    expect(response).toContain('100 Continue');
+    expect(response).toContain('200 OK');
+    expect(seenBody).toBe(body);
+    // Expect is hop-by-hop; it must not reach the origin.
+    expect(buildUpstreamHead(parseRequestHead(
+      'POST http://example.com/u HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\nExpect: 100-continue',
+      OPEN,
+    ))).not.toContain('Expect');
+  });
+
+  test('a client that disconnects before finishing the head settles the read', async () => {
+    /* A destroyed socket emits 'close' and never 'end', and cleanup() has
+     * already cleared the header timer -- so the read used to hang forever,
+     * retaining the handleClient frame once per early disconnect. */
+    const sock = await startProxy(1, { headerTimeoutMs: 30_000 });
+    await new Promise<void>(resolve => {
+      const client = net.connect({ path: sock });
+      client.on('connect', () => {
+        client.write('GET http://example.com/ HTTP/1.1\r\nHost: exa');
+        setTimeout(() => { client.destroy(); resolve(); }, 50);
+      });
+      client.on('error', () => resolve());
+    });
+    // The proxy is still healthy and serving afterwards.
+    await new Promise(r => setTimeout(r, 100));
+    const response = await proxyRequest(sock, 'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n');
+    expect(response.length).toBeGreaterThan(0);
+  });
+
+  test('a pending dial that is destroyed settles instead of hanging', async () => {
+    /* `register` hands the connecting socket to the caller so teardown can
+     * destroy it. A connecting socket destroyed that way emits only 'close' --
+     * no 'error' -- and teardown has already cleared the connect timer, so
+     * without a 'close' listener openUpstream never settles and the awaiting
+     * handleClient frame is retained. Here the dial is killed directly and the
+     * client must get an answer rather than wait out connectTimeoutMs. */
+    const stalled: net.Socket[] = [];
+    const sock = await startProxy(1, {
+      addressScreen: () => null,
+      lookup: async () => [{ address: '127.0.0.1', family: 4 }],
+      connect: () => {
+        const socket = new net.Socket();
+        stalled.push(socket);
+        return socket;
+      },
+      connectTimeoutMs: 30_000,
+    });
+
+    const response = await new Promise<string>(resolve => {
+      const client = net.connect({ path: sock });
+      let data = '';
+      client.on('connect', () => {
+        client.write('GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n');
+        // Once the proxy has dialed, kill the in-flight socket.
+        const wait = setInterval(() => {
+          if (stalled.length > 0) {
+            clearInterval(wait);
+            stalled[0].destroy();
+          }
+        }, 20);
+      });
+      client.on('data', chunk => { data += chunk.toString('utf8'); });
+      client.on('close', () => resolve(data));
+      // Comfortably under connectTimeoutMs: if the promise hangs, this is what
+      // the test would fall back on, and the assertion below fails.
+      setTimeout(() => { client.destroy(); resolve(data); }, 3_000);
+    });
+
+    expect(stalled.length).toBe(1);
+    expect(response).toContain('502');
+  });
+
   test('creates the socket with 0600 so only the job UID can connect', async () => {
     const sock = await startProxy(1);
     expect(fs.statSync(sock).mode & 0o777).toBe(0o600);

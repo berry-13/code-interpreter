@@ -158,6 +158,9 @@ interface ParsedRequest {
   headers: [string, string][];
   contentLength: number;
   isConnect: boolean;
+  /** Client sent `Expect: 100-continue` and is holding its body until it gets
+   * an interim response. See the answer in handleClient. */
+  expectsContinue: boolean;
 }
 
 export class RequestRejected extends Error {
@@ -197,6 +200,7 @@ export function parseRequestHead(head: string, policy: NetPolicy): ParsedRequest
   let contentLength = -1;
   let sawTransferEncoding = false;
   let sawHostHeader = false;
+  let expectsContinue = false;
   for (const line of lines) {
     if (line.length === 0) throw new RequestRejected(400, 'empty header line');
     // A leading space is an obs-fold continuation; it is obsolete and is a
@@ -227,6 +231,12 @@ export function parseRequestHead(head: string, policy: NetPolicy): ParsedRequest
       sawHostHeader = true;
     }
     if (lower === 'upgrade') throw new RequestRejected(400, 'Upgrade is not supported');
+    /* Expect is hop-by-hop and is stripped with the rest, but it cannot just be
+     * dropped: the client is waiting for a 100 before it sends a byte of body,
+     * while the origin would be waiting for that body. Note it here so the
+     * proxy can answer the expectation itself. curl sets this on any upload
+     * over ~1 KiB, so this is the common path, not an exotic one. */
+    if (lower === 'expect' && value.toLowerCase() === '100-continue') expectsContinue = true;
     if (STRIPPED_HEADERS.has(lower)) continue;
     headers.push([name, value]);
   }
@@ -279,7 +289,7 @@ export function parseRequestHead(head: string, policy: NetPolicy): ParsedRequest
   const portVerdict = checkPort(port, policy);
   if (!portVerdict.allowed) throw new RequestRejected(403, portVerdict.reason);
 
-  return { method, host, port, target, headers, contentLength, isConnect };
+  return { method, host, port, target, headers, contentLength, isConnect, expectsContinue };
 }
 
 /** Split 'host:port' or '[v6]:port'. `defaultPort` of -1 means the port is
@@ -595,6 +605,15 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
       const upstreamHead = buildUpstreamHead(approved);
       stats.bytesUp += Buffer.byteLength(upstreamHead);
       socket.write(upstreamHead);
+      /* Answer the client's expectation ourselves. Expect is hop-by-hop and was
+       * stripped, so the origin is already waiting for a length-delimited body;
+       * the client, meanwhile, will not send one until it sees a 100. Without
+       * this the two wait for each other until the idle timeout, which is every
+       * curl upload over ~1 KiB. Interim responses precede the real one, so the
+       * client still gets the origin's status afterwards. */
+      if (approved.expectsContinue) {
+        client.write('HTTP/1.1 100 Continue\r\n\r\n');
+      }
     }
     if (body.length > 0) {
       bodyForwarded += body.length;
@@ -786,6 +805,7 @@ function readRequestHead(
       done = true;
       client.removeListener('data', onData);
       client.removeListener('end', onEnd);
+      client.removeListener('close', onClose);
       timers.clear('header');
       fn();
     };
@@ -820,9 +840,17 @@ function readRequestHead(
       }
     };
     const onEnd = (): void => settle(() => reject(new RequestRejected(400, 'connection closed before a complete request')));
+    /* A client that is destroyed rather than ended -- which is what the
+     * connection teardown does -- emits 'close' and never 'end'. Without this
+     * the promise never settles: cleanup() has already cleared the header
+     * timer, so nothing else would ever reject it, and the awaiting
+     * handleClient frame and its buffered partial head stay alive for the
+     * lifetime of the proxy. One leak per early disconnect. */
+    const onClose = (): void => settle(() => reject(new RequestRejected(400, 'connection closed before a complete request')));
 
     client.on('data', onData);
     client.on('end', onEnd);
+    client.on('close', onClose);
     timers.set('header', () => settle(() => reject(new RequestRejected(408, 'timed out reading the request head'))), timeoutMs);
   });
 }
@@ -924,6 +952,7 @@ function openUpstream(
       timers.clear('connect');
       socket.removeListener('connect', onConnect);
       socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
       fn();
     };
     const onConnect = (): void => settle(() => resolve(socket));
@@ -931,8 +960,17 @@ function openUpstream(
       socket.destroy();
       reject(new RequestRejected(502, 'upstream connection failed'));
     });
+    /* `register` above hands this socket to the caller's teardown, which
+     * destroys it if the client goes away mid-dial. A connecting socket
+     * destroyed that way emits 'close' with no 'error', and cleanup() has
+     * already cleared the connect timer -- so without this the await never
+     * settles and the whole handleClient frame is retained per aborted dial. */
+    const onClose = (): void => settle(() => {
+      reject(new RequestRejected(502, 'upstream connection closed before it was established'));
+    });
     socket.on('connect', onConnect);
     socket.on('error', onError);
+    socket.on('close', onClose);
     timers.set('connect', () => settle(() => {
       socket.destroy();
       reject(new RequestRejected(504, 'upstream connection timed out'));

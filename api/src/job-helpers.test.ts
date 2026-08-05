@@ -720,3 +720,4 @@ describe('assertRegistryOnlyTree', () => {
     expect(() => assertRegistryOnlyTree('{}', REGISTRY)).toThrow(/no readable lockfile/);
   });
 });
+

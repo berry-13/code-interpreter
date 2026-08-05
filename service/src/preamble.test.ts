@@ -133,3 +133,56 @@ describe('createProgrammaticPayload — tool-call socket opt-in', () => {
     expect(payload.tool_call_socket).toBeUndefined();
   });
 });
+
+
+describe('createProgrammaticPayload requirements extraction', () => {
+  /* The PTC preamble is prepended to the user's code, and with the allowed 100
+   * tools and unbounded descriptions it can push a header that was on line one
+   * past MAX_SOURCE_SCAN_BYTES -- so the sandbox's own re-scan misses it and
+   * the job fails later on import. Extract from the raw code, like the normal
+   * payload path does before the session wrapper. */
+  const bigTools = Array.from({ length: 60 }, (_, i) => ({
+    name: `tool_${i}`,
+    description: 'x'.repeat(2000),
+    parameters: { type: 'object', properties: {}, required: [] },
+  })) as Parameters<typeof createProgrammaticPayload>[0]['tools'];
+
+  test('forwards a declaration the preamble would have buried', () => {
+    const payload = createProgrammaticPayload({
+      req: { body: { code: '# requirements: cowsay==6.1\nimport cowsay' }, planId: '' } as Parameters<typeof createProgrammaticPayload>[0]['req'],
+      execution_id: 'exec_1',
+      session_id: 's1',
+      tools: bigTools,
+      mode: 'replay',
+    } as Parameters<typeof createProgrammaticPayload>[0]);
+
+    // The header really is out of the sandbox's scan window now...
+    const shipped = payload.files[0].content;
+    expect(shipped.indexOf('# requirements: cowsay==6.1')).toBeGreaterThan(64 * 1024);
+    // ...and the declaration still made it out.
+    expect(payload.dependencies).toEqual({ pip: ['cowsay==6.1'] });
+  });
+
+  test('leaves dependencies unset when nothing was declared', () => {
+    const payload = createProgrammaticPayload({
+      req: { body: { code: 'print(1)' }, planId: '' } as Parameters<typeof createProgrammaticPayload>[0]['req'],
+      execution_id: 'exec_2',
+      session_id: 's2',
+      tools: [],
+      mode: 'replay',
+    } as Parameters<typeof createProgrammaticPayload>[0]);
+    expect(payload.dependencies).toBeUndefined();
+  });
+
+  test('bash PTC forwards its declaration too', () => {
+    const payload = createProgrammaticPayload({
+      req: { body: { code: '# requirements: cowsay==6.1\npython3 -c "import cowsay"' }, planId: '' } as Parameters<typeof createProgrammaticPayload>[0]['req'],
+      execution_id: 'exec_3',
+      session_id: 's3',
+      tools: [],
+      mode: 'replay',
+      language: 'bash',
+    } as Parameters<typeof createProgrammaticPayload>[0]);
+    expect(payload.dependencies).toEqual({ pip: ['cowsay==6.1'] });
+  });
+});

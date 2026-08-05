@@ -1211,7 +1211,12 @@ export class Job {
       JSON.stringify({ name: 'codeapi-job-deps', version: '0.0.0', private: true }) + '\n',
       { mode: 0o600 },
     );
-    await applySandboxPathPermissionsNoFollow(manifestPath, identity, 0o400, 'file');
+    /* Writable, not 0o400: `npm install <spec>` saves the specs to the manifest
+     * by default and fails outright when it cannot, and `--no-save` — which
+     * would avoid the write — also suppresses the lockfile this whole approach
+     * reads. The installer runs as the job UID, which already owns the install
+     * tree, and both files are removed below before anything is mounted. */
+    await applySandboxPathPermissionsNoFollow(manifestPath, identity, 0o600, 'file');
 
     const args = [
       'install',
@@ -1227,12 +1232,18 @@ export class Job {
     if (!this.isSynthetic) {
       this.log.info({ count: npmSpecs.length }, 'Installing npm dependencies');
     }
+    /* Cache OUTSIDE depsDir. It used to sit at <depsDir>/.npm-cache, which
+     * dirSizeBytes then counted against CODEAPI_DEPENDENCY_MAX_BYTES and which
+     * was mounted into the jail as part of /mnt/deps — so a job could fail the
+     * size cap on tarballs it never asked to keep, and the sandbox got a copy
+     * of the cache for free. Sibling dir, per job, removed either way. */
+    const cacheDir = path.join(path.dirname(depsDir), `deps_cache_${path.basename(depsDir)}`);
+    await fsp.mkdir(cacheDir, { recursive: true, mode: 0o700 });
+    await applySandboxPathPermissions(cacheDir, identity, 0o700);
+
     try {
       await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, deadlineAt, {
-        /* npm writes its cache and any temp state relative to these; point both
-         * inside the per-job dir so nothing lands in the runner's HOME and
-         * concurrent jobs cannot collide in a shared cache. */
-        npm_config_cache: path.join(depsDir, '.npm-cache'),
+        npm_config_cache: cacheDir,
         npm_config_update_notifier: 'false',
       });
       assertRegistryOnlyTree(
@@ -1240,9 +1251,10 @@ export class Job {
         config.dependency_npm_registry,
       );
     } finally {
-      // Neither belongs in the read-only tree the jail sees.
+      // None of these belong in the read-only tree the jail sees.
       await fsp.rm(lockPath, { force: true }).catch(() => {});
       await fsp.rm(manifestPath, { force: true }).catch(() => {});
+      await fsp.rm(cacheDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -1277,8 +1289,15 @@ export class Job {
       .filter(r => r.language === 'node')
       .sort((a, b) => semver.rcompare(a.version.raw, b.version.raw))[0];
     if (!node) {
+      /* Bun-backed JS runtimes (CODEAPI_LANGUAGES=python,bun) register as
+       * 'bun' and ship no npm, but js/ts still default to the npm manager, so
+       * this is reachable with a JS runtime present. Bun's own installer writes
+       * a different lockfile format than assertRegistryOnlyTree reads, so npm
+       * requirements need the node runtime rather than a second, unverified
+       * install path. Name that, instead of describing the tree. */
       throw new ValidationError(
-        'npm requirements were declared but no node runtime is installed to install them with',
+        'npm requirements were declared but no node runtime is installed to install them with; '
+          + 'add "node" to CODEAPI_LANGUAGES (Bun runtimes do not ship npm)',
       );
     }
     return path.join(node.pkgdir, 'bin', 'npm');

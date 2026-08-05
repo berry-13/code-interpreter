@@ -131,6 +131,15 @@ The properties that matter:
 | `CODEAPI_DEPENDENCY_INDEX_URL` | `https://pypi.org/simple` | Where wheels come from |
 | `CODEAPI_DEPENDENCY_NPM_REGISTRY` | `https://registry.npmjs.org` | Where npm packages come from |
 
+<Callout type="warn">
+  **npm requirements need the `node` runtime installed.** Bun-backed JS runtimes
+  (`CODEAPI_LANGUAGES=python,bun`) register as `bun` and ship no npm, but `js`
+  and `ts` jobs still default to the npm manager — so a `// requirements:` job
+  fails during prime with a message telling you to add `node` to
+  `CODEAPI_LANGUAGES`. Bun's own installer is not used as a fallback: it writes
+  a different lockfile format, and the registry verification above reads npm's.
+</Callout>
+
 The count, size and time budgets are shared across both managers: a job
 declaring pip and npm packages gets one 250 MB ceiling, not two.
 
