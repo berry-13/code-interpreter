@@ -577,11 +577,13 @@ networkPolicy:
     # dependencies.enabled and sandboxNetwork.enabled need more than that -- the
     # installers reach the package index, the per-job proxy reaches allowlisted
     # hosts -- and both turn this on implicitly. Set it true to grant the same
-    # egress without either feature. Private ranges stay excluded either way; a
-    # sandbox-runner that can reach cluster-internal services is the thing this
-    # boundary exists to prevent.
+    # egress without either feature. Private, link-local (cloud instance
+    # metadata) and CGNAT ranges stay excluded either way; a sandbox-runner that
+    # can reach cluster-internal services or the metadata endpoint is the thing
+    # this boundary exists to prevent.
     allowExternalEgress: false
     # Destination ports opened by the rule above. Must cover
     # sandboxNetwork.allowedPorts plus whatever your index and registry listen
-    # on, or the policy drops connections the proxy considers allowed.
+    # on, or the policy drops connections the proxy considers allowed. Empty
+    # falls back to 80/443.
     externalEgressPorts: [80, 443]

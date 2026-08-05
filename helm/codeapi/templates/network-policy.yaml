@@ -92,9 +92,12 @@ spec:
     {{- if or .Values.networkPolicy.sandboxRunner.allowExternalEgress .Values.dependencies.enabled .Values.sandboxNetwork.enabled }}
     # Dependency installs and the per-job sandbox proxy both run in
     # sandbox-runner and both talk to the public internet, so neither works
-    # under the egress-gateway-only rule above. Private ranges stay excluded:
-    # what this boundary exists to prevent is sandbox-runner reaching
-    # cluster-internal services, not it reaching PyPI.
+    # under the egress-gateway-only rule above. What stays excluded is
+    # everything this boundary actually exists to protect: cluster-internal
+    # services, and the link-local range that carries cloud instance metadata.
+    # An empty port list falls back to 80/443 rather than rendering `ports:`
+    # with nothing under it, which Kubernetes reads as "every port".
+    {{- $externalEgressPorts := .Values.networkPolicy.sandboxRunner.externalEgressPorts | default (list 80 443) }}
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -102,8 +105,10 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
       ports:
-        {{- range .Values.networkPolicy.sandboxRunner.externalEgressPorts }}
+        {{- range $externalEgressPorts }}
         - protocol: TCP
           port: {{ . }}
         {{- end }}
