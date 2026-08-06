@@ -40,6 +40,11 @@ export interface NetPolicy {
    * is falling back to the 80,443 default, which would widen a policy written
    * to narrow it. Startup refuses this configuration too. */
   denyAllPorts?: boolean;
+  /** Exact hosts that skip the infrastructure denylist because the operator
+   * named them as this policy's destination — the dependency index and
+   * registry, which are commonly `.internal` or a `.svc.cluster.local` service.
+   * Never set for user code: the denylist is the whole point there. */
+  exemptHosts?: string[];
   /** What to call this allowlist in a denial. Defaults to the sandbox's env
    * var, which is where the policy comes from for user code; the dependency
    * installers run under a policy derived from the index and registry instead,
@@ -134,6 +139,14 @@ export function isIpLiteral(host: string): boolean {
  * look at addresses — checkAddress does that after resolution.
  */
 export function checkHost(host: string, policy: NetPolicy): PolicyVerdict {
+  /* The denylist covers the names untrusted code must never reach —
+   * infrastructure suffixes like `.internal`, `.svc` and `.cluster.local`. An
+   * internal package mirror is exactly one of those names, and it is the
+   * operator's own configuration rather than anything a job can influence, so
+   * an exact configured host is exempt. Only an exact match: no wildcard, no
+   * suffix, and never reachable from the sandbox's own policy, which sets
+   * none. */
+  if (policy.exemptHosts?.includes(host)) return ALLOW;
   if (DENIED_HOSTS.has(host)) return deny('host is denied by policy');
   for (const suffix of DENIED_HOST_SUFFIXES) {
     if (host.endsWith(suffix)) return deny(`host suffix '${suffix}' is denied by policy`);

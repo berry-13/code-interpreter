@@ -598,6 +598,39 @@ describe('ensureNodeModulesSymlink', () => {
     }
   });
 
+  /* With declared packages the link is the only way an `import` can see them —
+   * ESM ignores NODE_PATH — so a workspace that already has node_modules is a
+   * collision the caller has to hear about rather than a successful install
+   * the program cannot use. */
+  it('refuses a real node_modules directory when packages were declared', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codeapi-job-'));
+    const submissionDir = path.join(tmpDir, 'submission');
+
+    try {
+      fs.mkdirSync(submissionDir, { recursive: true });
+      fs.mkdirSync(path.join(submissionDir, 'node_modules'));
+      expect(() => ensureNodeModulesSymlink(submissionDir, '/mnt/deps/node_modules', true))
+        .toThrow(/already contains a node_modules/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('repoints a stale link at the per-job install when packages were declared', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codeapi-job-'));
+    const submissionDir = path.join(tmpDir, 'submission');
+    const linkPath = path.join(submissionDir, 'node_modules');
+
+    try {
+      fs.mkdirSync(submissionDir, { recursive: true });
+      fs.symlinkSync('/pkgs/node/24/node_modules', linkPath, 'dir');
+      ensureNodeModulesSymlink(submissionDir, '/mnt/deps/node_modules', true);
+      expect(fs.readlinkSync(linkPath)).toBe('/mnt/deps/node_modules');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not replace an existing user-provided node_modules path', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codeapi-job-'));
     const target = path.join(tmpDir, 'runtime-node_modules');

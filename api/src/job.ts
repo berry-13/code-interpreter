@@ -346,13 +346,29 @@ function errorCode(err: unknown): string | undefined {
 export function ensureNodeModulesSymlink(
   submissionDir: string,
   nodeModulesPath?: string,
+  /** Set when the job declared npm packages. Then this link is not a
+   * convenience but the only route by which those packages are visible: ESM
+   * ignores NODE_PATH entirely, so leaving a workspace's own node_modules in
+   * place would mean a successful install the program cannot import. A stale
+   * link is replaced; a real directory is a collision the caller has to know
+   * about, because silently ignoring either half of it is worse. */
+  required = false,
 ): void {
   if (!nodeModulesPath) return;
   const linkPath = path.join(submissionDir, 'node_modules');
   try {
-    fs.lstatSync(linkPath);
-    return;
+    const existing = fs.lstatSync(linkPath);
+    if (!required) return;
+    if (!existing.isSymbolicLink()) {
+      throw new ValidationError(
+        'the workspace already contains a node_modules directory, which would shadow the '
+          + 'packages declared by this job; remove it or drop the requirements declaration',
+      );
+    }
+    if (fs.readlinkSync(linkPath) === nodeModulesPath) return;
+    fs.unlinkSync(linkPath);
   } catch (err) {
+    if (err instanceof ValidationError) throw err;
     if (errorCode(err) !== 'ENOENT') throw err;
   }
 
@@ -1239,13 +1255,32 @@ export class Job {
         denyAllHosts: hosts.length === 0,
         allowedPorts: ports,
         denyAllPorts: false,
+        /* The same operator-configured names, exempted from the denylist that
+         * exists to keep USER CODE off `.internal`/`.svc`/`.cluster.local`. A
+         * mirror at `mirror.internal` is otherwise refused before
+         * CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX can matter. */
+        exemptHosts: hosts,
         allowlistLabel: 'the configured package index, registry and CODEAPI_DEPENDENCY_ALLOWED_HOSTS',
       },
       /* An operator whose index IS an internal mirror opts out of the address
        * gate explicitly. The host allowlist above still bounds this to the
        * mirror they configured. */
       addressScreen: config.dependency_allow_private_index ? () => null : undefined,
-      maxTotalBytes: config.dependency_max_bytes,
+      /* Budgets sized for an installer, not for user code. The proxy's own
+       * defaults are the sandbox's, and an install is a very different shape:
+       *
+       * - Requests: one resolution asks for an index page, metadata and an
+       *   archive per package, and the phase runs pip's dry-run, pip's install
+       *   and npm's resolution through this one proxy. Scaled off the declared
+       *   package limit so raising CODEAPI_DEPENDENCY_MAX_COUNT does not walk
+       *   into a 429 that no dependency setting could raise.
+       * - Bytes: the same wheels cross twice (dry-run, then install), and a
+       *   compressed archive is smaller than what it unpacks to, so the byte
+       *   ceiling cannot be the disk ceiling. The size cap is enforced on disk
+       *   while the installer runs; this is only a backstop against a download
+       *   that never ends. */
+      maxRequests: Math.max(1024, config.dependency_max_count * 64),
+      maxTotalBytes: config.dependency_max_bytes * 3,
       idleTimeoutMs: config.dependency_install_timeout_ms,
       log: this.log,
     });
@@ -2885,7 +2920,7 @@ export class Job {
     const hasInstalledNodeModules = installedNodeModules !== undefined
       && fs.existsSync(installedNodeModules);
     if (hasInstalledNodeModules) {
-      ensureNodeModulesSymlink(this.submissionDir, '/mnt/deps/node_modules');
+      ensureNodeModulesSymlink(this.submissionDir, '/mnt/deps/node_modules', true);
     } else {
       ensureNodeModulesSymlink(this.submissionDir, bakedNodeModules.nodeModulesPath);
     }

@@ -212,6 +212,24 @@ const NETWORK_PROXY_ENV: Record<string, string> = {
    * flow fails while curl and python in the same jail work. Harmless on
    * runtimes that do not know the variable. */
   NODE_USE_ENV_PROXY: '1',
+  /* The JVM is the other client that reads none of the above: its default
+   * ProxySelector is built from system properties, so `java.net.http.HttpClient`
+   * and `HttpURLConnection` dial the destination directly, the shim refuses a
+   * connect that is not the proxy endpoint, and a Java job fails while curl in
+   * the same jail works. JAVA_TOOL_OPTIONS is the only way to reach a JVM the
+   * runtime's `run` script launches without rebuilding the packages volume.
+   *
+   * It costs one "Picked up JAVA_TOOL_OPTIONS" line on stderr per JVM start,
+   * which is the JVM's own doing and cannot be suppressed. Only when sandbox
+   * networking is on, and only for a runtime that reads it. */
+  JAVA_TOOL_OPTIONS: [
+    `-Dhttp.proxyHost=127.0.0.1`,
+    `-Dhttp.proxyPort=${NET_PROXY_PORT}`,
+    `-Dhttps.proxyHost=127.0.0.1`,
+    `-Dhttps.proxyPort=${NET_PROXY_PORT}`,
+    // Not the desktop's proxy settings, which do not exist in a jail.
+    '-Djava.net.useSystemProxies=false',
+  ].join(' '),
 };
 
 export { SIGNALS };

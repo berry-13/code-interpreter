@@ -396,6 +396,28 @@ describe('inspectClientHelloSni', () => {
   });
 });
 
+describe('checkHost exemptions', () => {
+  /* The denylist keeps USER code off infrastructure names. An internal package
+   * mirror is one of those names by definition, and it is the operator's own
+   * configuration, so the dependency installers' policy exempts exactly the
+   * hosts it was pointed at -- otherwise allowPrivateIndex and a mirror CIDR
+   * still could not reach mirror.internal. */
+  test('an exact operator-configured host survives the infrastructure denylist', () => {
+    const policy = {
+      allowedHosts: ['mirror.internal'],
+      allowedPorts: [443],
+      exemptHosts: ['mirror.internal'],
+    };
+    expect(checkHost('mirror.internal', policy).allowed).toBe(true);
+    expect(checkHost('index.mirror.internal', policy).allowed).toBe(false);
+  });
+
+  test('the sandbox policy sets no exemptions, so the denylist still bites', () => {
+    expect(checkHost('mirror.internal', { allowedHosts: [], allowedPorts: [443] }).allowed)
+      .toBe(false);
+  });
+});
+
 describe('checkTunnelSni', () => {
   test('lets the tunnel through for the name it was authorized for', () => {
     expect(checkTunnelSni('api.github.com', 'api.github.com', LISTED).allowed).toBe(true);

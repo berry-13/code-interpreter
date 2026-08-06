@@ -105,7 +105,19 @@ static int is_proxy_endpoint(const struct sockaddr *addr, socklen_t len) {
     }
     if (addr->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
         const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)(const void *)addr;
-        return IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) && ntohs(in6->sin6_port) == proxy_port;
+        if (ntohs(in6->sin6_port) != proxy_port) return 0;
+        if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr)) return 1;
+        /* A dual-stack client reaching 127.0.0.1 sends it as ::ffff:127.0.0.1
+         * on an AF_INET6 socket — which is what the JVM does, so a Java job
+         * pointed at the proxy was refused here and reported "Connection
+         * refused" no matter how the proxy was configured. Same endpoint, same
+         * single allowed port; only the spelling differs. */
+        if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+            uint32_t v4;
+            memcpy(&v4, &in6->sin6_addr.s6_addr[12], sizeof(v4));
+            return v4 == htonl(INADDR_LOOPBACK);
+        }
+        return 0;
     }
     return 0;
 }

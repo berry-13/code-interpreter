@@ -150,6 +150,22 @@ valid pattern is dropped rather than widening the policy.
 Every allowed and denied request is logged with its host, port and resolved
 address, and each job logs a usage summary.
 
+## Client coverage
+
+Every shipped runtime reaches the proxy without the job doing anything, but not
+all of them read the same configuration, so three are set for you:
+
+| Runtime | Reads | Set for it |
+| --- | --- | --- |
+| Python, curl, bash | `http_proxy` / `https_proxy` | — |
+| Node `node:http`, most libraries | `HTTP_PROXY` / `HTTPS_PROXY` | — |
+| Node built-in `fetch()` | neither, unless told to | `NODE_USE_ENV_PROXY=1` |
+| Java `HttpClient`, `HttpURLConnection` | system properties only | `JAVA_TOOL_OPTIONS` |
+
+The JVM prints one `Picked up JAVA_TOOL_OPTIONS: …` line to stderr per start.
+That is the JVM's own doing and cannot be suppressed; it appears only in Java
+jobs and only while sandbox networking is enabled.
+
 ## What is not supported
 
 - **Inbound connections.** Nothing can reach into the sandbox.

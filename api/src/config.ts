@@ -170,9 +170,15 @@ export const config = {
   /* Hosts the installers may reach BESIDES the index and registry themselves,
    * which are always allowed. The default covers PyPI, which lists on pypi.org
    * and serves files from files.pythonhosted.org; an index that delivers its
-   * own files needs nothing here. `||` for the same reason as the index URL:
-   * Compose forwards an unset knob as an empty string. */
-  dependency_allowed_hosts: (process.env.CODEAPI_DEPENDENCY_ALLOWED_HOSTS || 'files.pythonhosted.org')
+   * own files needs nothing here.
+   *
+   * `??`, not `||`: an operator whose mirror serves its own files sets this
+   * EMPTY to mean "nothing besides the mirror", and `||` would quietly hand
+   * that deployment public PyPI file-host access back. The deployment
+   * manifests therefore render the default themselves — Compose with
+   * `${VAR-default}`, which substitutes only when the variable is unset — so an
+   * empty value here really did come from the operator. */
+  dependency_allowed_hosts: (process.env.CODEAPI_DEPENDENCY_ALLOWED_HOSTS ?? 'files.pythonhosted.org')
     .split(',')
     .map(entry => entry.trim())
     .filter(entry => entry.length > 0),
