@@ -4,6 +4,7 @@ import type * as t from './types';
 import { planLimits, languageConfig, resolveLanguage, env } from './config';
 import { Languages } from './enum';
 import { wrapPythonForSessionPersistence } from './session-persist';
+import { defaultManagerFor, extractRequirements } from '../../shared/requirements-header';
 
 export const templateCode = fs.readFileSync(path.join(__dirname, 'matplotlib.py'), 'utf8');
 
@@ -12,7 +13,7 @@ export function createPayload({
   isPyPlot,
   session_id,
 }: t.CreatePayload): t.PayloadBody {
-  const { lang: rawLang, code: userCode, args, files, dependencies, run_timeout } = req.body as t.RequestBody;
+  const { lang: rawLang, code: userCode, args, files, run_timeout } = req.body as t.RequestBody;
   const language = resolveLanguage(rawLang);
   if (language === undefined) {
     throw new Error(`Unsupported language: ${rawLang}`);
@@ -21,6 +22,13 @@ export function createPayload({
   if (config === undefined) {
     throw new Error(`Unsupported language: ${rawLang}`);
   }
+
+  /* Extract the `# requirements:` declaration from the ORIGINAL user code,
+   * before any wrapping. It has to happen here: with persistent sessions the
+   * code is base64-encoded into the wrapper below, so the sandbox would never
+   * see the header as text. The sandbox validates whatever we forward -- this
+   * side only reads it. */
+  const requirements = extractRequirements([userCode ?? ''], defaultManagerFor(language));
 
   let finalCode: string;
   if (isPyPlot === true) {
@@ -57,16 +65,29 @@ export function createPayload({
     ]
   };
 
+  /* Forward per manager, and forward `unsupported` with them. It has to travel:
+   * the sandbox re-parses `finalCode` for direct callers, but for a persistent
+   * Python session that code is a base64 wrapper, so a `requirements(cargo):`
+   * header is invisible there. Dropping it here is what would silently run the
+   * job instead of producing the promised error naming the manager. */
+  if (
+    requirements.pip.length > 0
+    || requirements.npm.length > 0
+    || requirements.unsupported.length > 0
+  ) {
+    payload.dependencies = {
+      ...(requirements.pip.length > 0 ? { pip: requirements.pip } : {}),
+      ...(requirements.npm.length > 0 ? { npm: requirements.npm } : {}),
+      ...(requirements.unsupported.length > 0 ? { unsupported: requirements.unsupported } : {}),
+    };
+  }
+
   if (session_id) {
     payload.session_id = session_id;
   }
 
   if (args) {
     payload.args = args;
-  }
-
-  if (dependencies) {
-    payload.dependencies = dependencies;
   }
 
   /* The router has already validated and clamped this against MAX_RUN_TIMEOUT

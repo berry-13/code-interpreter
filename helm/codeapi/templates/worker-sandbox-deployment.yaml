@@ -19,6 +19,9 @@ Split runtime deployments:
 {{- if not .Values.executionManifest.publicKey }}
 {{- fail "workerSandbox.enabled requires executionManifest.publicKey so sandbox-runner can verify signed execute manifests without a signing secret. The chart ships no default keypair; derive the public key from your Ed25519 private key (see helm/codeapi/README.md 'Execution manifest signing keys') and set it via --set or a values file (base64 DER or PEM with escaped newlines). For minikube local dev use -f values-local.yaml" }}
 {{- end }}
+{{- if and .Values.dependencies.enabled (lt (int .Values.workerSandbox.config.jobPrimeAllowanceMs) (int .Values.dependencies.installTimeoutMs)) }}
+{{- fail (printf "dependencies.enabled requires workerSandbox.config.jobPrimeAllowanceMs (%v) to be at least dependencies.installTimeoutMs (%v): the install runs inside the sandbox call the worker is waiting on, so a smaller prime allowance aborts the call partway through the install" .Values.workerSandbox.config.jobPrimeAllowanceMs .Values.dependencies.installTimeoutMs) }}
+{{- end }}
 {{- range .Values.workerSandbox.sandboxExtraEnv }}
 {{- $name := .name | default "" }}
 {{- if and $name (or (regexMatch "(?i)(SECRET|TOKEN|PASSWORD|KEY)" $name) (hasPrefix "REDIS_" $name) (hasPrefix "AWS_" $name) (hasPrefix "S3_" $name) (hasPrefix "MINIO_" $name) (hasPrefix "CODEAPI_" $name) (eq $name "FILE_SERVER_URL") (eq $name "TOOL_CALL_SERVER_URL")) }}
@@ -319,6 +322,41 @@ spec:
               value: "true"
             - name: SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY
               value: {{ .Values.executionManifest.publicKey | quote }}
+            # Code-declared dependencies and sandbox networking. Both are
+            # CODEAPI_-prefixed, which sandboxExtraEnv rejects, so the chart has
+            # to render them itself or the features cannot be enabled at all.
+            - name: CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES
+              value: {{ .Values.dependencies.enabled | quote }}
+            - name: CODEAPI_DEPENDENCY_INDEX_URL
+              value: {{ .Values.dependencies.indexUrl | quote }}
+            - name: CODEAPI_DEPENDENCY_NPM_REGISTRY
+              value: {{ .Values.dependencies.npmRegistry | quote }}
+            - name: CODEAPI_DEPENDENCY_ALLOWED_HOSTS
+              value: {{ .Values.dependencies.allowedHosts | quote }}
+            - name: CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX
+              value: {{ .Values.dependencies.allowPrivateIndex | quote }}
+            - name: CODEAPI_DEPENDENCY_REQUIRE_PINNED
+              value: {{ .Values.dependencies.requirePinned | quote }}
+            - name: CODEAPI_DEPENDENCY_MAX_COUNT
+              value: {{ .Values.dependencies.maxCount | int64 | quote }}
+            - name: CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS
+              value: {{ .Values.dependencies.installTimeoutMs | int64 | quote }}
+            - name: CODEAPI_DEPENDENCY_MAX_BYTES
+              value: {{ .Values.dependencies.maxBytes | int64 | quote }}
+            - name: CODEAPI_ALLOW_SANDBOX_NETWORK
+              value: {{ .Values.sandboxNetwork.enabled | quote }}
+            - name: SANDBOX_NET_ALLOWED_HOSTS
+              value: {{ .Values.sandboxNetwork.allowedHosts | quote }}
+            - name: SANDBOX_NET_ALLOWED_PORTS
+              value: {{ .Values.sandboxNetwork.allowedPorts | quote }}
+            - name: SANDBOX_NET_MAX_BYTES
+              value: {{ .Values.sandboxNetwork.maxBytes | int64 | quote }}
+            - name: SANDBOX_NET_MAX_REQUESTS
+              value: {{ .Values.sandboxNetwork.maxRequests | int64 | quote }}
+            - name: SANDBOX_NET_MAX_CONNECTIONS
+              value: {{ .Values.sandboxNetwork.maxConnections | int64 | quote }}
+            - name: SANDBOX_NET_IDLE_TIMEOUT_MS
+              value: {{ .Values.sandboxNetwork.idleTimeoutMs | int64 | quote }}
             {{- with .Values.workerSandbox.sandboxExtraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

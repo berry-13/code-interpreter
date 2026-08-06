@@ -16,6 +16,7 @@
     "languages",
     "files",
     "dependencies",
+    "networking",
     "sessions",
     "tool-calling",
     "---Operating it---",

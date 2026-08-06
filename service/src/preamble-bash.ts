@@ -304,6 +304,14 @@ _ptc_maybe_emit_pending() {
             _ptc_prune_finished_tool_jobs
             : > "$_PTC_WAIT_RAN_FILE"
         fi
+        # A command substitution that recorded a tool call forces the emit
+        # below, but a background tool job launched before it may not have
+        # written its pending entry yet. Join the tracked jobs first so the
+        # sentinel carries the whole batch instead of whichever child won
+        # the race.
+        if [ "$_ptc_force_pending_emit" = "1" ] && [ -s "$_PTC_TOOL_JOBS_FILE" ]; then
+            _ptc_wait_for_tracked_tool_jobs
+        fi
     fi
     if declare -F _ptc_contains_tool_command >/dev/null 2>&1 && _ptc_contains_tool_command "$BASH_COMMAND"; then
         _ptc_note_bare_tool_command

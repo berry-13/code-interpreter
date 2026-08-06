@@ -1,4 +1,6 @@
+import * as fs from 'fs';
 import { config } from './config';
+import { NET_SHIM_LIBRARY } from './nsjail';
 import { workspaceIsolationConfigErrors } from './workspace-isolation';
 
 export class SandboxSecureStartupError extends Error {
@@ -62,6 +64,11 @@ const ALLOWED_CODEAPI_ENV = new Set([
   'CODEAPI_DEPENDENCY_MAX_COUNT',
   'CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS',
   'CODEAPI_DEPENDENCY_MAX_BYTES',
+  'CODEAPI_DEPENDENCY_REQUIRE_PINNED',
+  'CODEAPI_DEPENDENCY_NPM_REGISTRY',
+  'CODEAPI_DEPENDENCY_ALLOWED_HOSTS',
+  'CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX',
+  'CODEAPI_ALLOW_SANDBOX_NETWORK',
 ]);
 
 function forbiddenEnvNames(): string[] {
@@ -77,6 +84,54 @@ function forbiddenEnvNames(): string[] {
     if (/(SECRET|TOKEN|PASSWORD|PRIVATE_KEY)/.test(name)) forbidden.push(name);
   }
   return Array.from(new Set(forbidden)).sort();
+}
+
+/**
+ * Refuse to start when sandbox networking is enabled but the preload shim is
+ * missing from the image. Without this every job would run with an LD_PRELOAD
+ * the loader cannot resolve: ld.so writes an error to stderr for each process,
+ * polluting user output, and no job would have working network access anyway.
+ * Runs in every mode.
+ *
+ * NOTE: this used to also refuse hardened mode outright, because the earlier
+ * design relaxed the seccomp AF_INET rule and libkrun's TSI carries AF_INET
+ * past the jail namespace. The shim removed that relaxation, so hardened mode
+ * is supported again — the AF_INET block is now unconditional.
+ */
+export function validateSandboxNetworkStartup(
+  opts: { enabled?: boolean; binaryPath?: string; denyAllHosts?: boolean; denyAllPorts?: boolean } = {},
+): void {
+  const enabled = opts.enabled ?? config.allow_sandbox_network;
+  const binaryPath = opts.binaryPath ?? NET_SHIM_LIBRARY;
+  if (!enabled) return;
+
+  try {
+    fs.accessSync(binaryPath, fs.constants.R_OK);
+  } catch {
+    throw new SandboxSecureStartupError(
+      `CODEAPI_ALLOW_SANDBOX_NETWORK=true requires ${binaryPath} in the sandbox image; ` +
+        'rebuild the sandbox runner image so the network shim is present',
+    );
+  }
+
+  /* A restrictive allowlist that parses to nothing is the dangerous typo: the
+   * runtime denies on it (NetPolicy.denyAllHosts), but the operator asked for
+   * a working allowlist and would otherwise only find out from denied jobs. */
+  const denyAllHosts = opts.denyAllHosts ?? config.sandbox_network_deny_all_hosts;
+  if (denyAllHosts) {
+    throw new SandboxSecureStartupError(
+      'SANDBOX_NET_ALLOWED_HOSTS is set but no entry is a valid host or *.host pattern; ' +
+        "fix the entries, or set it to '*' (or leave it unset) to allow any publicly routable host",
+    );
+  }
+
+  const denyAllPorts = opts.denyAllPorts ?? config.sandbox_network_deny_all_ports;
+  if (denyAllPorts) {
+    throw new SandboxSecureStartupError(
+      'SANDBOX_NET_ALLOWED_PORTS is set but no entry is a valid port number; ' +
+        'fix the entries, or leave it unset to allow the default 80,443',
+    );
+  }
 }
 
 export function validateHardenedSandboxStartup(): void {

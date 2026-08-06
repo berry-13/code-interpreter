@@ -89,6 +89,60 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.egressGateway.service.port }}
+    {{- if or .Values.networkPolicy.sandboxRunner.allowExternalEgress .Values.dependencies.enabled .Values.sandboxNetwork.enabled }}
+    # Dependency installs and the per-job sandbox proxy both run in
+    # sandbox-runner and both talk to the public internet, so neither works
+    # under the egress-gateway-only rule above. What stays excluded is
+    # everything this boundary actually exists to protect: cluster-internal
+    # services, and the link-local range that carries cloud instance metadata.
+    # An empty port list falls back to 80/443 rather than rendering `ports:`
+    # with nothing under it, which Kubernetes reads as "every port".
+    {{- $externalEgressPorts := .Values.networkPolicy.sandboxRunner.externalEgressPorts | default (list 80 443) }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+        {{- if .Values.networkPolicy.sandboxRunner.externalEgressIPv6 }}
+        # Dual-stack: the proxy pins whatever address it resolved, so a host
+        # that answers AAAA passes every application check and then dies at the
+        # policy unless ::/0 is here too. Same exclusions in v6 terms: ULA,
+        # link-local, loopback, and the v4-mapped range that would otherwise
+        # carry a private v4 destination past the list above.
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "fc00::/7"
+              - "fe80::/10"
+              - "::1/128"
+              - "::ffff:0:0/96"
+        {{- end }}
+      ports:
+        {{- range $externalEgressPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- with .Values.networkPolicy.sandboxRunner.mirrorCIDRs }}
+    # An index or registry inside the cluster network. The rule above excludes
+    # every private range on purpose, so a deployment that points
+    # dependencies.indexUrl at an internal mirror has to name it here — and
+    # only it, rather than reopening RFC1918 wholesale.
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        {{- range $externalEgressPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -281,9 +281,29 @@ Off by default. See [Dynamic dependencies](/docs/guides/dependencies).
 | --- | --- | --- |
 | `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES` | `false` | Allow per-job pip installs. |
 | `CODEAPI_DEPENDENCY_INDEX_URL` | `https://pypi.org/simple` | Package index the runner fetches from. |
+| `CODEAPI_DEPENDENCY_ALLOWED_HOSTS` | `files.pythonhosted.org` | Other hosts the installers may reach. |
+| `CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX` | `false` | Allow an index or registry on a private address. |
 | `CODEAPI_DEPENDENCY_MAX_COUNT` | `50` | Max packages per job. |
+| `CODEAPI_DEPENDENCY_REQUIRE_PINNED` | `true` | Require `name==version`. Set false to accept bare names and ranges. |
 | `CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS` | `120000` | Install timeout. |
 | `CODEAPI_DEPENDENCY_MAX_BYTES` | `262144000` | Total install size cap. |
+
+## Sandbox networking
+
+Off by default. See [Sandbox networking](/docs/guides/networking).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEAPI_ALLOW_SANDBOX_NETWORK` | `false` | Allow user code outbound HTTP/HTTPS through a per-job proxy. |
+| `SANDBOX_NET_ALLOWED_HOSTS` | *(empty)* | Host allowlist; empty or `*` means any publicly routable host. |
+| `SANDBOX_NET_ALLOWED_PORTS` | `80,443` | Destination ports the sandbox may reach. |
+| `SANDBOX_NET_MAX_BYTES` | `268435456` | Bytes proxied per job, both directions. |
+| `SANDBOX_NET_MAX_REQUESTS` | `512` | Requests per job. |
+| `SANDBOX_NET_MAX_CONNECTIONS` | `32` | Concurrent proxied connections per job. |
+| `SANDBOX_NET_IDLE_TIMEOUT_MS` | `60000` | Idle time before a proxied connection is torn down. |
+
+Non-public destinations (private, loopback, link-local/metadata, CGNAT, ULA)
+are refused unconditionally and cannot be enabled by configuration.
 
 ## Service URLs
 

@@ -173,8 +173,12 @@ if [ "$SANDBOX_USE_CGROUPV2" = "true" ]; then
     NSJAIL_CGROUP_ARGS=(--use_cgroupv2)
 fi
 
+# --iface_no_lo matches the default job posture: it used to live in
+# sandbox.cfg and moved to the command line when sandbox networking became
+# per-job (see nsjail.ts). Without it the smoke jail would differ from a real
+# one by having loopback up.
 if timeout 10 /usr/sbin/nsjail --config "${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}" \
-    "${NSJAIL_CGROUP_ARGS[@]}" --log "$SMOKE_LOG" \
+    "${NSJAIL_CGROUP_ARGS[@]}" --log "$SMOKE_LOG" --iface_no_lo \
     --user "65534:${SMOKE_OUTSIDE_UID}:1" --group "65534:${SMOKE_OUTSIDE_GID}:1" \
     -s /usr/bin:/bin -s /usr/lib:/lib -s /usr/lib64:/lib64 \
     -B "$SMOKE_DIR:/mnt/data" \

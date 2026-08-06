@@ -209,6 +209,25 @@ wait
     expect(parsed.stdout).not.toContain('SIDE_EFFECT');
   });
 
+  test('waits for a slow background tool job before emitting the command-substitution batch', () => {
+    // The background job records its pending call well after the command
+    // substitution records its own. Without joining the tracked tool jobs the
+    // forced emit races the background write and drops get_weather.
+    const run = runBash(assemble(`
+sleep 0.3 && get_weather '{"city":"Oslo"}' &
+result=$(calculate '{"expression":"2+3"}')
+echo "SIDE_EFFECT: $result"
+wait
+`), 3000);
+
+    const parsed = extractPendingFromStdout(run.stdout, executionId);
+    expect(run.signal).not.toBe('SIGTERM');
+    expect(run.exitCode).toBe(0);
+    expect(pendingNames(run.stdout)).toEqual(['calculate', 'get_weather']);
+    expect(parsed.pending).toHaveLength(2);
+    expect(parsed.stdout).not.toContain('SIDE_EFFECT');
+  });
+
   test('waits for background compound commands that invoke tools later', () => {
     const run = runBash(assemble(`
 (sleep 0.2; get_weather '{"city":"Paris"}') &

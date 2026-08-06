@@ -1,4 +1,4 @@
-import { describe, it, expect, mock } from 'bun:test';
+import { describe, it, test, expect, mock } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -7,6 +7,9 @@ import {
   isNormalizedObjectForSession,
   markerConflictsWithExplicitFile,
   aggregateBashExtras,
+  assertNoDirectUrlInstalls,
+  assertRegistryOnlyTree,
+  bakedNodeModulesFor,
   ensureNodeModulesSymlink,
   isHiddenDirectory,
   inputsLiveUnder,
@@ -595,6 +598,39 @@ describe('ensureNodeModulesSymlink', () => {
     }
   });
 
+  /* With declared packages the link is the only way an `import` can see them —
+   * ESM ignores NODE_PATH — so a workspace that already has node_modules is a
+   * collision the caller has to hear about rather than a successful install
+   * the program cannot use. */
+  it('refuses a real node_modules directory when packages were declared', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codeapi-job-'));
+    const submissionDir = path.join(tmpDir, 'submission');
+
+    try {
+      fs.mkdirSync(submissionDir, { recursive: true });
+      fs.mkdirSync(path.join(submissionDir, 'node_modules'));
+      expect(() => ensureNodeModulesSymlink(submissionDir, '/mnt/deps/node_modules', true))
+        .toThrow(/already contains a node_modules/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('repoints a stale link at the per-job install when packages were declared', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codeapi-job-'));
+    const submissionDir = path.join(tmpDir, 'submission');
+    const linkPath = path.join(submissionDir, 'node_modules');
+
+    try {
+      fs.mkdirSync(submissionDir, { recursive: true });
+      fs.symlinkSync('/pkgs/node/24/node_modules', linkPath, 'dir');
+      ensureNodeModulesSymlink(submissionDir, '/mnt/deps/node_modules', true);
+      expect(fs.readlinkSync(linkPath)).toBe('/mnt/deps/node_modules');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not replace an existing user-provided node_modules path', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codeapi-job-'));
     const target = path.join(tmpDir, 'runtime-node_modules');
@@ -649,3 +685,129 @@ describe('tarLongNameOverheadBytes', () => {
     expect(tarLongNameOverheadBytes('あ'.repeat(30))).toBe(0);
   });
 });
+
+describe('assertRegistryOnlyTree', () => {
+  const REGISTRY = 'https://registry.npmjs.org';
+  const lock = (packages: Record<string, unknown>): string => JSON.stringify({ packages });
+
+  test('accepts a tree that came entirely from the configured registry', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': { name: 'codeapi-job-deps' },
+      'node_modules/left-pad': { resolved: 'https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz' },
+      'node_modules/ms': { resolved: 'https://registry.npmjs.org/ms/-/ms-2.1.3.tgz' },
+    }), REGISTRY)).not.toThrow();
+  });
+
+  test('refuses a transitive git dependency', () => {
+    /* `--registry` only routes the specs we pass. A package on the registry can
+     * still declare `"dep": "git+https://..."`, and npm fetches it. */
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/ok': { resolved: 'https://registry.npmjs.org/ok/-/ok-1.0.0.tgz' },
+      'node_modules/sneaky': { resolved: 'git+ssh://git@github.com/attacker/pkg.git#deadbeef' },
+    }), REGISTRY)).toThrow(/sneaky/);
+  });
+
+  test('refuses a tarball from another host', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/sneaky': { resolved: 'https://evil.example.com/pkg.tgz' },
+    }), REGISTRY)).toThrow(/evil.example.com/);
+  });
+
+  test('refuses a package whose source was not recorded', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/mystery': {},
+    }), REGISTRY)).toThrow(/cannot be verified/);
+  });
+
+  test('refuses a local link', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/linked': { link: true, resolved: 'file:../elsewhere' },
+    }), REGISTRY)).toThrow(/local link/);
+  });
+
+  test('allows a bundled dependency, which rode inside a checked tarball', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/parent': { resolved: 'https://registry.npmjs.org/parent/-/parent-1.0.0.tgz' },
+      'node_modules/parent/node_modules/child': { inBundle: true },
+    }), REGISTRY)).not.toThrow();
+  });
+
+  test('honours a self-hosted registry', () => {
+    const internal = 'https://npm.corp.internal/repo';
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.internal/repo/pkg/-/pkg-1.0.0.tgz' },
+    }), internal)).not.toThrow();
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz' },
+    }), internal)).toThrow(/registry.npmjs.org/);
+  });
+
+  test('refuses an install that produced no lockfile to check', () => {
+    expect(() => assertRegistryOnlyTree('', REGISTRY)).toThrow(/no readable lockfile/);
+    expect(() => assertRegistryOnlyTree('{}', REGISTRY)).toThrow(/no readable lockfile/);
+  });
+});
+
+describe('assertNoDirectUrlInstalls', () => {
+  const report = (install: unknown[]): string => JSON.stringify({ install });
+
+  test('accepts a tree pip resolved entirely through its index', () => {
+    /* Note the host differs from the index on purpose: PyPI serves its index
+     * from pypi.org and its files from files.pythonhosted.org, which is why
+     * this checks is_direct rather than comparing origins. */
+    expect(() => assertNoDirectUrlInstalls(report([
+      { is_direct: false, metadata: { name: 'requests' }, download_info: { url: 'https://files.pythonhosted.org/x/requests.whl' } },
+      { is_direct: false, metadata: { name: 'idna' }, download_info: { url: 'https://files.pythonhosted.org/y/idna.whl' } },
+    ]))).not.toThrow();
+  });
+
+  test('refuses a transitive direct-URL requirement', () => {
+    // `Requires-Dist: child @ https://other.example/child.whl` on a package
+    // from the configured index.
+    expect(() => assertNoDirectUrlInstalls(report([
+      { is_direct: false, metadata: { name: 'parent' }, download_info: { url: 'https://files.pythonhosted.org/p/parent.whl' } },
+      { is_direct: true, metadata: { name: 'child' }, download_info: { url: 'https://other.example/child.whl' } },
+    ]))).toThrow(/child/);
+  });
+
+  test('refuses an install with no readable report', () => {
+    expect(() => assertNoDirectUrlInstalls('')).toThrow(/no readable report/);
+    expect(() => assertNoDirectUrlInstalls('{}')).toThrow(/no readable report/);
+  });
+});
+
+describe('assertRegistryOnlyTree with a path-scoped registry', () => {
+  const SCOPED = 'https://npm.corp.example/artifactory/api/npm/vetted/';
+  const lock = (packages: Record<string, unknown>): string => JSON.stringify({ packages });
+
+  test('accepts packages from the configured repository', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.example/artifactory/api/npm/vetted/pkg/-/pkg-1.0.0.tgz' },
+    }), SCOPED)).not.toThrow();
+  });
+
+  test('refuses another repository on the same host', () => {
+    /* An Artifactory-style registry is path-scoped, so matching on origin
+     * alone accepted any other repo the same server hosts. */
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.example/artifactory/api/npm/unvetted/pkg/-/pkg-1.0.0.tgz' },
+    }), SCOPED)).toThrow(/unvetted/);
+  });
+
+  test('does not let a prefix match cross a path boundary', () => {
+    expect(() => assertRegistryOnlyTree(lock({
+      '': {},
+      'node_modules/pkg': { resolved: 'https://npm.corp.example/artifactory/api/npm/vetted-evil/pkg.tgz' },
+    }), SCOPED)).toThrow(/vetted-evil/);
+  });
+});
+

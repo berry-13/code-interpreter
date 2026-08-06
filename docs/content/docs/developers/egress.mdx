@@ -4,7 +4,10 @@ description: How anything gets out of a sandbox that has no network, the gateway
 icon: DoorOpen
 ---
 
-The sandbox has no network access. Yet it must download input files, upload
+The sandbox has no network access of its own. (The opt-in
+[sandbox networking](/docs/guides/networking) feature adds a proxied HTTP path
+for user code; it is off by default and does not change anything below.) Yet it
+must download input files, upload
 results, and route tool calls. The egress gateway is how that happens without
 giving untrusted code a credential.
 
@@ -41,6 +44,15 @@ Two independent mechanisms enforce this:
    outright, so ordinary network calls fail at the syscall layer.
 2. **The network namespace is empty** (`clone_newnet: true`), so even permitted
    sockets have nowhere to go.
+
+<Callout type="warn">
+Layer 2 is weaker than it looks on KVM/libkrun runners: libkrun's TSI
+intercepts `AF_INET` at the guest socket layer and forwards it to the host, so
+an allowed socket bypasses the namespace entirely. There, layer 1 — the seccomp
+block — is the *only* thing keeping user code off the network. Do not relax it
+on a libkrun deployment; [sandbox networking](/docs/guides/networking) is built
+so that it never has to be.
+</Callout>
 
 The one exception is a single forwarded port:
 

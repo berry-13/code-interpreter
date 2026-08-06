@@ -1,3 +1,5 @@
+import { parseAllowedHostsConfig, parseAllowedPortsConfig } from './net-policy';
+
 type LimitOverrides = Record<string, Record<string, number> | undefined>;
 
 function parseLimitOverrides(raw: string): LimitOverrides {
@@ -8,6 +10,21 @@ function parseLimitOverrides(raw: string): LimitOverrides {
   } catch {
     return {};
   }
+}
+
+/**
+ * Parses a boolean env var, treating blank the same as unset.
+ *
+ * That distinction is the whole point: compose forwards `${VAR:-}`, so an unset
+ * knob reaches the process as an empty string, not undefined. Comparing
+ * `(raw ?? 'true') === 'true'` therefore read blank as an explicit "not true"
+ * and silently flipped every default-on flag OFF for compose deployments that
+ * left it alone.
+ */
+export function envFlag(raw: string | undefined, fallback: boolean): boolean {
+  const value = raw?.trim();
+  if (value === undefined || value.length === 0) return fallback;
+  return value === 'true';
 }
 
 /**
@@ -28,6 +45,8 @@ const requireExecutionManifest = (
   ?? (egressGatewayUrl ? 'true' : 'false')
 ) === 'true';
 const sandboxStartedAtSeconds = Math.floor(Date.now() / 1000);
+const sandboxNetAllowedHosts = parseAllowedHostsConfig(process.env.SANDBOX_NET_ALLOWED_HOSTS);
+const sandboxNetAllowedPorts = parseAllowedPortsConfig(process.env.SANDBOX_NET_ALLOWED_PORTS, [80, 443]);
 
 function cleanDirectory(raw: string | undefined): string | undefined {
   if (!raw?.trim()) return undefined;
@@ -50,8 +69,8 @@ export const config = {
   packages_directory: cleanDirectory(process.env.SANDBOX_PACKAGES_DIRECTORY)
     ?? legacyPackagesDirectory(process.env.SANDBOX_DATA_DIRECTORY)
     ?? '/pkgs',
-  disable_networking: (process.env.SANDBOX_DISABLE_NETWORKING ?? 'true') === 'true',
-  use_cgroupv2: (process.env.SANDBOX_USE_CGROUPV2 ?? 'true') === 'true',
+  disable_networking: envFlag(process.env.SANDBOX_DISABLE_NETWORKING, true),
+  use_cgroupv2: envFlag(process.env.SANDBOX_USE_CGROUPV2, true),
   allowed_local_network_port: Number(process.env.SANDBOX_ALLOWED_LOCAL_NETWORK_PORT ?? 0),
   output_max_size: Number(process.env.SANDBOX_OUTPUT_MAX_SIZE ?? 1024),
   max_process_count: Number(process.env.SANDBOX_MAX_PROCESS_COUNT ?? 64),
@@ -64,7 +83,7 @@ export const config = {
   compile_memory_limit: Number(process.env.SANDBOX_COMPILE_MEMORY_LIMIT ?? -1),
   run_memory_limit: Number(process.env.SANDBOX_RUN_MEMORY_LIMIT ?? -1),
   max_concurrent_jobs: safeInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS, 8),
-  per_job_uids: (process.env.SANDBOX_PER_JOB_UIDS ?? 'true') === 'true',
+  per_job_uids: envFlag(process.env.SANDBOX_PER_JOB_UIDS, true),
   job_uid_base: safeInt(process.env.SANDBOX_JOB_UID_BASE, 200000),
   job_gid_base: safeInt(process.env.SANDBOX_JOB_GID_BASE, 200000),
   job_uid_count: safeInt(
@@ -96,13 +115,78 @@ export const config = {
    * pip --only-binary=:all: (wheels only -> no build/setup.py code runs) into a
    * per-job dir mounted READ-ONLY into the jail. The jail itself gains no
    * network; only the trusted runner fetches from the allowlisted index. */
+  /* ADDING A CODEAPI_* KNOB? It must be listed in TWO allowlists or it will be
+   * silently absent at runtime and fall back to its default:
+   *   1. `ALLOWED_CODEAPI_ENV` in secure-startup.ts — hardened mode otherwise
+   *      refuses to boot with it set.
+   *   2. `ALLOW_EXACT` in launcher/src/main.rs — the KVM launcher filters which
+   *      variables cross into the microVM guest, and CODEAPI_ is a deny prefix.
+   * Both have bitten this feature already; there is no runtime error, just a
+   * flag that appears to be set and does nothing. */
   allow_dynamic_dependencies: process.env.CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES === 'true',
+  /* Sandbox network egress (opt-in, OFF by default). When enabled, a per-job
+   * HTTP proxy (net-egress-proxy.ts) listens on a unix socket bind-mounted
+   * into the jail, and net-shim.c (LD_PRELOAD) rewrites a client's connect()
+   * to 127.0.0.1:8080 onto that socket, so ordinary HTTP_PROXY-aware clients
+   * work while the seccomp block on AF_INET stays fully in force. Every
+   * destination is decided by the proxy on the trusted side.
+   *
+   * With no host allowlist the policy is "any publicly routable address":
+   * private, loopback, link-local (cloud metadata), CGNAT, ULA and the other
+   * special-purpose ranges are refused unconditionally and cannot be opened
+   * up by configuration. */
+  allow_sandbox_network: process.env.CODEAPI_ALLOW_SANDBOX_NETWORK === 'true',
+  sandbox_network_allowed_hosts: sandboxNetAllowedHosts.hosts,
+  /* An allowlist that parsed to nothing must deny, not fall back to "no
+   * allowlist". Startup refuses this too; both halves are kept so neither is
+   * load-bearing on its own. */
+  sandbox_network_deny_all_hosts: sandboxNetAllowedHosts.denyAll,
+  sandbox_network_allowed_ports: sandboxNetAllowedPorts.ports,
+  sandbox_network_deny_all_ports: sandboxNetAllowedPorts.denyAll,
+  sandbox_network_max_bytes: safeInt(process.env.SANDBOX_NET_MAX_BYTES, 268435456),
+  sandbox_network_max_requests: safeInt(process.env.SANDBOX_NET_MAX_REQUESTS, 512),
+  sandbox_network_max_connections: safeInt(process.env.SANDBOX_NET_MAX_CONNECTIONS, 32),
+  sandbox_network_idle_timeout_ms: safeInt(process.env.SANDBOX_NET_IDLE_TIMEOUT_MS, 60000),
   // `||` (not `??`): compose passes an empty string when the var is unset, and
   // an empty index URL would break pip.
   dependency_index_url: process.env.CODEAPI_DEPENDENCY_INDEX_URL || 'https://pypi.org/simple',
+  dependency_npm_registry: process.env.CODEAPI_DEPENDENCY_NPM_REGISTRY || 'https://registry.npmjs.org',
   dependency_max_count: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_COUNT, 50),
+  /* Pinned `name==version` is required by default: it makes a run reproducible,
+   * and it means a compromised NEW release of a package cannot change what an
+   * already-working job installs. Set false to accept bare names and ranges and
+   * let pip resolve the version — far friendlier for an LLM, which rarely knows
+   * real version numbers and will otherwise pin one that does not exist, at the
+   * cost of both of those properties.
+   *
+   * envFlag (not `??`): compose forwards `${VAR:-}`, so an unset knob arrives
+   * as an empty string rather than undefined. With `??` that blank counted as
+   * an explicit "not true" and silently turned pinning OFF for every Compose
+   * deployment that left it alone — the opposite of the documented default and
+   * of the security posture. Same reason the index URL above uses `||`. */
+  dependency_require_pinned: envFlag(process.env.CODEAPI_DEPENDENCY_REQUIRE_PINNED, true),
   dependency_install_timeout_ms: safeInt(process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS, 120000),
   dependency_max_bytes: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_BYTES, 262144000),
+  /* Hosts the installers may reach BESIDES the index and registry themselves,
+   * which are always allowed. The default covers PyPI, which lists on pypi.org
+   * and serves files from files.pythonhosted.org; an index that delivers its
+   * own files needs nothing here.
+   *
+   * `??`, not `||`: an operator whose mirror serves its own files sets this
+   * EMPTY to mean "nothing besides the mirror", and `||` would quietly hand
+   * that deployment public PyPI file-host access back. The deployment
+   * manifests therefore render the default themselves — Compose with
+   * `${VAR-default}`, which substitutes only when the variable is unset — so an
+   * empty value here really did come from the operator. */
+  dependency_allowed_hosts: (process.env.CODEAPI_DEPENDENCY_ALLOWED_HOSTS ?? 'files.pythonhosted.org')
+    .split(',')
+    .map(entry => entry.trim())
+    .filter(entry => entry.length > 0),
+  /* The installer proxy screens addresses the same way the sandbox's does, so
+   * an index on a private address is refused by default. Set true when the
+   * configured index or registry IS an internal mirror — the host allowlist
+   * above is then what bounds where installs can reach. */
+  dependency_allow_private_index: envFlag(process.env.CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX, false),
   require_execution_manifest: requireExecutionManifest,
   execution_manifest_body_hash_required_after_seconds: sandboxStartedAtSeconds + safeInt(
     process.env.SANDBOX_EXECUTION_MANIFEST_BODY_HASH_LEGACY_GRACE_SECONDS,

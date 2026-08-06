@@ -122,30 +122,6 @@ components:
         version:
           type: integer
 
-    Dependencies:
-      type: object
-      description: |
-        Request-declared packages installed for this job only, before user code
-        runs. **Off by default**: enable with
-        `CODEAPI_ALLOW_DYNAMIC_DEPENDENCIES=true`, otherwise a request carrying
-        this field is rejected.
-
-        Installs run in the trusted runner with `pip --only-binary=:all:`, so
-        only prebuilt wheels are used and no `setup.py` executes. The result is
-        mounted read-only into the sandbox on `PYTHONPATH`; the sandbox itself
-        still has no network.
-      properties:
-        pip:
-          type: array
-          description: |
-            Pinned `name==version` specs, each optionally followed by one or
-            more ` --hash=sha256:<hex>` options. When any entry is hashed, all
-            must be, and pip runs with `--require-hashes`. Bounded by
-            `CODEAPI_DEPENDENCY_MAX_COUNT` (default 50).
-          items:
-            type: string
-            example: cowsay==6.1
-
     ExecRequest:
       type: object
       required: [code, lang]
@@ -177,8 +153,6 @@ components:
           description: Previously uploaded files to stage into the workspace.
           items:
             $ref: '#/components/schemas/RequestFile'
-        dependencies:
-          $ref: '#/components/schemas/Dependencies'
         run_timeout:
           type: integer
           minimum: 1
@@ -550,15 +524,19 @@ paths:
                       storage_session_id: 7fZq2NkP0aRcVbXsLmTdY
                       name: data.csv
                       kind: user
-              withDependencies:
+              withRequirements:
                 summary: Install a pinned package for this job only
+                description: |
+                  Packages are declared in the code itself, with a
+                  `# requirements:` comment. There is no request field: the
+                  callers this serves write code through a fixed tool schema
+                  they cannot add fields to.
                 value:
                   lang: py
                   code: |
+                    # requirements: cowsay==6.1
                     import cowsay
                     cowsay.cow('hello')
-                  dependencies:
-                    pip: [cowsay==6.1]
       responses:
         '200':
           description: |

@@ -216,6 +216,24 @@ describe('renderJobConfigOverlay', () => {
     const srcLines = overlay.split('\n').filter(l => l.includes('src:'));
     expect(srcLines.length).toBe(1);
   });
+
+  test('binds the baked node_modules read-only one level above the workspace', () => {
+    /* Node resolution walks up from /mnt/data, so the runtime's own packages
+     * stay reachable at /mnt/node_modules once /mnt/data/node_modules has been
+     * redirected to the per-job install. */
+    const overlay = renderJobConfigOverlay('/tmp/sandbox/ws_abc', '/tmp/sandbox/deps_abc', '/pkgs/node/24/node_modules');
+    expect(overlay).toMatch(/^\s*src: "\/pkgs\/node\/24\/node_modules"$/m);
+    expect(overlay).toMatch(/^\s*dst: "\/mnt\/node_modules"$/m);
+    const bakedBlock = overlay.slice(overlay.indexOf('/pkgs/node/24/node_modules'));
+    expect(bakedBlock).toMatch(/^\s*rw: false$/m);
+    expect(bakedBlock).toMatch(/^\s*nosuid: true$/m);
+  });
+
+  test('omits the baked node_modules mount when the job installed nothing', () => {
+    expect(renderJobConfigOverlay('/tmp/sandbox/ws_abc')).not.toContain('/mnt/node_modules');
+    expect(renderJobConfigOverlay('/tmp/sandbox/ws_abc', '/tmp/sandbox/deps_abc'))
+      .not.toContain('/mnt/node_modules');
+  });
 });
 
 describe('NsJail seccomp policy', () => {
@@ -377,5 +395,118 @@ describe('NsJail seccomp policy', () => {
     const policy = seccompPolicy();
     expect(policy).toContain('#define pidfd_send_signal 424');
     expect(policy).toContain('#define pidfd_open 434');
+  });
+});
+
+/* ── Sandbox networking (CODEAPI_ALLOW_SANDBOX_NETWORK) ───────────────── */
+
+function argsFor(netSocketPath?: string): string[] {
+  return buildArgs({
+    logPath: '/tmp/nsjail-test.log',
+    pkgdir: '/pkgs/python/3.14.4',
+    timeout: 1000,
+    memoryLimit: -1,
+    envVars: { SANDBOX_LANGUAGE: 'python' },
+    command: ['/bin/bash', '/pkgs/python/3.14.4/run', 'main.py'],
+    identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+    netSocketPath,
+  });
+}
+
+function socketRule(policy: string, block: 'KILL' | 'ERRNO(1)'): string {
+  const section = block === 'KILL' ? policy.split('KILL {')[1] : policy.split('ERRNO(1)')[1];
+  const rule = (section ?? '').split('\n').find(line => line.includes('socket(domain)'));
+  if (!rule) throw new Error(`no socket rule in the ${block} block`);
+  return rule;
+}
+
+describe('sandbox networking wiring', () => {
+  test('networking off is the default', () => {
+    const args = argsFor();
+    expect(args.join(' ')).not.toContain('net.sock');
+    expect(args.join(' ')).not.toContain('HTTP_PROXY');
+    expect(args.join(' ')).not.toContain('net-shim');
+  });
+
+  test('loopback stays down and AF_INET stays blocked in BOTH modes', () => {
+    // The seccomp rule is the real network boundary: under libkrun, TSI
+    // forwards AF_INET past the jail namespace, so this must never be relaxed.
+    for (const args of [argsFor(), argsFor('/tmp/netegress-abc.sock')]) {
+      expect(args).toContain('--iface_no_lo');
+      const rule = socketRule(valueAfter(args, '--seccomp_string') ?? '', 'ERRNO(1)');
+      expect(rule).toContain('AF_INET');
+      expect(rule).toContain('AF_INET6');
+    }
+  });
+
+  test('the seccomp policy is byte-identical with and without networking', () => {
+    expect(valueAfter(argsFor('/tmp/netegress-abc.sock'), '--seccomp_string'))
+      .toBe(valueAfter(argsFor(), '--seccomp_string'));
+  });
+
+  test('networking on mounts the per-job socket and a CA bundle', () => {
+    const args = argsFor('/tmp/netegress-abc.sock');
+    expect(hasArgPair(args, '-B', '/tmp/netegress-abc.sock:/tmp/net.sock')).toBe(true);
+    expect(hasArgPair(args, '-R', '/etc/ssl/certs:/etc/ssl/certs')).toBe(true);
+  });
+
+  test('networking on preloads the shim', () => {
+    expect(hasArgPair(argsFor('/tmp/netegress-abc.sock'), '-E', 'LD_PRELOAD=/usr/local/lib/net-shim.so')).toBe(true);
+  });
+
+  test('networking on exports proxy env in both cases with an empty NO_PROXY', () => {
+    const args = argsFor('/tmp/netegress-abc.sock');
+    for (const pair of [
+      'HTTP_PROXY=http://127.0.0.1:8080',
+      'HTTPS_PROXY=http://127.0.0.1:8080',
+      'http_proxy=http://127.0.0.1:8080',
+      'https_proxy=http://127.0.0.1:8080',
+      'NO_PROXY=',
+      'no_proxy=',
+    ]) {
+      expect(hasArgPair(args, '-E', pair)).toBe(true);
+    }
+    // Caller-supplied env must survive alongside the proxy variables.
+    expect(hasArgPair(args, '-E', 'SANDBOX_LANGUAGE=python')).toBe(true);
+  });
+
+  test('the command chain is unchanged by networking', () => {
+    const expected = [
+      '/usr/local/bin/spec-guard',
+      '/bin/bash',
+      '/pkgs/python/3.14.4/run',
+      'main.py',
+    ];
+    for (const args of [argsFor(), argsFor('/tmp/netegress-abc.sock')]) {
+      expect(args.slice(args.indexOf('--') + 1)).toEqual(expected);
+    }
+  });
+
+  test('the rest of the seccomp policy is intact', () => {
+    const policy = valueAfter(argsFor('/tmp/netegress-abc.sock'), '--seccomp_string') ?? '';
+    for (const family of ['AF_NETLINK', 'AF_KEY', 'AF_RXRPC', 'AF_ALG']) {
+      expect(socketRule(policy, 'ERRNO(1)')).toContain(family);
+    }
+    expect(socketRule(policy, 'KILL')).toContain('AF_VSOCK');
+    expect(policy).toMatch(/\bptrace\b/);
+    expect(policy).toMatch(/\bunshare\b/);
+  });
+
+  test('the jail keeps its own empty network namespace in both modes', async () => {
+    // config.nsjail_config is the in-container path; read the repo copy. The
+    // suite is normally run from api/, but stay correct from the repo root too.
+    const candidates = [
+      path.resolve(process.cwd(), 'config/sandbox.cfg'),
+      path.resolve(process.cwd(), 'api/config/sandbox.cfg'),
+    ];
+    let cfg: string | undefined;
+    for (const candidate of candidates) {
+      cfg = await fsp.readFile(candidate, 'utf8').catch(() => undefined);
+      if (cfg !== undefined) break;
+    }
+    if (cfg === undefined) throw new Error(`sandbox.cfg not found in ${candidates.join(', ')}`);
+    expect(cfg).toContain('clone_newnet: true');
+    // iface_no_lo must NOT be in the base config: it is per-job now.
+    expect(cfg).not.toMatch(/^iface_no_lo:/m);
   });
 });

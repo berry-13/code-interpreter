@@ -2,7 +2,7 @@ import express from 'express';
 import { loadPackages } from './runtime';
 import { logger } from './logger';
 import { config } from './config';
-import { validateHardenedSandboxStartup } from './secure-startup';
+import { validateHardenedSandboxStartup, validateSandboxNetworkStartup } from './secure-startup';
 import { initializeSandboxWorkspaceIsolation, startWorkspaceReaper } from './workspace-isolation';
 import { httpMetricsMiddleware, metricsHandler } from './metrics';
 import { positiveInt, shutdownTelemetry, traceHttpRequest } from './telemetry';
@@ -63,6 +63,7 @@ app.use((err: HttpError, _req: express.Request, res: express.Response, _next: ex
 
 async function main(): Promise<void> {
   validateHardenedSandboxStartup();
+  validateSandboxNetworkStartup();
   await initializeSandboxWorkspaceIsolation();
 
   const [address, port] = config.bind_address.split(':');

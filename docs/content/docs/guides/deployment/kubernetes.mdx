@@ -186,6 +186,56 @@ workerSandbox:
         effect: NoSchedule
 ```
 
+### Dependencies and sandbox networking
+
+Both features are off by default and both are configured through chart values
+rather than `workerSandbox.sandboxExtraEnv`, which rejects `CODEAPI_`-prefixed
+names on purpose:
+
+```yaml
+dependencies:
+  enabled: true
+  indexUrl: "https://pypi.org/simple"
+  npmRegistry: "https://registry.npmjs.org"
+  installTimeoutMs: 120000
+
+sandboxNetwork:
+  enabled: true
+  allowedHosts: "api.github.com,*.pypi.org"
+  allowedPorts: "80,443"
+```
+
+Enabling either one also opens sandbox-runner's egress to public addresses —
+the installers reach the index, the per-job proxy reaches allowlisted hosts —
+which the chart renders into the sandbox-runner NetworkPolicy automatically,
+for both IPv4 and IPv6. Private, link-local and CGNAT ranges stay excluded.
+Adjust the ports it opens with `networkPolicy.sandboxRunner.externalEgressPorts`
+if `allowedPorts`, your index, or your registry needs more than 80 and 443.
+
+An index or registry that lives inside the cluster network is the one case the
+public rule cannot cover, so name it rather than reopening RFC1918:
+
+```yaml
+dependencies:
+  enabled: true
+  indexUrl: "https://mirror.internal/simple"
+  allowPrivateIndex: true        # the installers' proxy may dial a private address
+
+networkPolicy:
+  sandboxRunner:
+    mirrorCIDRs: ["10.4.2.0/24"] # ...and the NetworkPolicy lets it out
+```
+
+<Callout type="warn">
+`dependencies.installTimeoutMs` is spent inside the sandbox call the worker is
+waiting on, so `workerSandbox.config.jobPrimeAllowanceMs` must be at least as
+large. The chart refuses to render otherwise rather than letting installs be
+cut off mid-flight.
+</Callout>
+
+See [Dynamic dependencies](/docs/guides/dependencies) and
+[Sandbox networking](/docs/guides/networking) for what each one costs you.
+
 ### Authentication
 
 Outside local mode the API verifies JWTs. Configure the verifier through

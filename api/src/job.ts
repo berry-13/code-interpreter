@@ -17,7 +17,13 @@ import { logger as rootLogger } from './logger';
 import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
-import type { ValidatedDependencies } from './dependencies';
+import { dependencyEgressPolicy, type ValidatedDependencies } from './dependencies';
+import { defaultManagerFor, type PackageManager } from '../../shared/requirements-header';
+import { createNetEgressProxy } from './net-egress-proxy';
+
+/* How Python and Node each spell "you imported something that isn't there". */
+const MISSING_MODULE_RE = /\b(ModuleNotFoundError|ImportError: No module named)\b/;
+const MISSING_NODE_MODULE_RE = /\b(Cannot find module|ERR_MODULE_NOT_FOUND|Cannot find package)\b/;
 import { internalServiceHeaders } from './internal-service-auth';
 import { EGRESS_GRANT_HEADER } from './egress';
 import { injectTraceHeaders } from './telemetry';
@@ -59,6 +65,11 @@ export {
 } from './validation';
 
 const AUTO_LOAD_DIRKEEP_TIMEOUT_MS = 10000;
+
+/* How often a running installer's tree is measured against the size cap. Short
+ * enough that a fast writer cannot get far past the ceiling, long enough that
+ * the walk is a rounding error next to the install itself. */
+const INSTALL_SIZE_WATCH_INTERVAL_MS = 1000;
 
 const execFileP = promisify(execFile);
 
@@ -198,6 +209,122 @@ export function aggregateBashExtras(
   return extraPkgdirs;
 }
 
+/** The runtime's own baked `node_modules`, taken from its NODE_PATH (what
+ * package-init writes into each runtime's .env) and falling back to the
+ * conventional location under its pkgdir. Undefined for runtimes that ship
+ * none, such as python or bash. */
+export function bakedNodeModulesFor(
+  runtime: { pkgdir: string; env_vars?: Record<string, string> },
+): string | undefined {
+  const fromNodePath = (runtime.env_vars?.NODE_PATH ?? '')
+    .split(':')
+    .filter(Boolean)
+    .find(entry => path.isAbsolute(entry) && path.basename(entry) === 'node_modules');
+  if (fromNodePath) return fromNodePath;
+  const conventional = path.join(runtime.pkgdir, 'node_modules');
+  return fs.existsSync(conventional) ? conventional : undefined;
+}
+
+/**
+ * Assert every package npm installed came from `registry`.
+ *
+ * `--registry` only routes the specs we hand npm. A package on the configured
+ * registry is free to declare a dependency as `git+ssh://…`, `https://…tgz` or
+ * `file:…`, and npm fetches those from wherever they point — so the registry
+ * setting and the validator's no-URLs rule both stop at the top level. The
+ * lockfile npm writes records a `resolved` per package, which is the one place
+ * the whole resolved tree is visible.
+ *
+ * Fails closed: an entry with no `resolved` that is not the root and not
+ * bundled inside its parent's tarball is refused rather than assumed fine.
+ */
+export function assertRegistryOnlyTree(lockJson: string, registry: string): void {
+  let parsed: { packages?: Record<string, { resolved?: string; link?: boolean; inBundle?: boolean }> };
+  try {
+    parsed = JSON.parse(lockJson);
+  } catch {
+    throw new ValidationError('npm install produced no readable lockfile to verify against the registry');
+  }
+  const packages = parsed.packages;
+  if (packages === undefined) {
+    throw new ValidationError('npm install produced no readable lockfile to verify against the registry');
+  }
+
+  /* Compare the full base URL, not just the origin. An Artifactory-style
+   * registry is path-scoped -- https://npm.corp.example/artifactory/api/npm/vetted/
+   * -- and matching on the host alone would accept any other repository the
+   * same server hosts, which is exactly the boundary the operator drew. */
+  let expected: string;
+  try {
+    const url = new URL(registry);
+    expected = url.origin + url.pathname.replace(/\/+$/, '');
+  } catch {
+    throw new ValidationError(`CODEAPI_DEPENDENCY_NPM_REGISTRY is not a valid URL: ${registry}`);
+  }
+
+  for (const [name, entry] of Object.entries(packages)) {
+    // '' is the synthetic root manifest; it is never fetched.
+    if (name === '') continue;
+    // Bundled deps ship inside a parent tarball that was itself checked.
+    if (entry.inBundle === true) continue;
+    if (entry.link === true) {
+      throw new ValidationError(`dependency '${name}' resolves to a local link, which is not allowed`);
+    }
+    if (typeof entry.resolved !== 'string' || entry.resolved.length === 0) {
+      throw new ValidationError(`dependency '${name}' has no recorded source and cannot be verified`);
+    }
+    let resolvedBase: string;
+    try {
+      const url = new URL(entry.resolved);
+      resolvedBase = url.origin + url.pathname;
+    } catch {
+      throw new ValidationError(`dependency '${name}' resolves to '${entry.resolved}', which is not a registry URL`);
+    }
+    // Prefix, with the boundary anchored so '/vetted' cannot match '/vetted-evil'.
+    if (resolvedBase !== expected && !resolvedBase.startsWith(`${expected}/`)) {
+      throw new ValidationError(
+        `dependency '${name}' resolves to '${resolvedBase}', outside the configured npm registry '${expected}'`,
+      );
+    }
+  }
+}
+
+/**
+ * Assert pip fetched every package from its index rather than by direct URL.
+ *
+ * `--index-url` chooses the index; it does not stop a package ON that index
+ * from declaring `Requires-Dist: child @ https://other.example/child.whl`, and
+ * pip honours that by fetching the URL. The top-level grammar rules URLs out of
+ * user input, so any direct reference in the resolved tree came from a package,
+ * not from the caller.
+ *
+ * Checked on pip's own `--report`, via `is_direct`, rather than by comparing
+ * hosts: PyPI serves its index from pypi.org and its files from
+ * files.pythonhosted.org, so a host comparison would reject the default
+ * configuration while telling us nothing extra about a private index.
+ */
+export function assertNoDirectUrlInstalls(reportJson: string): void {
+  let parsed: {
+    install?: { is_direct?: boolean; download_info?: { url?: string }; metadata?: { name?: string } }[];
+  };
+  try {
+    parsed = JSON.parse(reportJson);
+  } catch {
+    throw new ValidationError('pip install produced no readable report to verify its sources against');
+  }
+  if (!Array.isArray(parsed.install)) {
+    throw new ValidationError('pip install produced no readable report to verify its sources against');
+  }
+  for (const entry of parsed.install) {
+    if (entry.is_direct !== true) continue;
+    const name = entry.metadata?.name ?? 'unknown';
+    const url = entry.download_info?.url ?? 'a direct URL';
+    throw new ValidationError(
+      `dependency '${name}' was fetched from '${url}' rather than the configured index`,
+    );
+  }
+}
+
 function rememberPreferredNodeModules(
   source: string,
   linkTarget: { nodeModulesPath?: string },
@@ -219,13 +346,29 @@ function errorCode(err: unknown): string | undefined {
 export function ensureNodeModulesSymlink(
   submissionDir: string,
   nodeModulesPath?: string,
+  /** Set when the job declared npm packages. Then this link is not a
+   * convenience but the only route by which those packages are visible: ESM
+   * ignores NODE_PATH entirely, so leaving a workspace's own node_modules in
+   * place would mean a successful install the program cannot import. A stale
+   * link is replaced; a real directory is a collision the caller has to know
+   * about, because silently ignoring either half of it is worse. */
+  required = false,
 ): void {
   if (!nodeModulesPath) return;
   const linkPath = path.join(submissionDir, 'node_modules');
   try {
-    fs.lstatSync(linkPath);
-    return;
+    const existing = fs.lstatSync(linkPath);
+    if (!required) return;
+    if (!existing.isSymbolicLink()) {
+      throw new ValidationError(
+        'the workspace already contains a node_modules directory, which would shadow the '
+          + 'packages declared by this job; remove it or drop the requirements declaration',
+      );
+    }
+    if (fs.readlinkSync(linkPath) === nodeModulesPath) return;
+    fs.unlinkSync(linkPath);
   } catch (err) {
+    if (err instanceof ValidationError) throw err;
     if (errorCode(err) !== 'ENOENT') throw err;
   }
 
@@ -1029,46 +1172,47 @@ export class Job {
    * (see safeCall / renderJobConfigOverlay); the jail itself gains no network.
    */
   private async installDependencies(): Promise<void> {
-    const pipSpecs = this.dependencies?.pip;
-    if (!pipSpecs || pipSpecs.length === 0) return;
+    const pipSpecs = this.dependencies?.pip ?? [];
+    const npmSpecs = this.dependencies?.npm ?? [];
+    if (pipSpecs.length === 0 && npmSpecs.length === 0) return;
 
     const identity = this.sandboxIdentity();
     const workspaceId = this.workspaceLease?.workspaceId ?? nanoid();
     const parent = path.dirname(this.submissionDir);
     const depsDir = path.join(parent, `deps_${workspaceId}`);
-    const reqPath = path.join(parent, `deps_req_${workspaceId}.txt`);
 
     await fsp.mkdir(depsDir, { recursive: true, mode: 0o711 });
     await applySandboxPathPermissions(depsDir, identity, 0o711);
     this.depsDir = depsDir;
 
-    await fsp.writeFile(reqPath, pipSpecs.join('\n') + '\n', { mode: 0o600 });
-    await applySandboxPathPermissionsNoFollow(reqPath, identity, 0o400, 'file');
+    /* One deadline across both managers, like the size cap below. The
+     * installers run in sequence, so giving each the full timeout means a mixed
+     * job can spend 2x CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS in prime -- past
+     * the service's JOB_PRIME_ALLOWANCE_MS, which is sized for one. The service
+     * would then abort the call partway through the second install. */
+    const deadlineAt = Date.now() + config.dependency_install_timeout_ms;
 
-    const requireHashes = pipSpecs.some(s => s.includes('--hash='));
-    const pipPath = path.join(this.runtime.pkgdir, 'bin', 'pip3');
-    const args = [
-      'install',
-      '--requirement', reqPath,
-      '--target', depsDir,
-      '--only-binary=:all:',
-      '--no-input',
-      '--disable-pip-version-check',
-      '--no-cache-dir',
-      '--index-url', config.dependency_index_url,
-    ];
-    if (requireHashes) args.push('--require-hashes');
-
-    if (!this.isSynthetic) {
-      this.log.info({ count: pipSpecs.length, requireHashes }, 'Installing pip dependencies');
-    }
-
+    /* Everything the installers fetch goes through a proxy that knows only the
+     * configured index, registry and file hosts. Both managers resolve a
+     * package's declared direct URL by fetching it, and a check on the result
+     * runs after the runner has already made that request; this makes the
+     * request itself fail. Started here rather than per manager so a mixed job
+     * pays for one listener, and closed in the finally so no run can leave one
+     * behind. */
+    const egress = await this.startInstallEgressProxy();
     try {
-      await this.runInstaller(pipPath, args, depsDir, identity);
+      if (pipSpecs.length > 0) {
+        await this.installPip(pipSpecs, depsDir, parent, workspaceId, identity, deadlineAt, egress.env);
+      }
+      if (npmSpecs.length > 0) {
+        await this.installNpm(npmSpecs, depsDir, identity, deadlineAt, egress.env);
+      }
     } finally {
-      await fsp.rm(reqPath, { force: true }).catch(() => {});
+      await egress.close();
     }
 
+    /* One budget across both managers: the cap is on what the jail will be able
+     * to see, not on any single installer. */
     const installedBytes = await dirSizeBytes(depsDir);
     if (installedBytes > config.dependency_max_bytes) {
       throw new ValidationError(
@@ -1080,28 +1224,335 @@ export class Job {
     }
   }
 
+  /**
+   * The installers' only route to the network, for the duration of the install.
+   *
+   * The runner itself has unrestricted egress, which is what makes a
+   * package-declared `child @ https://other.example/child.whl` a problem: pip
+   * and npm fetch it while resolving, long before any report or lockfile can be
+   * inspected. Pointing them at a proxy that resolves only the configured index
+   * and registry turns "detected afterwards" into "never connected". The
+   * listener is loopback-only and lives for exactly this phase; the jail has no
+   * interfaces and cannot reach it either way.
+   */
+  private async startInstallEgressProxy(): Promise<{
+    env: Record<string, string>;
+    close: () => Promise<void>;
+  }> {
+    const { hosts, ports } = dependencyEgressPolicy({
+      indexUrl: config.dependency_index_url,
+      npmRegistry: config.dependency_npm_registry,
+      extraHosts: config.dependency_allowed_hosts,
+    });
+
+    const proxy = await createNetEgressProxy({
+      loopbackPort: 0,
+      policy: {
+        allowedHosts: hosts,
+        // An empty derived list would mean "any host" under the shared policy
+        // rules, which is the opposite of the point. Refuse everything instead
+        // and let the install fail with the proxy's own reason.
+        denyAllHosts: hosts.length === 0,
+        allowedPorts: ports,
+        denyAllPorts: false,
+        /* The same operator-configured names, exempted from the denylist that
+         * exists to keep USER CODE off `.internal`/`.svc`/`.cluster.local`. A
+         * mirror at `mirror.internal` is otherwise refused before
+         * CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX can matter. */
+        exemptHosts: hosts,
+        allowlistLabel: 'the configured package index, registry and CODEAPI_DEPENDENCY_ALLOWED_HOSTS',
+      },
+      /* An operator whose index IS an internal mirror opts out of the address
+       * gate explicitly. The host allowlist above still bounds this to the
+       * mirror they configured. */
+      addressScreen: config.dependency_allow_private_index ? () => null : undefined,
+      /* Budgets sized for an installer, not for user code. The proxy's own
+       * defaults are the sandbox's, and an install is a very different shape:
+       *
+       * - Requests: one resolution asks for an index page, metadata and an
+       *   archive per package, and the phase runs pip's dry-run, pip's install
+       *   and npm's resolution through this one proxy. Scaled off the declared
+       *   package limit so raising CODEAPI_DEPENDENCY_MAX_COUNT does not walk
+       *   into a 429 that no dependency setting could raise.
+       * - Bytes: the same wheels cross twice (dry-run, then install), and a
+       *   compressed archive is smaller than what it unpacks to, so the byte
+       *   ceiling cannot be the disk ceiling. The size cap is enforced on disk
+       *   while the installer runs; this is only a backstop against a download
+       *   that never ends. */
+      maxRequests: Math.max(1024, config.dependency_max_count * 64),
+      maxTotalBytes: config.dependency_max_bytes * 3,
+      idleTimeoutMs: config.dependency_install_timeout_ms,
+      log: this.log,
+    });
+
+    const port = proxy.port();
+    if (port === null) {
+      await proxy.close();
+      throw new ValidationError('dependency install could not start its egress proxy');
+    }
+    const url = `http://127.0.0.1:${port}`;
+
+    return {
+      /* Both cases: pip reads the lowercase names through requests, npm reads
+       * its own npm_config_* first. NO_PROXY empty so nothing bypasses this. */
+      env: {
+        HTTP_PROXY: url,
+        HTTPS_PROXY: url,
+        http_proxy: url,
+        https_proxy: url,
+        NO_PROXY: '',
+        no_proxy: '',
+        npm_config_proxy: url,
+        npm_config_https_proxy: url,
+      },
+      close: async () => {
+        const stats = proxy.stats();
+        if (stats.denied > 0 && !this.isSynthetic) {
+          this.log.warn(
+            { denied: stats.denied, allowedHosts: hosts },
+            'Dependency install tried to reach a host outside the configured index',
+          );
+        }
+        await proxy.close();
+      },
+    };
+  }
+
+  private async installPip(
+    pipSpecs: string[],
+    depsDir: string,
+    parent: string,
+    workspaceId: string,
+    identity: SandboxJobIdentity,
+    deadlineAt: number,
+    egressEnv: Record<string, string>,
+  ): Promise<void> {
+    // Before anything is written: a job with no python runtime to install with
+    // fails here, with nothing to clean up.
+    const pipPath = this.resolvePipPath();
+
+    const reqPath = path.join(parent, `deps_req_${workspaceId}.txt`);
+    await fsp.writeFile(reqPath, pipSpecs.join('\n') + '\n', { mode: 0o600 });
+    await applySandboxPathPermissionsNoFollow(reqPath, identity, 0o400, 'file');
+
+    const requireHashes = pipSpecs.some(s => s.includes('--hash='));
+    /* `--index-url` selects the index; it does not stop a wheel from that index
+     * declaring `Requires-Dist: child @ https://other.example/child.whl`, which
+     * pip resolves by fetching that URL. The install proxy is what stops that
+     * fetch (see startInstallEgressProxy); the report is the second half of the
+     * answer, refusing a tree that reached anything by direct URL even when the
+     * URL happened to be on an allowed host. `--no-deps` is not an option here
+     * — dependencies are the point.
+     *
+     * pip writes the report itself, with a plain `open(path, 'w')`, as the
+     * per-job UID. The workspace root is root-owned 0711: that UID can traverse
+     * it but not create in it, so the file has to exist and belong to the job
+     * before pip runs or every pip install dies on EACCES. */
+    const reportPath = path.join(parent, `deps_report_${workspaceId}.json`);
+    await fsp.writeFile(reportPath, '', { mode: 0o600 });
+    await applySandboxPathPermissionsNoFollow(reportPath, identity, 0o600, 'file');
+
+    const args = [
+      'install',
+      '--requirement', reqPath,
+      '--target', depsDir,
+      '--only-binary=:all:',
+      '--no-input',
+      '--disable-pip-version-check',
+      '--no-cache-dir',
+      '--report', reportPath,
+      '--index-url', config.dependency_index_url,
+    ];
+    if (requireHashes) args.push('--require-hashes');
+
+    if (!this.isSynthetic) {
+      this.log.info({ count: pipSpecs.length, requireHashes }, 'Installing pip dependencies');
+    }
+
+    try {
+      /* Resolve first, install second. Reading the report only after the real
+       * install means a package's direct-URL dependency has already been
+       * fetched and unpacked into `--target` by the time it is rejected — the
+       * install is refused, but code from a host the operator never configured
+       * reached the runner's disk. `--dry-run` produces the same report without
+       * installing anything, so the plan is vetoed before the tree exists. The
+       * real install re-checks, because the index is free to resolve
+       * differently the second time. */
+      await this.runInstaller(pipPath, [...args, '--dry-run'], depsDir, identity, deadlineAt, egressEnv);
+      assertNoDirectUrlInstalls(await fsp.readFile(reportPath, 'utf8').catch(() => ''));
+
+      await this.runInstaller(pipPath, args, depsDir, identity, deadlineAt, egressEnv);
+      assertNoDirectUrlInstalls(await fsp.readFile(reportPath, 'utf8').catch(() => ''));
+    } finally {
+      await fsp.rm(reqPath, { force: true }).catch(() => {});
+      await fsp.rm(reportPath, { force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * npm's equivalent of pip's `--only-binary=:all:` is `--ignore-scripts`: it
+   * is what stops a package's install/postinstall hook from executing HERE, in
+   * the trusted runner, which would be a far worse outcome than anything the
+   * sandbox can do. Everything else is noise reduction and determinism.
+   *
+   * Packages land in `<depsDir>/node_modules`, alongside pip's flat layout in
+   * the same directory, and the jail sees them through NODE_PATH.
+   */
+  private async installNpm(
+    npmSpecs: string[],
+    depsDir: string,
+    identity: SandboxJobIdentity,
+    deadlineAt: number,
+    egressEnv: Record<string, string>,
+  ): Promise<void> {
+    /* `--registry` constrains the specs WE pass; it does not constrain what a
+     * package on that registry asks for. npm resolves a transitive
+     * `"dep": "git+https://..."` or a bare tarball URL by fetching it, so a
+     * selected package could pull code from a host the operator never
+     * configured -- past both CODEAPI_DEPENDENCY_NPM_REGISTRY and the no-URLs
+     * rule the spec grammar enforces on user input. npm has no config that
+     * forbids this, so the fetch is stopped by the install proxy and the tree
+     * is verified after the fact as well: a manifest in the prefix makes npm
+     * record a `resolved` URL per package, and assertRegistryOnlyTree rejects
+     * any that did not come from the configured registry. --ignore-scripts
+     * means nothing has executed at that point, so failing here is still
+     * before any of it can matter. */
+    const manifestPath = path.join(depsDir, 'package.json');
+    const lockPath = path.join(depsDir, 'package-lock.json');
+    await fsp.writeFile(
+      manifestPath,
+      JSON.stringify({ name: 'codeapi-job-deps', version: '0.0.0', private: true }) + '\n',
+      { mode: 0o600 },
+    );
+    /* Writable, not 0o400: `npm install <spec>` saves the specs to the manifest
+     * by default and fails outright when it cannot, and `--no-save` — which
+     * would avoid the write — also suppresses the lockfile this whole approach
+     * reads. The installer runs as the job UID, which already owns the install
+     * tree, and both files are removed below before anything is mounted. */
+    await applySandboxPathPermissionsNoFollow(manifestPath, identity, 0o600, 'file');
+
+    const args = [
+      'install',
+      '--prefix', depsDir,
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--registry', config.dependency_npm_registry,
+      '--',
+      ...npmSpecs,
+    ];
+
+    if (!this.isSynthetic) {
+      this.log.info({ count: npmSpecs.length }, 'Installing npm dependencies');
+    }
+    /* Cache OUTSIDE depsDir. It used to sit at <depsDir>/.npm-cache, which
+     * dirSizeBytes then counted against CODEAPI_DEPENDENCY_MAX_BYTES and which
+     * was mounted into the jail as part of /mnt/deps — so a job could fail the
+     * size cap on tarballs it never asked to keep, and the sandbox got a copy
+     * of the cache for free. Sibling dir, per job, removed either way. */
+    const cacheDir = path.join(path.dirname(depsDir), `deps_cache_${path.basename(depsDir)}`);
+    await fsp.mkdir(cacheDir, { recursive: true, mode: 0o700 });
+    await applySandboxPathPermissions(cacheDir, identity, 0o700);
+
+    try {
+      await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, deadlineAt, {
+        ...egressEnv,
+        npm_config_cache: cacheDir,
+        npm_config_update_notifier: 'false',
+      }, [cacheDir]);
+      assertRegistryOnlyTree(
+        await fsp.readFile(lockPath, 'utf8').catch(() => ''),
+        config.dependency_npm_registry,
+      );
+    } finally {
+      // None of these belong in the read-only tree the jail sees.
+      await fsp.rm(lockPath, { force: true }).catch(() => {});
+      await fsp.rm(manifestPath, { force: true }).catch(() => {});
+      await fsp.rm(cacheDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * pip lives in the python runtime, which is not necessarily the runtime this
+   * job runs under: LibreChat's code tool commonly submits bash that shells out
+   * to python3, and that job's pkgdir is the bash package. Fall back to the
+   * newest installed python so a bash job can declare requirements too — the
+   * install target (/mnt/deps) and PYTHONPATH are language-agnostic.
+   */
+  private resolvePipPath(): string {
+    const own = path.join(this.runtime.pkgdir, 'bin', 'pip3');
+    if (this.runtime.language === 'python') return own;
+
+    const runtimes = getRuntimes();
+    const python = runtimes
+      .filter(r => r.language === 'python')
+      .sort((a, b) => semver.rcompare(a.version.raw, b.version.raw))[0];
+    if (!python) {
+      throw new ValidationError(
+        'requirements were declared but no python runtime is installed to install them with',
+      );
+    }
+    return path.join(python.pkgdir, 'bin', 'pip3');
+  }
+
+  /** Same reasoning as resolvePipPath: npm lives in the node runtime, which is
+   * usually not the runtime of a job that declares npm packages (a bash job
+   * shelling out to `node`, most often). */
+  private resolveNpmPath(): string {
+    const node = getRuntimes()
+      .filter(r => r.language === 'node')
+      .sort((a, b) => semver.rcompare(a.version.raw, b.version.raw))[0];
+    if (!node) {
+      /* Bun-backed JS runtimes (CODEAPI_LANGUAGES=python,bun) register as
+       * 'bun' and ship no npm, but js/ts still default to the npm manager, so
+       * this is reachable with a JS runtime present. Bun's own installer writes
+       * a different lockfile format than assertRegistryOnlyTree reads, so npm
+       * requirements need the node runtime rather than a second, unverified
+       * install path. Name that, instead of describing the tree. */
+      throw new ValidationError(
+        'npm requirements were declared but no node runtime is installed to install them with; '
+          + 'add "node" to CODEAPI_LANGUAGES (Bun runtimes do not ship npm)',
+      );
+    }
+    return path.join(node.pkgdir, 'bin', 'npm');
+  }
+
   private runInstaller(
-    pipPath: string,
+    installerPath: string,
     args: string[],
     depsDir: string,
     identity: SandboxJobIdentity,
+    deadlineAt: number,
+    extraEnv: Record<string, string> = {},
+    /** Written to by the installer besides depsDir — npm's cache. Counted
+     * while the install runs, because that is disk the runner is spending. */
+    extraWatchedPaths: string[] = [],
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      /* Whatever is left of the phase-wide budget, not a fresh full timeout.
+       * `spawn` treats a non-positive timeout as "no timeout", so an exhausted
+       * budget has to be refused here rather than passed through. */
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        reject(new ValidationError('dependency install timed out or was killed'));
+        return;
+      }
       // Minimal env: the installer inherits none of the runner's secrets, only
-      // what pip needs to run and reach the allowlisted index over HTTPS.
+      // what it needs to run and reach the allowlisted index over HTTPS.
       const env: Record<string, string> = {
-        PATH: `${path.join(this.runtime.pkgdir, 'bin')}:/usr/local/bin:/usr/bin:/bin`,
+        PATH: `${path.join(this.runtime.pkgdir, 'bin')}:${path.dirname(installerPath)}:/usr/local/bin:/usr/bin:/bin`,
         HOME: depsDir,
         PIP_DISABLE_PIP_VERSION_CHECK: '1',
         PYTHONDONTWRITEBYTECODE: '1',
+        ...extraEnv,
       };
-      const child = spawn(pipPath, args, {
+      const child = spawn(installerPath, args, {
         cwd: depsDir,
         env,
         uid: identity.uid,
         gid: identity.gid,
         stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: config.dependency_install_timeout_ms,
+        timeout: remainingMs,
         killSignal: 'SIGKILL',
       });
 
@@ -1113,8 +1564,45 @@ export class Job {
       child.stdout?.on('data', capture);
       child.stderr?.on('data', capture);
 
-      child.on('error', err => reject(new ValidationError(`dependency install failed to start: ${err.message}`)));
+      /* The size cap is also checked once the install finishes, but a check
+       * that only runs at the end is a check the runner's disk has already
+       * paid for: one pinned package can unpack to far more than
+       * CODEAPI_DEPENDENCY_MAX_BYTES, and the job is rejected long after every
+       * other job on the runner has run out of space. So watch it grow and
+       * kill the installer at the ceiling. Sampling, not accounting — the
+       * final check is what decides — so a stat storm on a large tree cannot
+       * cost more than one walk at a time. */
+      const watched = [depsDir, ...extraWatchedPaths];
+      let overran = false;
+      let walking = false;
+      const sizeWatch = setInterval(() => {
+        if (walking) return;
+        walking = true;
+        Promise.all(watched.map(target => dirSizeBytes(target).catch(() => 0)))
+          .then(sizes => {
+            if (sizes.reduce((total, size) => total + size, 0) <= config.dependency_max_bytes) return;
+            overran = true;
+            child.kill('SIGKILL');
+          })
+          .catch(() => {})
+          .finally(() => {
+            walking = false;
+          });
+      }, INSTALL_SIZE_WATCH_INTERVAL_MS);
+      sizeWatch.unref();
+
+      child.on('error', err => {
+        clearInterval(sizeWatch);
+        reject(new ValidationError(`dependency install failed to start: ${err.message}`));
+      });
       child.on('close', (code, signal) => {
+        clearInterval(sizeWatch);
+        if (overran) {
+          reject(new ValidationError(
+            `installed dependencies exceed the limit of ${config.dependency_max_bytes} bytes`,
+          ));
+          return;
+        }
         if (code === 0) {
           resolve();
           return;
@@ -2396,16 +2884,48 @@ export class Job {
       // take precedence over the baked-in site-packages. Set after spreading
       // runtime.env_vars so this wins over any PYTHONPATH from the runtime .env.
       envVars.PYTHONPATH = envVars.PYTHONPATH ? `/mnt/deps:${envVars.PYTHONPATH}` : '/mnt/deps';
+      // npm installs under <depsDir>/node_modules. NODE_PATH alone is not
+      // enough to make those the packages a job actually gets — see
+      // installedNodeModules below — but it stays set for CommonJS lookups
+      // that walk past the workspace.
+      envVars.NODE_PATH = envVars.NODE_PATH
+        ? `/mnt/deps/node_modules:${envVars.NODE_PATH}`
+        : '/mnt/deps/node_modules';
     }
 
     let extraPkgdirs: string[] | undefined;
+    const bakedNodeModules = { nodeModulesPath: bakedNodeModulesFor(this.runtime) };
     if (this.runtime.language === 'bash') {
-      const linkTarget: { nodeModulesPath?: string } = {};
-      extraPkgdirs = aggregateBashExtras(this.runtime.pkgdir, envVars, undefined, linkTarget);
-      ensureNodeModulesSymlink(this.submissionDir, linkTarget.nodeModulesPath);
+      extraPkgdirs = aggregateBashExtras(this.runtime.pkgdir, envVars, undefined, bakedNodeModules);
     }
 
-    return execute({
+    /* Resolution order for declared npm packages.
+     *
+     * NODE_PATH does not carry them: Node's ESM resolver ignores it outright,
+     * so `import pkg from 'pkg'` never sees a declared package, and for
+     * CommonJS it is consulted only AFTER the directory walk — so a declared
+     * pin of an already-baked package silently loses to the baked copy. Both
+     * are the opposite of what declaring a dependency promises.
+     *
+     * So point the workspace's node_modules at the per-job install and let the
+     * baked set answer from /mnt/node_modules one level up (bound by
+     * renderJobConfigOverlay). The directory walk then gives declared packages
+     * precedence and keeps the baked ones reachable, for ESM and CommonJS
+     * alike. Pre-creating the link also stops the runtime `run` script from
+     * pointing /mnt/data/node_modules at the baked set first — it only creates
+     * the link when nothing is there. */
+    const installedNodeModules = this.depsDir
+      ? path.join(this.depsDir, 'node_modules')
+      : undefined;
+    const hasInstalledNodeModules = installedNodeModules !== undefined
+      && fs.existsSync(installedNodeModules);
+    if (hasInstalledNodeModules) {
+      ensureNodeModulesSymlink(this.submissionDir, '/mnt/deps/node_modules', true);
+    } else {
+      ensureNodeModulesSymlink(this.submissionDir, bakedNodeModules.nodeModulesPath);
+    }
+
+    const executeOptions = {
       command,
       envVars,
       submissionDir: this.submissionDir,
@@ -2419,7 +2939,82 @@ export class Job {
       enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
       suppressSuccessLogs: this.isSynthetic,
       depsDir: this.depsDir,
-    });
+      // Only bound when the workspace link was redirected; otherwise the baked
+      // set is already what /mnt/data/node_modules points at.
+      bakedNodeModulesDir: hasInstalledNodeModules ? bakedNodeModules.nodeModulesPath : undefined,
+    };
+
+    /* Sandbox networking covers the user's program only: a compile step has no
+     * business reaching the internet, and prewarm/synthetic jobs run trusted
+     * canned code. Everything else keeps the historical no-network posture. */
+    if (!config.allow_sandbox_network || script !== 'run' || this.isSynthetic) {
+      return execute(executeOptions);
+    }
+    return this.executeWithNetwork(executeOptions);
+  }
+
+  /**
+   * Run the jail with a per-job egress proxy alive for exactly the duration of
+   * the run. The socket is created here rather than in prime() so it never
+   * exists while no jail is running, and it is closed in a finally so a failed
+   * or timed-out execution cannot leave a listener behind.
+   */
+  private async executeWithNetwork(
+    executeOptions: Parameters<typeof execute>[0],
+  ): Promise<NsJailResult> {
+    const identity = this.sandboxIdentity();
+    /* Kept short and outside submissionDir: AF_UNIX paths are capped at 108
+     * bytes, and a deep workspace path plus a job id can approach that. */
+    const socketPath = path.join(os.tmpdir(), `netegress-${nanoid()}.sock`);
+
+    /* If the proxy cannot be started — the runner cannot chown the socket to
+     * the job UID, the path is unusable, FDs are exhausted — run the job
+     * WITHOUT networking rather than failing it. The sandbox then finds
+     * nothing listening on the proxy port, which is the same behavior as the
+     * feature being off. The error is logged loudly so this never looks like
+     * a working configuration. */
+    let proxy: Awaited<ReturnType<typeof createNetEgressProxy>>;
+    try {
+      proxy = await createNetEgressProxy({
+        socketPath,
+        policy: {
+          allowedHosts: config.sandbox_network_allowed_hosts,
+          denyAllHosts: config.sandbox_network_deny_all_hosts,
+          allowedPorts: config.sandbox_network_allowed_ports,
+          denyAllPorts: config.sandbox_network_deny_all_ports,
+        },
+        socketUid: identity.uid,
+        socketGid: identity.gid,
+        maxConnections: config.sandbox_network_max_connections,
+        maxRequests: config.sandbox_network_max_requests,
+        maxTotalBytes: config.sandbox_network_max_bytes,
+        idleTimeoutMs: config.sandbox_network_idle_timeout_ms,
+        log: this.log,
+      });
+    } catch (error) {
+      this.log.error({ err: error }, 'Failed to start the sandbox egress proxy; running without network access');
+      await fsp.rm(socketPath, { force: true }).catch(() => {});
+      return execute(executeOptions);
+    }
+
+    try {
+      return await execute({ ...executeOptions, netSocketPath: socketPath });
+    } finally {
+      const stats = proxy.stats();
+      if (stats.requests > 0) {
+        this.log.info(
+          {
+            requests: stats.requests,
+            allowed: stats.allowed,
+            denied: stats.denied,
+            bytes_up: stats.bytesUp,
+            bytes_down: stats.bytesDown,
+          },
+          'Sandbox network usage',
+        );
+      }
+      await proxy.close().catch(() => {});
+    }
   }
 
   async execute(): Promise<ExecuteResult> {
@@ -2464,6 +3059,7 @@ export class Job {
         this.memory_limits.run,
         this.stdin,
       );
+      this.hintMissingModule(run);
     }
 
     await this.handleSessionFiles();
@@ -2476,6 +3072,51 @@ export class Job {
       session_id: this.outputSessionId,
       files: this.sessionFiles,
     };
+  }
+
+  /**
+   * Teach the caller the requirements convention at the only moment it is
+   * relevant: when an import just failed.
+   *
+   * There is no other channel. The LLM callers this serves reach the sandbox
+   * through a fixed tool schema whose description we do not control, so a
+   * declaration syntax they are never told about would go unused. A one-line
+   * hint appended to stderr is read by the model on the very turn it hit the
+   * error, and it retries with the header. Appended only when the feature is
+   * actually enabled and the job did not already declare requirements, so it
+   * can never suggest something that would fail.
+   */
+  private hintMissingModule(run: NsJailResult | undefined): void {
+    if (!run || !config.allow_dynamic_dependencies) return;
+    if (this.dependencies?.pip?.length || this.dependencies?.npm?.length) return;
+
+    const text = `${run.stderr}\n${run.output}`;
+    const python = MISSING_MODULE_RE.test(text);
+    const node = MISSING_NODE_MODULE_RE.test(text);
+    if (!python && !node) return;
+
+    /* The hint has to be valid in the language the job is actually written in,
+     * which is not the language that failed: a bash job shelling out to node
+     * gets a missing-node-module error, but '//' is not a bash comment and
+     * bash's default manager is pip, so the old hint produced either a bogus
+     * '//' command or a pip requirement for an npm package. Take the comment
+     * marker from the job's own language, and name the manager explicitly
+     * whenever it is not the one that language would default to. Pin only when
+     * the deployment requires it — a hint that produces a rejected declaration
+     * would be worse than none. */
+    const pinned = config.dependency_require_pinned;
+    const marker = defaultManagerFor(this.runtime.language) === 'npm' ? '//' : '#';
+    const manager: PackageManager = node ? 'npm' : 'pip';
+    const qualifier = defaultManagerFor(this.runtime.language) === manager ? '' : `(${manager})`;
+    const example = node
+      ? (pinned ? 'lodash@4.17.21' : 'lodash')
+      : (pinned ? 'cowsay==6.1' : 'cowsay');
+    const declaration = `${marker} requirements${qualifier}:`;
+    const hint = `\nHint: this package is not installed. Declare it with a '${declaration} name' `
+      + `comment at the top of your code (for example '${declaration} ${example}'); `
+      + 'it is installed before your code runs.\n';
+    run.stderr += hint;
+    run.output += hint;
   }
 
   private async handleSessionFiles(): Promise<void> {

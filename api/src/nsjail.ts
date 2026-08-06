@@ -166,12 +166,71 @@ const SECCOMP_POLICY = [
   '    pidfd_send_signal,',
   /* Block direct network and kernel-control socket domains from sandboxed
    * code. AF_ALG covers the Linux kernel crypto API used by Copy Fail, and
-   * AF_RXRPC covers the RxRPC family used by Dirty Frag. */
+   * AF_RXRPC covers the RxRPC family used by Dirty Frag.
+   *
+   * This rule is UNCONDITIONAL, including for jobs with sandbox networking
+   * enabled. Those reach the egress proxy through net-shim.c, which turns the
+   * client's AF_INET connect into an AF_UNIX one, so nothing in the sandbox
+   * ever needs an AF_INET socket. Relaxing this line was tried and reverted:
+   * under libkrun the guest kernel's TSI forwards AF_INET past the jail's
+   * network namespace to the host, so this rule — not clone_newnet — is what
+   * keeps user code off the network. See net-shim.c. */
   '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC || domain == AF_ALG }',
   '  }',
   '}',
   'USE sandbox DEFAULT ALLOW',
 ].filter(line => line !== '').join('\n');
+
+/* Fixed inside the jail: the per-job socket is bind-mounted onto this path, so
+ * nothing job-specific ends up in the sandbox's view of the filesystem or in
+ * its environment. */
+export const NET_SOCKET_JAIL_PATH = '/tmp/net.sock';
+export const NET_SHIM_LIBRARY = '/usr/local/lib/net-shim.so';
+export const NET_PROXY_PORT = 8080;
+const NET_PROXY_URL = `http://127.0.0.1:${NET_PROXY_PORT}`;
+
+/* Both cases of each variable: Python's urllib/requests read the lowercase
+ * form, most other tooling reads the uppercase one, and curl reads both.
+ * NO_PROXY is empty on purpose — there is no destination the sandbox may reach
+ * directly, so nothing should ever bypass the proxy. */
+const NETWORK_PROXY_ENV: Record<string, string> = {
+  /* The shim is what makes the proxy URL reachable at all: it rewrites the
+   * client's connect() onto the bind-mounted unix socket. Without it the
+   * connect fails at the seccomp layer, which is the intended fail-closed
+   * behavior rather than a fallback. */
+  LD_PRELOAD: NET_SHIM_LIBRARY,
+  HTTP_PROXY: NET_PROXY_URL,
+  HTTPS_PROXY: NET_PROXY_URL,
+  http_proxy: NET_PROXY_URL,
+  https_proxy: NET_PROXY_URL,
+  NO_PROXY: '',
+  no_proxy: '',
+  /* Node's built-in fetch() is the one client that ignores the variables above
+   * unless it is told to read them (`node --use-env-proxy`, or this variable).
+   * Without it a `fetch()` in a JS job dials the destination directly, the
+   * seccomp AF_INET rule refuses the syscall, and the documented JavaScript
+   * flow fails while curl and python in the same jail work. Harmless on
+   * runtimes that do not know the variable. */
+  NODE_USE_ENV_PROXY: '1',
+  /* The JVM is the other client that reads none of the above: its default
+   * ProxySelector is built from system properties, so `java.net.http.HttpClient`
+   * and `HttpURLConnection` dial the destination directly, the shim refuses a
+   * connect that is not the proxy endpoint, and a Java job fails while curl in
+   * the same jail works. JAVA_TOOL_OPTIONS is the only way to reach a JVM the
+   * runtime's `run` script launches without rebuilding the packages volume.
+   *
+   * It costs one "Picked up JAVA_TOOL_OPTIONS" line on stderr per JVM start,
+   * which is the JVM's own doing and cannot be suppressed. Only when sandbox
+   * networking is on, and only for a runtime that reads it. */
+  JAVA_TOOL_OPTIONS: [
+    `-Dhttp.proxyHost=127.0.0.1`,
+    `-Dhttp.proxyPort=${NET_PROXY_PORT}`,
+    `-Dhttps.proxyHost=127.0.0.1`,
+    `-Dhttps.proxyPort=${NET_PROXY_PORT}`,
+    // Not the desktop's proxy settings, which do not exist in a jail.
+    '-Djava.net.useSystemProxies=false',
+  ].join(' '),
+};
 
 export { SIGNALS };
 
@@ -193,7 +252,11 @@ function readBaseConfig(): string {
  * embedded backslashes and double-quotes defensively in case future
  * callers pass arbitrary paths in. The cfg syntax is C-like so only those
  * two characters need escaping inside a string literal. */
-export function renderJobConfigOverlay(submissionDir: string, depsDir?: string): string {
+export function renderJobConfigOverlay(
+  submissionDir: string,
+  depsDir?: string,
+  bakedNodeModulesDir?: string,
+): string {
   const escaped = submissionDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const lines = [
     '',
@@ -232,6 +295,27 @@ export function renderJobConfigOverlay(submissionDir: string, depsDir?: string):
     );
   }
 
+  if (bakedNodeModulesDir) {
+    const escapedBaked = bakedNodeModulesDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    lines.push(
+      '# The runtime\'s baked node_modules, one directory above the workspace.',
+      '# When a job installs its own npm packages, /mnt/data/node_modules points',
+      '# at /mnt/deps/node_modules so the declared versions win; Node then walks',
+      '# up and finds the baked set here. NODE_PATH cannot do this job: ESM',
+      '# resolution ignores it entirely, and for CommonJS it is searched AFTER',
+      '# the workspace, which is the wrong precedence.',
+      'mount {',
+      `    src: "${escapedBaked}"`,
+      '    dst: "/mnt/node_modules"',
+      '    is_bind: true',
+      '    rw: false',
+      '    nosuid: true',
+      '    nodev: true',
+      '}',
+      '',
+    );
+  }
+
   return lines.join('\n');
 }
 
@@ -249,6 +333,12 @@ interface ExecuteOptions {
   enableToolCallSocket?: boolean;
   suppressSuccessLogs?: boolean;
   depsDir?: string;
+  /** Runtime's baked node_modules, bound at /mnt/node_modules so it stays
+   * resolvable when the workspace's node_modules is redirected to the per-job
+   * install. Only set when the job installed npm packages. */
+  bakedNodeModulesDir?: string;
+  /** Per-job net-egress-proxy socket; enables sandbox networking when set. */
+  netSocketPath?: string;
 }
 
 export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate = defaultNsJailSetupGate): Promise<NsJailResult> {
@@ -266,12 +356,18 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     enableToolCallSocket,
     suppressSuccessLogs,
     depsDir,
+    bakedNodeModulesDir,
+    netSocketPath,
   } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
   const cfgPath = `/tmp/nsjail-${logId}.cfg`;
 
-  fs.writeFileSync(cfgPath, readBaseConfig() + renderJobConfigOverlay(submissionDir, depsDir), { mode: 0o600 });
+  fs.writeFileSync(
+    cfgPath,
+    readBaseConfig() + renderJobConfigOverlay(submissionDir, depsDir, bakedNodeModulesDir),
+    { mode: 0o600 },
+  );
 
   const nsjailArgs = buildArgs({
     logPath,
@@ -284,6 +380,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     extraPkgdirs,
     identity,
     enableToolCallSocket,
+    netSocketPath,
   });
 
   const startTime = Date.now();
@@ -642,6 +739,10 @@ interface BuildArgsOptions {
   extraPkgdirs?: string[];
   identity: SandboxJobIdentity;
   enableToolCallSocket?: boolean;
+  /** Path to this job's net-egress-proxy unix socket. Present only when
+   * sandbox networking is enabled for the job; its absence is what keeps the
+   * jail's network posture unchanged for everyone else. */
+  netSocketPath?: string;
 }
 
 export function buildArgs(opts: BuildArgsOptions): string[] {
@@ -656,9 +757,11 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
     extraPkgdirs,
     identity,
     enableToolCallSocket,
+    netSocketPath,
   } = opts;
 
   const timeoutSecs = Math.max(1, Math.ceil(timeout / 1000));
+  const networkEnabled = typeof netSocketPath === 'string' && netSocketPath.length > 0;
 
   const args: string[] = [
     '--config', cfgPath ?? config.nsjail_config,
@@ -713,7 +816,22 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
     args.push('-B', `${socketPath}:${socketPath}`);
   }
 
-  for (const [key, value] of Object.entries(envVars)) {
+  /* Loopback stays DOWN for every job, networked or not: with the shim there
+   * is nothing to listen on it. `iface_no_lo` lives here rather than in
+   * sandbox.cfg because NsJail's config is protobuf text format, where
+   * re-setting a singular field per job cannot be expressed by appending to
+   * the base file. */
+  args.push('--iface_no_lo');
+
+  if (networkEnabled) {
+    args.push('-B', `${netSocketPath}:${NET_SOCKET_JAIL_PATH}`);
+    /* TLS verification needs a trust store. Read-only, and public data: this
+     * is the same bundle every Debian image ships. */
+    args.push('-R', '/etc/ssl/certs:/etc/ssl/certs');
+  }
+
+  const jobEnv = networkEnabled ? { ...envVars, ...NETWORK_PROXY_ENV } : envVars;
+  for (const [key, value] of Object.entries(jobEnv)) {
     args.push('-E', `${key}=${value}`);
   }
 
