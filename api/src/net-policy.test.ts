@@ -327,6 +327,16 @@ function clientHello(sni: string | null): Buffer {
   return Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), sizeOf(handshake.length), handshake]);
 }
 
+/** The same ClientHello, split across two handshake records. */
+function fragmentedClientHello(sni: string, firstFragmentBytes: number): Buffer {
+  const handshake = clientHello(sni).subarray(5);
+  const head = handshake.subarray(0, firstFragmentBytes);
+  const tail = handshake.subarray(firstFragmentBytes);
+  const record = (payload: Buffer): Buffer =>
+    Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), sizeOf(payload.length), payload]);
+  return Buffer.concat([record(head), record(tail)]);
+}
+
 function sizeOf(n: number): Buffer {
   const out = Buffer.alloc(2);
   out.writeUInt16BE(n);
@@ -360,6 +370,29 @@ describe('inspectClientHelloSni', () => {
     const lying = Buffer.from(hello);
     lying.writeUInt16BE(4, 3); // record claims 4 bytes of handshake
     expect(inspectClientHelloSni(lying).status).toBe('malformed');
+  });
+
+  test('reassembles a ClientHello split across handshake records', () => {
+    /* Legal TLS, and the shape that mattered: while a fragmented hello was
+     * 'malformed', the caller's fallback for an unreadable tunnel was looser
+     * than the SNI gate, so splitting the record was a way to carry a denied
+     * name past it. */
+    expect(inspectClientHelloSni(fragmentedClientHello('api.github.com', 8)))
+      .toEqual({ status: 'ok', sni: 'api.github.com' });
+  });
+
+  test('asks for more while only the first fragment has arrived', () => {
+    const fragmented = fragmentedClientHello('api.github.com', 8);
+    // 5 record header + 8 payload bytes: a complete first record, incomplete
+    // handshake message.
+    expect(inspectClientHelloSni(fragmented.subarray(0, 13))).toEqual({ status: 'need-more' });
+  });
+
+  test('rejects a non-handshake record in the middle of a fragmented hello', () => {
+    const fragmented = fragmentedClientHello('api.github.com', 8);
+    const spliced = Buffer.from(fragmented);
+    spliced[13] = 0x17; // second record announces application data
+    expect(inspectClientHelloSni(spliced).status).toBe('malformed');
   });
 });
 

@@ -51,6 +51,15 @@ dependencies:
   # internal mirror to keep installs inside your own network.
   indexUrl: "https://pypi.org/simple"
   npmRegistry: "https://registry.npmjs.org"
+  # Hosts the installers may reach besides those two. The installers run behind
+  # a proxy that knows only this set, which is what stops a package from
+  # pulling a transitive dependency off some other host. The default covers
+  # PyPI, which lists on pypi.org and serves files from files.pythonhosted.org;
+  # an index that serves its own files can be left empty.
+  allowedHosts: "files.pythonhosted.org"
+  # Let that proxy dial a private address. Needed when indexUrl/npmRegistry is
+  # an internal mirror; pair it with networkPolicy.sandboxRunner.mirrorCIDRs.
+  allowPrivateIndex: false
   # Reject unpinned specs ("requests" without "==2.31.0").
   requirePinned: true
   # Per-job ceilings on the declared package count, install wall clock, and
@@ -71,8 +80,11 @@ dependencies:
 sandboxNetwork:
   enabled: false
   # Comma-separated host allowlist; "*" or empty allows any public host that
-  # survives the proxy's IP checks. Suffix entries (".example.com") match
-  # subdomains.
+  # survives the proxy's IP checks. An entry is either an exact host
+  # ("api.github.com") or one leading wildcard label ("*.pypi.org", which also
+  # matches pypi.org itself). Anything else is dropped, and a list where NO
+  # entry parses denies every host and refuses to boot -- so the wildcard form
+  # has to be exactly this one.
   allowedHosts: ""
   # Comma-separated port allowlist. Keep networkPolicy.sandboxRunner
   # .externalEgressPorts in sync, or the policy drops what the proxy allows.
@@ -587,3 +599,13 @@ networkPolicy:
     # on, or the policy drops connections the proxy considers allowed. Empty
     # falls back to 80/443.
     externalEgressPorts: [80, 443]
+    # Render the matching ::/0 rule. On a dual-stack cluster the proxy will pin
+    # an AAAA answer and then be dropped by a v4-only policy; harmless on a
+    # v4-only cluster. Turn off only if your CNI rejects IPv6 ipBlocks.
+    externalEgressIPv6: true
+    # Package index or registry reachable only on a private address. The rule
+    # above excludes every private range deliberately, so name the mirror's CIDR
+    # here — e.g. ["10.4.2.0/24"] — rather than widening that exclusion. Pair it
+    # with CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX=true, which is what lets the
+    # installers' own proxy dial a private address at all.
+    mirrorCIDRs: []

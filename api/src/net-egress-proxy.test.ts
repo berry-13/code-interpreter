@@ -5,7 +5,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { buildUpstreamHead, createNetEgressProxy, parseRequestHead, RequestRejected } from './net-egress-proxy';
-import type { NetPolicy } from './net-policy';
+import { MAX_CLIENT_HELLO_BYTES, type NetPolicy } from './net-policy';
 
 const OPEN: NetPolicy = { allowedHosts: [], allowedPorts: [80, 443] };
 
@@ -686,6 +686,58 @@ describe('createNetEgressProxy', () => {
       sock,
       'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'
         + clientHelloFor('admin.internal').toString('latin1'),
+      { keepOpenMs: 250 },
+    );
+
+    expect(origin.received().length).toBe(0);
+  });
+
+  test('a denied SNI split across records is refused with no allowlist configured', async () => {
+    /* Same bypass as above, dressed as a legal fragmented handshake. It used to
+     * parse as 'malformed', and an unreadable tunnel with no allowlist was
+     * passed through opaquely — which is exactly the pass the whole hello was
+     * refused. */
+    const hello = clientHelloFor('admin.internal');
+    const handshake = hello.subarray(5);
+    const record = (payload: Buffer): Buffer => {
+      const size = Buffer.alloc(2);
+      size.writeUInt16BE(payload.length);
+      return Buffer.concat([Buffer.from([0x16, 0x03, 0x01]), size, payload]);
+    };
+    const fragmented = Buffer.concat([
+      record(handshake.subarray(0, 8)),
+      record(handshake.subarray(8)),
+    ]);
+
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port);
+
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'
+        + fragmented.toString('latin1'),
+      { keepOpenMs: 250 },
+    );
+
+    expect(origin.received().length).toBe(0);
+  });
+
+  test('a tunnel that claims TLS and never completes a hello is refused', async () => {
+    /* Stalling the parser was the other half of the same fail-open path: hold
+     * the buffer under a handshake record header, overrun the cap, and take the
+     * unnamed-tunnel exit. */
+    const origin = await startRecordingOrigin();
+    closers.push(origin.close);
+    const sock = await startDataPathProxy(origin.port);
+
+    const stall = Buffer.concat([
+      Buffer.from([0x16, 0x03, 0x01, 0xff, 0xff]),
+      Buffer.alloc(MAX_CLIENT_HELLO_BYTES + 1, 0x41),
+    ]);
+    await proxyRequest(
+      sock,
+      'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' + stall.toString('latin1'),
       { keepOpenMs: 250 },
     );
 

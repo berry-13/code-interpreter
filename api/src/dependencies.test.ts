@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { resolveDependencies, validateNpmDependencies, validatePipDependencies } from './dependencies';
+import {
+  dependencyEgressPolicy,
+  resolveDependencies,
+  validateNpmDependencies,
+  validatePipDependencies,
+} from './dependencies';
 
 const LIMITS = { maxCount: 5 };
 
@@ -345,5 +350,37 @@ describe('limits and errors that span both managers', () => {
       ['print("wrapped")'],
       { ...OPTS, declared: { unsupported: ['cargo'] } },
     ))).toMatch(/cargo/);
+  });
+});
+
+describe('dependencyEgressPolicy', () => {
+  const DEFAULTS = {
+    indexUrl: 'https://pypi.org/simple',
+    npmRegistry: 'https://registry.npmjs.org',
+    extraHosts: ['files.pythonhosted.org'],
+  };
+
+  test('allows the index, the registry and the hosts that serve their files', () => {
+    expect(dependencyEgressPolicy(DEFAULTS)).toEqual({
+      hosts: ['pypi.org', 'registry.npmjs.org', 'files.pythonhosted.org'],
+      ports: [80, 443],
+    });
+  });
+
+  test('carries a custom port into the allowlist', () => {
+    expect(dependencyEgressPolicy({ ...DEFAULTS, indexUrl: 'https://mirror.internal:8443/simple' }).ports)
+      .toEqual([80, 443, 8443]);
+  });
+
+  test('does not widen the policy for an unparseable index', () => {
+    /* A typo in the configuration must not become "reach anything": the
+     * install fails against a proxy that never learned the host. */
+    expect(dependencyEgressPolicy({ ...DEFAULTS, indexUrl: 'not a url', extraHosts: [] }).hosts)
+      .toEqual(['registry.npmjs.org']);
+  });
+
+  test('normalizes case and drops blank extra hosts', () => {
+    const policy = dependencyEgressPolicy({ ...DEFAULTS, extraHosts: [' Files.PythonHosted.org ', '', '  '] });
+    expect(policy.hosts).toEqual(['pypi.org', 'registry.npmjs.org', 'files.pythonhosted.org']);
   });
 });

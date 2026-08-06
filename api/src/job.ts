@@ -17,7 +17,7 @@ import { logger as rootLogger } from './logger';
 import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
-import type { ValidatedDependencies } from './dependencies';
+import { dependencyEgressPolicy, type ValidatedDependencies } from './dependencies';
 import { defaultManagerFor, type PackageManager } from '../../shared/requirements-header';
 import { createNetEgressProxy } from './net-egress-proxy';
 
@@ -65,6 +65,11 @@ export {
 } from './validation';
 
 const AUTO_LOAD_DIRKEEP_TIMEOUT_MS = 10000;
+
+/* How often a running installer's tree is measured against the size cap. Short
+ * enough that a fast writer cannot get far past the ceiling, long enough that
+ * the walk is a rounding error next to the install itself. */
+const INSTALL_SIZE_WATCH_INTERVAL_MS = 1000;
 
 const execFileP = promisify(execFile);
 
@@ -1170,8 +1175,25 @@ export class Job {
      * the service's JOB_PRIME_ALLOWANCE_MS, which is sized for one. The service
      * would then abort the call partway through the second install. */
     const deadlineAt = Date.now() + config.dependency_install_timeout_ms;
-    if (pipSpecs.length > 0) await this.installPip(pipSpecs, depsDir, parent, workspaceId, identity, deadlineAt);
-    if (npmSpecs.length > 0) await this.installNpm(npmSpecs, depsDir, identity, deadlineAt);
+
+    /* Everything the installers fetch goes through a proxy that knows only the
+     * configured index, registry and file hosts. Both managers resolve a
+     * package's declared direct URL by fetching it, and a check on the result
+     * runs after the runner has already made that request; this makes the
+     * request itself fail. Started here rather than per manager so a mixed job
+     * pays for one listener, and closed in the finally so no run can leave one
+     * behind. */
+    const egress = await this.startInstallEgressProxy();
+    try {
+      if (pipSpecs.length > 0) {
+        await this.installPip(pipSpecs, depsDir, parent, workspaceId, identity, deadlineAt, egress.env);
+      }
+      if (npmSpecs.length > 0) {
+        await this.installNpm(npmSpecs, depsDir, identity, deadlineAt, egress.env);
+      }
+    } finally {
+      await egress.close();
+    }
 
     /* One budget across both managers: the cap is on what the jail will be able
      * to see, not on any single installer. */
@@ -1186,6 +1208,81 @@ export class Job {
     }
   }
 
+  /**
+   * The installers' only route to the network, for the duration of the install.
+   *
+   * The runner itself has unrestricted egress, which is what makes a
+   * package-declared `child @ https://other.example/child.whl` a problem: pip
+   * and npm fetch it while resolving, long before any report or lockfile can be
+   * inspected. Pointing them at a proxy that resolves only the configured index
+   * and registry turns "detected afterwards" into "never connected". The
+   * listener is loopback-only and lives for exactly this phase; the jail has no
+   * interfaces and cannot reach it either way.
+   */
+  private async startInstallEgressProxy(): Promise<{
+    env: Record<string, string>;
+    close: () => Promise<void>;
+  }> {
+    const { hosts, ports } = dependencyEgressPolicy({
+      indexUrl: config.dependency_index_url,
+      npmRegistry: config.dependency_npm_registry,
+      extraHosts: config.dependency_allowed_hosts,
+    });
+
+    const proxy = await createNetEgressProxy({
+      loopbackPort: 0,
+      policy: {
+        allowedHosts: hosts,
+        // An empty derived list would mean "any host" under the shared policy
+        // rules, which is the opposite of the point. Refuse everything instead
+        // and let the install fail with the proxy's own reason.
+        denyAllHosts: hosts.length === 0,
+        allowedPorts: ports,
+        denyAllPorts: false,
+        allowlistLabel: 'the configured package index, registry and CODEAPI_DEPENDENCY_ALLOWED_HOSTS',
+      },
+      /* An operator whose index IS an internal mirror opts out of the address
+       * gate explicitly. The host allowlist above still bounds this to the
+       * mirror they configured. */
+      addressScreen: config.dependency_allow_private_index ? () => null : undefined,
+      maxTotalBytes: config.dependency_max_bytes,
+      idleTimeoutMs: config.dependency_install_timeout_ms,
+      log: this.log,
+    });
+
+    const port = proxy.port();
+    if (port === null) {
+      await proxy.close();
+      throw new ValidationError('dependency install could not start its egress proxy');
+    }
+    const url = `http://127.0.0.1:${port}`;
+
+    return {
+      /* Both cases: pip reads the lowercase names through requests, npm reads
+       * its own npm_config_* first. NO_PROXY empty so nothing bypasses this. */
+      env: {
+        HTTP_PROXY: url,
+        HTTPS_PROXY: url,
+        http_proxy: url,
+        https_proxy: url,
+        NO_PROXY: '',
+        no_proxy: '',
+        npm_config_proxy: url,
+        npm_config_https_proxy: url,
+      },
+      close: async () => {
+        const stats = proxy.stats();
+        if (stats.denied > 0 && !this.isSynthetic) {
+          this.log.warn(
+            { denied: stats.denied, allowedHosts: hosts },
+            'Dependency install tried to reach a host outside the configured index',
+          );
+        }
+        await proxy.close();
+      },
+    };
+  }
+
   private async installPip(
     pipSpecs: string[],
     depsDir: string,
@@ -1193,6 +1290,7 @@ export class Job {
     workspaceId: string,
     identity: SandboxJobIdentity,
     deadlineAt: number,
+    egressEnv: Record<string, string>,
   ): Promise<void> {
     // Before anything is written: a job with no python runtime to install with
     // fails here, with nothing to clean up.
@@ -1205,10 +1303,11 @@ export class Job {
     const requireHashes = pipSpecs.some(s => s.includes('--hash='));
     /* `--index-url` selects the index; it does not stop a wheel from that index
      * declaring `Requires-Dist: child @ https://other.example/child.whl`, which
-     * pip resolves by fetching that URL. Same shape as the npm case, and the
-     * same answer: ask pip for a report of what it resolved and refuse a tree
-     * containing anything it would fetch by direct URL. `--no-deps` is not an
-     * option here — dependencies are the point.
+     * pip resolves by fetching that URL. The install proxy is what stops that
+     * fetch (see startInstallEgressProxy); the report is the second half of the
+     * answer, refusing a tree that reached anything by direct URL even when the
+     * URL happened to be on an allowed host. `--no-deps` is not an option here
+     * — dependencies are the point.
      *
      * pip writes the report itself, with a plain `open(path, 'w')`, as the
      * per-job UID. The workspace root is root-owned 0711: that UID can traverse
@@ -1244,10 +1343,10 @@ export class Job {
        * installing anything, so the plan is vetoed before the tree exists. The
        * real install re-checks, because the index is free to resolve
        * differently the second time. */
-      await this.runInstaller(pipPath, [...args, '--dry-run'], depsDir, identity, deadlineAt);
+      await this.runInstaller(pipPath, [...args, '--dry-run'], depsDir, identity, deadlineAt, egressEnv);
       assertNoDirectUrlInstalls(await fsp.readFile(reportPath, 'utf8').catch(() => ''));
 
-      await this.runInstaller(pipPath, args, depsDir, identity, deadlineAt);
+      await this.runInstaller(pipPath, args, depsDir, identity, deadlineAt, egressEnv);
       assertNoDirectUrlInstalls(await fsp.readFile(reportPath, 'utf8').catch(() => ''));
     } finally {
       await fsp.rm(reqPath, { force: true }).catch(() => {});
@@ -1269,6 +1368,7 @@ export class Job {
     depsDir: string,
     identity: SandboxJobIdentity,
     deadlineAt: number,
+    egressEnv: Record<string, string>,
   ): Promise<void> {
     /* `--registry` constrains the specs WE pass; it does not constrain what a
      * package on that registry asks for. npm resolves a transitive
@@ -1276,11 +1376,12 @@ export class Job {
      * selected package could pull code from a host the operator never
      * configured -- past both CODEAPI_DEPENDENCY_NPM_REGISTRY and the no-URLs
      * rule the spec grammar enforces on user input. npm has no config that
-     * forbids this, so the tree is verified after the fact instead: a manifest
-     * in the prefix makes npm record a `resolved` URL per package, and
-     * assertRegistryOnlyTree rejects any that did not come from the configured
-     * registry. --ignore-scripts means nothing has executed at that point, so
-     * failing here is still before any of it can matter. */
+     * forbids this, so the fetch is stopped by the install proxy and the tree
+     * is verified after the fact as well: a manifest in the prefix makes npm
+     * record a `resolved` URL per package, and assertRegistryOnlyTree rejects
+     * any that did not come from the configured registry. --ignore-scripts
+     * means nothing has executed at that point, so failing here is still
+     * before any of it can matter. */
     const manifestPath = path.join(depsDir, 'package.json');
     const lockPath = path.join(depsDir, 'package-lock.json');
     await fsp.writeFile(
@@ -1320,9 +1421,10 @@ export class Job {
 
     try {
       await this.runInstaller(this.resolveNpmPath(), args, depsDir, identity, deadlineAt, {
+        ...egressEnv,
         npm_config_cache: cacheDir,
         npm_config_update_notifier: 'false',
-      });
+      }, [cacheDir]);
       assertRegistryOnlyTree(
         await fsp.readFile(lockPath, 'utf8').catch(() => ''),
         config.dependency_npm_registry,
@@ -1387,6 +1489,9 @@ export class Job {
     identity: SandboxJobIdentity,
     deadlineAt: number,
     extraEnv: Record<string, string> = {},
+    /** Written to by the installer besides depsDir — npm's cache. Counted
+     * while the install runs, because that is disk the runner is spending. */
+    extraWatchedPaths: string[] = [],
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       /* Whatever is left of the phase-wide budget, not a fresh full timeout.
@@ -1424,8 +1529,45 @@ export class Job {
       child.stdout?.on('data', capture);
       child.stderr?.on('data', capture);
 
-      child.on('error', err => reject(new ValidationError(`dependency install failed to start: ${err.message}`)));
+      /* The size cap is also checked once the install finishes, but a check
+       * that only runs at the end is a check the runner's disk has already
+       * paid for: one pinned package can unpack to far more than
+       * CODEAPI_DEPENDENCY_MAX_BYTES, and the job is rejected long after every
+       * other job on the runner has run out of space. So watch it grow and
+       * kill the installer at the ceiling. Sampling, not accounting — the
+       * final check is what decides — so a stat storm on a large tree cannot
+       * cost more than one walk at a time. */
+      const watched = [depsDir, ...extraWatchedPaths];
+      let overran = false;
+      let walking = false;
+      const sizeWatch = setInterval(() => {
+        if (walking) return;
+        walking = true;
+        Promise.all(watched.map(target => dirSizeBytes(target).catch(() => 0)))
+          .then(sizes => {
+            if (sizes.reduce((total, size) => total + size, 0) <= config.dependency_max_bytes) return;
+            overran = true;
+            child.kill('SIGKILL');
+          })
+          .catch(() => {})
+          .finally(() => {
+            walking = false;
+          });
+      }, INSTALL_SIZE_WATCH_INTERVAL_MS);
+      sizeWatch.unref();
+
+      child.on('error', err => {
+        clearInterval(sizeWatch);
+        reject(new ValidationError(`dependency install failed to start: ${err.message}`));
+      });
       child.on('close', (code, signal) => {
+        clearInterval(sizeWatch);
+        if (overran) {
+          reject(new ValidationError(
+            `installed dependencies exceed the limit of ${config.dependency_max_bytes} bytes`,
+          ));
+          return;
+        }
         if (code === 0) {
           resolve();
           return;

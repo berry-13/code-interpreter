@@ -84,6 +84,30 @@ describe('createPayload requirements extraction', () => {
       .toEqual({ pip: ['cowsay==6.1'], unsupported: ['gem'] });
   });
 
+  /* Scanning raw text found declarations that are not declarations: a
+   * docstring or template literal that merely CONTAINS the line was treated as
+   * one, so a program printing its own usage had those packages installed for
+   * it — or, with the feature off, was rejected outright. */
+  test('ignores a declaration inside a docstring', () => {
+    expect(build('"""\nUsage:\n# requirements: cowsay==6.1\n"""\nprint(1)').dependencies)
+      .toBeUndefined();
+  });
+
+  test('ignores a declaration inside a template literal', () => {
+    expect(build('const usage = `\n// requirements: lodash@4.17.21\n`;\nconsole.log(usage);', 'js').dependencies)
+      .toBeUndefined();
+  });
+
+  test('still reads a real declaration after a docstring closes', () => {
+    expect(build('"""doc"""\n# requirements: cowsay==6.1\nimport cowsay').dependencies)
+      .toEqual({ pip: ['cowsay==6.1'] });
+  });
+
+  test('a quote inside a comment does not swallow the rest of the file', () => {
+    expect(build("# it's a comment\n# requirements: cowsay==6.1\nimport cowsay").dependencies)
+      .toEqual({ pip: ['cowsay==6.1'] });
+  });
+
   test('keeps a comma that belongs to a version specifier or an extras list', () => {
     expect(build('# requirements: pandas>=2,<3\n').dependencies)
       .toEqual({ pip: ['pandas>=2,<3'] });

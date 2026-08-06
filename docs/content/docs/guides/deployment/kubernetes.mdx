@@ -207,10 +207,24 @@ sandboxNetwork:
 
 Enabling either one also opens sandbox-runner's egress to public addresses —
 the installers reach the index, the per-job proxy reaches allowlisted hosts —
-which the chart renders into the sandbox-runner NetworkPolicy automatically.
-Private ranges stay excluded. Adjust the ports it opens with
-`networkPolicy.sandboxRunner.externalEgressPorts` if `allowedPorts`, your index,
-or your registry needs more than 80 and 443.
+which the chart renders into the sandbox-runner NetworkPolicy automatically,
+for both IPv4 and IPv6. Private, link-local and CGNAT ranges stay excluded.
+Adjust the ports it opens with `networkPolicy.sandboxRunner.externalEgressPorts`
+if `allowedPorts`, your index, or your registry needs more than 80 and 443.
+
+An index or registry that lives inside the cluster network is the one case the
+public rule cannot cover, so name it rather than reopening RFC1918:
+
+```yaml
+dependencies:
+  enabled: true
+  indexUrl: "https://mirror.internal/simple"
+  allowPrivateIndex: true        # the installers' proxy may dial a private address
+
+networkPolicy:
+  sandboxRunner:
+    mirrorCIDRs: ["10.4.2.0/24"] # ...and the NetworkPolicy lets it out
+```
 
 <Callout type="warn">
 `dependencies.installTimeoutMs` is spent inside the sandbox call the worker is

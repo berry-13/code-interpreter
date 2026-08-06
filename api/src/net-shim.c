@@ -56,6 +56,7 @@ static int (*real_connect)(int, const struct sockaddr *, socklen_t);
 static int (*real_close)(int);
 static int (*real_setsockopt)(int, int, int, const void *, socklen_t);
 static int (*real_getpeername)(int, struct sockaddr *, socklen_t *);
+static int (*real_getsockname)(int, struct sockaddr *, socklen_t *);
 
 static volatile sig_atomic_t redirected[MAX_TRACKED_FD];
 static char socket_path[108];
@@ -71,6 +72,7 @@ __attribute__((constructor)) static void net_shim_init(void) {
     real_close = dlsym(RTLD_NEXT, "close");
     real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
     real_getpeername = dlsym(RTLD_NEXT, "getpeername");
+    real_getsockname = dlsym(RTLD_NEXT, "getsockname");
 
     const char *path = getenv("NET_SHIM_SOCKET");
     if (path == NULL || *path == '\0' || strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
@@ -180,6 +182,37 @@ int setsockopt(int fd, int level, int optname, const void *optval, socklen_t opt
         return -1;
     }
     return real_setsockopt(fd, level, optname, optval, optlen);
+}
+
+/* The local-address counterpart, and not cosmetic: a client that asks the
+ * kernel what family its own socket is gets AF_UNIX and concludes the socket
+ * cannot carry IP options. Node's built-in fetch() is exactly that client —
+ * undici sets the IP type-of-service byte before writing the request, the
+ * runtime checks the family first, and the mismatch surfaces as an uncaught
+ * `setTypeOfService EINVAL` that kills the process before a single byte is
+ * sent. Interposing setsockopt alone does not help, because the option is
+ * never attempted. Verified against the shipped Node 24.15.0: node:http worked
+ * either way, fetch() only with this. */
+int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
+    net_shim_init();
+    if (is_tracked(fd) && addr != NULL && len != NULL && *len >= (socklen_t)sizeof(struct sockaddr_in)) {
+        struct sockaddr_in in;
+        memset(&in, 0, sizeof(in));
+        in.sin_family = AF_INET;
+        /* An ephemeral local port is what a connected TCP socket would report;
+         * nothing in the jail can bind or reach it, so the value only has to
+         * be shaped like one. */
+        in.sin_port = 0;
+        in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        memcpy(addr, &in, sizeof(in));
+        *len = sizeof(in);
+        return 0;
+    }
+    if (real_getsockname == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return real_getsockname(fd, addr, len);
 }
 
 /* Clients that introspect the peer (logging, some TLS paths) would otherwise

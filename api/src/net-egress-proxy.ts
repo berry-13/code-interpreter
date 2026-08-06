@@ -59,7 +59,13 @@ export interface NetEgressProxyLogger {
 }
 
 export interface NetEgressProxyOptions {
-  socketPath: string;
+  /** Unix socket to listen on. The sandbox reaches the proxy this way: the jail
+   * has no network interfaces, and the socket is bind-mounted into it. */
+  socketPath?: string;
+  /** Loopback TCP to listen on instead, for clients that cannot speak to a unix
+   * socket — the dependency installers, which only understand an HTTP_PROXY
+   * URL. Port 0 asks the kernel for a free port; the handle reports it. */
+  loopbackPort?: number;
   policy: NetPolicy;
   socketUid?: number;
   socketGid?: number;
@@ -102,6 +108,8 @@ export interface NetEgressProxyStats {
 export interface NetEgressProxyHandle {
   close: () => Promise<void>;
   stats: () => NetEgressProxyStats;
+  /** The bound loopback port, when listening on TCP rather than a socket. */
+  port: () => number | null;
 }
 
 const DEFAULT_MAX_CONNECTIONS = 32;
@@ -333,6 +341,7 @@ function sanitize(value: string): string {
 export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise<NetEgressProxyHandle> {
   const {
     socketPath,
+    loopbackPort,
     policy,
     socketUid,
     socketGid,
@@ -565,7 +574,13 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
     /* A tunnel with no name in it. With an allowlist the authority is the
      * boundary and an unbindable tunnel is refused; without one the address
      * gate already settled the destination and there is nothing to smuggle, so
-     * it stays opaque and carries any protocol. */
+     * it stays opaque and carries any protocol.
+     *
+     * Only ever reached for a stream that is NOT TLS. Bytes that announce a
+     * handshake record and then fail to yield a ClientHello are refused
+     * outright: the denied-name list applies with or without an allowlist, so
+     * a fail-open path for anything claiming to be TLS is a way to reach a
+     * denied name by sending a hello the parser cannot read. */
     const passThroughUnnamedTunnel = (reason: string): boolean => {
       if (hostAllowlistInForce(policy)) {
         onOverrun(reason);
@@ -584,10 +599,21 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
 
       helloBuffer = Buffer.concat([helloBuffer, chunk]);
       if (helloBuffer.length > MAX_CLIENT_HELLO_BYTES) {
-        return passThroughUnnamedTunnel('CONNECT tunnel sent no parseable TLS ClientHello');
+        const reason = 'CONNECT tunnel sent no parseable TLS ClientHello';
+        // Claims to be a handshake record but never completes one: refused, so
+        // that stalling the parser is not a way around the SNI gate.
+        if (helloBuffer[0] === 0x16 && helloBuffer[1] === 0x03) {
+          onOverrun(reason);
+          return false;
+        }
+        return passThroughUnnamedTunnel(reason);
       }
       const verdict = inspectClientHelloSni(helloBuffer);
       if (verdict.status === 'need-more') return true;
+      if (verdict.status === 'malformed') {
+        onOverrun('CONNECT tunnel did not open with a TLS ClientHello (malformed)');
+        return false;
+      }
       if (verdict.status !== 'ok') {
         return passThroughUnnamedTunnel(
           `CONNECT tunnel did not open with a TLS ClientHello (${verdict.status})`,
@@ -714,42 +740,62 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
     client.resume();
   }
 
+  if ((socketPath === undefined) === (loopbackPort === undefined)) {
+    throw new Error('net egress proxy needs exactly one of socketPath or loopbackPort');
+  }
+
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen({ path: socketPath, backlog: LISTEN_BACKLOG }, () => {
+    const listening = (): void => {
       server.removeListener('error', reject);
       resolve();
-    });
+    };
+    if (socketPath !== undefined) {
+      server.listen({ path: socketPath, backlog: LISTEN_BACKLOG }, listening);
+    } else {
+      /* Loopback only. Nothing in the jail can reach the runner's loopback —
+       * it has no interfaces at all — so this is reachable by the installer
+       * the runner spawned and by nothing the sandbox runs. */
+      server.listen({ host: '127.0.0.1', port: loopbackPort, backlog: LISTEN_BACKLOG }, listening);
+    }
   });
+
+  const boundPort = (): number | null => {
+    const address = server.address();
+    return address !== null && typeof address === 'object' ? address.port : null;
+  };
 
   /* Past this point the server is listening, so anything that throws has to
    * take the listener down with it. The caller only knows the socket path and
    * unlinks that; an FD left listening on an unlinked path is unreachable but
    * still alive, and with networking on that is one leaked listener per job
    * until the runner is out of descriptors. */
-  try {
-    // Ownership first, then mode: between listen() and chown the socket exists
-    // with the runner's ownership, and 0600 on the wrong owner is still closed
-    // to the job. chmod last means the job-readable state is only ever reached
-    // after the uid is correct.
-    if (socketUid !== undefined && socketGid !== undefined) {
-      await fsp.chown(socketPath, socketUid, socketGid);
+  if (socketPath !== undefined) {
+    try {
+      // Ownership first, then mode: between listen() and chown the socket exists
+      // with the runner's ownership, and 0600 on the wrong owner is still closed
+      // to the job. chmod last means the job-readable state is only ever reached
+      // after the uid is correct.
+      if (socketUid !== undefined && socketGid !== undefined) {
+        await fsp.chown(socketPath, socketUid, socketGid);
+      }
+      await fsp.chmod(socketPath, 0o600);
+    } catch (error) {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await fsp.rm(socketPath, { force: true }).catch(() => {});
+      throw error;
     }
-    await fsp.chmod(socketPath, 0o600);
-  } catch (error) {
-    await new Promise<void>(resolve => server.close(() => resolve()));
-    await fsp.rm(socketPath, { force: true }).catch(() => {});
-    throw error;
   }
 
   return {
     stats: () => ({ ...stats, activeConnections: sockets.size }),
+    port: boundPort,
     close: async () => {
       closed = true;
       for (const socket of sockets) socket.destroy();
       sockets.clear();
       await new Promise<void>(resolve => server.close(() => resolve()));
-      await fsp.rm(socketPath, { force: true }).catch(() => {});
+      if (socketPath !== undefined) await fsp.rm(socketPath, { force: true }).catch(() => {});
     },
   };
 }

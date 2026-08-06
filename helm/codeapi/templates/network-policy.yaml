@@ -107,11 +107,41 @@ spec:
               - 192.168.0.0/16
               - 169.254.0.0/16
               - 100.64.0.0/10
+        {{- if .Values.networkPolicy.sandboxRunner.externalEgressIPv6 }}
+        # Dual-stack: the proxy pins whatever address it resolved, so a host
+        # that answers AAAA passes every application check and then dies at the
+        # policy unless ::/0 is here too. Same exclusions in v6 terms: ULA,
+        # link-local, loopback, and the v4-mapped range that would otherwise
+        # carry a private v4 destination past the list above.
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "fc00::/7"
+              - "fe80::/10"
+              - "::1/128"
+              - "::ffff:0:0/96"
+        {{- end }}
       ports:
         {{- range $externalEgressPorts }}
         - protocol: TCP
           port: {{ . }}
         {{- end }}
+    {{- with .Values.networkPolicy.sandboxRunner.mirrorCIDRs }}
+    # An index or registry inside the cluster network. The rule above excludes
+    # every private range on purpose, so a deployment that points
+    # dependencies.indexUrl at an internal mirror has to name it here — and
+    # only it, rather than reopening RFC1918 wholesale.
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        {{- range $externalEgressPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
     {{- end }}
 ---
 apiVersion: networking.k8s.io/v1

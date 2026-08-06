@@ -167,6 +167,20 @@ export const config = {
   dependency_require_pinned: envFlag(process.env.CODEAPI_DEPENDENCY_REQUIRE_PINNED, true),
   dependency_install_timeout_ms: safeInt(process.env.CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS, 120000),
   dependency_max_bytes: safeInt(process.env.CODEAPI_DEPENDENCY_MAX_BYTES, 262144000),
+  /* Hosts the installers may reach BESIDES the index and registry themselves,
+   * which are always allowed. The default covers PyPI, which lists on pypi.org
+   * and serves files from files.pythonhosted.org; an index that delivers its
+   * own files needs nothing here. `||` for the same reason as the index URL:
+   * Compose forwards an unset knob as an empty string. */
+  dependency_allowed_hosts: (process.env.CODEAPI_DEPENDENCY_ALLOWED_HOSTS || 'files.pythonhosted.org')
+    .split(',')
+    .map(entry => entry.trim())
+    .filter(entry => entry.length > 0),
+  /* The installer proxy screens addresses the same way the sandbox's does, so
+   * an index on a private address is refused by default. Set true when the
+   * configured index or registry IS an internal mirror — the host allowlist
+   * above is then what bounds where installs can reach. */
+  dependency_allow_private_index: envFlag(process.env.CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX, false),
   require_execution_manifest: requireExecutionManifest,
   execution_manifest_body_hash_required_after_seconds: sandboxStartedAtSeconds + safeInt(
     process.env.SANDBOX_EXECUTION_MANIFEST_BODY_HASH_LEGACY_GRACE_SECONDS,

@@ -409,6 +409,8 @@ fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
         // runner INSIDE the guest, so they must cross the VM boundary; without
         // them the feature silently stays off in hardened mode.
         "CODEAPI_ALLOW_SANDBOX_NETWORK",
+        "CODEAPI_DEPENDENCY_ALLOWED_HOSTS",
+        "CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX",
         "CODEAPI_DEPENDENCY_INDEX_URL",
         "CODEAPI_DEPENDENCY_INSTALL_TIMEOUT_MS",
         "CODEAPI_DEPENDENCY_MAX_BYTES",

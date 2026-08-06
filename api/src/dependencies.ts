@@ -287,3 +287,53 @@ export function resolveDependencies(
   if (npm.length > 0) resolved.npm = validateNpmDependencies(npm, limits);
   return resolved;
 }
+
+/**
+ * The egress the installers are allowed, derived from where packages are
+ * supposed to come from.
+ *
+ * `--index-url` and `--registry` choose where the installer LOOKS; they do not
+ * stop a package found there from declaring `child @ https://other.example/…`,
+ * which pip and npm resolve by fetching that URL. Both are checked after the
+ * fact (pip's `--report`, npm's lockfile), but by then the trusted runner has
+ * already contacted a host the operator never configured. So the installer runs
+ * behind a proxy that only knows these hosts and ports, and the fetch fails
+ * instead of the check catching it afterwards.
+ *
+ * A package index commonly serves its files from a second host — pypi.org lists
+ * and files.pythonhosted.org delivers — which is what `extraHosts` is for.
+ */
+export function dependencyEgressPolicy(opts: {
+  indexUrl: string;
+  npmRegistry: string;
+  extraHosts: string[];
+}): { hosts: string[]; ports: number[] } {
+  const hosts = new Set<string>();
+  // 80 and 443 always: an index on a custom port still redirects to ordinary
+  // ones for its files, and the host allowlist is what actually gates this.
+  const ports = new Set<number>([80, 443]);
+
+  for (const raw of [opts.indexUrl, opts.npmRegistry]) {
+    let url: URL;
+    try {
+      url = new URL(raw);
+    } catch {
+      // Unparseable configuration is left out rather than widening the policy;
+      // the installer then fails to reach it, which is the visible failure.
+      continue;
+    }
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (host.length > 0) hosts.add(host);
+    if (url.port.length > 0) {
+      const port = Number(url.port);
+      if (Number.isInteger(port) && port > 0 && port <= 65535) ports.add(port);
+    }
+  }
+
+  for (const extra of opts.extraHosts) {
+    const host = extra.trim().toLowerCase();
+    if (host.length > 0) hosts.add(host);
+  }
+
+  return { hosts: [...hosts], ports: [...ports].sort((a, b) => a - b) };
+}

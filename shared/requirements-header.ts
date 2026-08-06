@@ -100,6 +100,67 @@ function splitDeclaredSpecs(text: string): string[] {
 }
 
 /**
+ * Blank out the inside of multi-line string literals, keeping every offset and
+ * newline so the line-anchored scan below is unaffected everywhere else.
+ *
+ * Without this, a Python docstring or a JS template literal that happens to
+ * contain a line reading `# requirements: cowsay==6.1` is read as a
+ * declaration: a program that only prints or documents that text gets rejected
+ * when the feature is off, and silently installs packages when it is on. Only
+ * multi-line forms can contain such a line, so tracking `'''`, `"""` and
+ * backticks is enough; single-line quotes are tracked, not masked, purely so a
+ * `#` inside one does not open a comment.
+ *
+ * Line comments are tracked for the same reason in reverse: a quote character
+ * inside an ordinary comment (`# it's fine`) must not open a string and swallow
+ * the rest of the file.
+ */
+function maskMultiLineStrings(source: string): string {
+  const out = source.split('');
+  let i = 0;
+  const at = (text: string): boolean => source.startsWith(text, i);
+
+  while (i < source.length) {
+    // Multi-line string: mask through the closing delimiter.
+    const opener = at("'''") ? "'''" : at('"""') ? '"""' : at('`') ? '`' : null;
+    if (opener !== null) {
+      i += opener.length;
+      while (i < source.length && !source.startsWith(opener, i)) {
+        if (source[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (source[i] !== '\n') out[i] = ' ';
+        i++;
+      }
+      i += opener.length;
+      continue;
+    }
+
+    // Line comment: skip to the newline without interpreting anything in it.
+    if (at('#') || at('//')) {
+      while (i < source.length && source[i] !== '\n') i++;
+      continue;
+    }
+
+    // Single-line string: ends at its quote or at the newline.
+    if (source[i] === "'" || source[i] === '"') {
+      const quote = source[i];
+      i++;
+      while (i < source.length && source[i] !== quote && source[i] !== '\n') {
+        i += source[i] === '\\' ? 2 : 1;
+      }
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  return out.join('');
+}
+
+/**
  * Collect declared specs per manager, in order and de-duplicated. Empty lists
  * mean the job declared nothing, which every caller must treat as ordinary
  * rather than as an error.
@@ -113,9 +174,9 @@ export function extractRequirements(
 
   for (const source of sources) {
     if (typeof source !== 'string' || source.length === 0) continue;
-    const scanned = source.length > MAX_SOURCE_SCAN_BYTES
-      ? source.slice(0, MAX_SOURCE_SCAN_BYTES)
-      : source;
+    const scanned = maskMultiLineStrings(
+      source.length > MAX_SOURCE_SCAN_BYTES ? source.slice(0, MAX_SOURCE_SCAN_BYTES) : source,
+    );
     REQUIREMENTS_LINE_RE.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = REQUIREMENTS_LINE_RE.exec(scanned)) !== null) {

@@ -58,7 +58,10 @@ every LLM integration and has been removed.
 The declaration is found anywhere in the first 64 KB of a submitted file,
 whitespace and capitalisation are forgiving, and duplicate specs across files
 are collapsed. Prose that merely mentions the word is not a declaration —
-`# requirements are listed in README` declares nothing.
+`# requirements are listed in README` declares nothing. Neither does a line
+inside a string: a docstring or template literal that quotes
+`# requirements: cowsay==6.1` as example text is skipped, so a program that
+prints its own usage does not install what its usage describes.
 
 <Callout type="info">
 When **any** package carries a hash, **all** of them must, and pip runs with
@@ -95,12 +98,19 @@ The properties that matter:
   `--registry` only route the specs the runner passes; a package on the index is
   free to declare a dependency as a direct URL (`child @ https://other/x.whl`,
   or a git ref for npm), and both installers would fetch it. Neither has a
-  setting that forbids it, so the resolved tree is verified afterwards instead —
-  npm against the lockfile, pip against its `--report` — and the job fails
-  before it runs if anything came from somewhere else. The npm check honours a
-  path-scoped registry, so a different repository on the same host is refused
-  too. Combined with `--ignore-scripts` and wheels-only, nothing from an
-  unapproved host has executed.
+  setting that forbids it, so the installers run behind a proxy that resolves
+  only the index, the registry and `CODEAPI_DEPENDENCY_ALLOWED_HOSTS` — the
+  request fails at the proxy rather than being caught after the runner has
+  already made it. The resolved tree is still verified afterwards, npm against
+  the lockfile and pip against its `--report`, which catches a direct URL that
+  happened to point at an allowed host. The npm check honours a path-scoped
+  registry, so a different repository on the same host is refused too. Combined
+  with `--ignore-scripts` and wheels-only, nothing from an unapproved host has
+  executed.
+- **The install cannot fill the runner's disk.** `CODEAPI_DEPENDENCY_MAX_BYTES`
+  is enforced while the installer runs, not only once it finishes, so a package
+  that expands to far more than the ceiling is killed on the way past it rather
+  than after the space is gone.
 - **No install-time code executes.** `pip --only-binary=:all:` means wheels
   only, so no `setup.py` runs; `npm --ignore-scripts` is the exact counterpart,
   refusing `preinstall`/`install`/`postinstall` hooks. This is the single most
@@ -133,6 +143,15 @@ The properties that matter:
 | `CODEAPI_DEPENDENCY_MAX_BYTES` | `262144000` | Total install size (250 MB) |
 | `CODEAPI_DEPENDENCY_INDEX_URL` | `https://pypi.org/simple` | Where wheels come from |
 | `CODEAPI_DEPENDENCY_NPM_REGISTRY` | `https://registry.npmjs.org` | Where npm packages come from |
+| `CODEAPI_DEPENDENCY_ALLOWED_HOSTS` | `files.pythonhosted.org` | Other hosts the installers may reach |
+| `CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX` | `false` | Allow an index on a private address |
+
+`CODEAPI_DEPENDENCY_ALLOWED_HOSTS` exists because an index and its files often
+live on different hosts — PyPI lists on `pypi.org` and delivers from
+`files.pythonhosted.org`. An index that serves its own files needs nothing here.
+An internal mirror additionally needs `CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX`,
+since the installers' proxy refuses private addresses the same way the sandbox's
+does.
 
 <Callout type="warn">
   **npm requirements need the `node` runtime installed.** Bun-backed JS runtimes

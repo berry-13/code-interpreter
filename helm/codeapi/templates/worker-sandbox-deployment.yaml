@@ -331,6 +331,10 @@ spec:
               value: {{ .Values.dependencies.indexUrl | quote }}
             - name: CODEAPI_DEPENDENCY_NPM_REGISTRY
               value: {{ .Values.dependencies.npmRegistry | quote }}
+            - name: CODEAPI_DEPENDENCY_ALLOWED_HOSTS
+              value: {{ .Values.dependencies.allowedHosts | quote }}
+            - name: CODEAPI_DEPENDENCY_ALLOW_PRIVATE_INDEX
+              value: {{ .Values.dependencies.allowPrivateIndex | quote }}
             - name: CODEAPI_DEPENDENCY_REQUIRE_PINNED
               value: {{ .Values.dependencies.requirePinned | quote }}
             - name: CODEAPI_DEPENDENCY_MAX_COUNT

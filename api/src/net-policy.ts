@@ -40,7 +40,16 @@ export interface NetPolicy {
    * is falling back to the 80,443 default, which would widen a policy written
    * to narrow it. Startup refuses this configuration too. */
   denyAllPorts?: boolean;
+  /** What to call this allowlist in a denial. Defaults to the sandbox's env
+   * var, which is where the policy comes from for user code; the dependency
+   * installers run under a policy derived from the index and registry instead,
+   * and naming SANDBOX_NET_ALLOWED_HOSTS there sends an operator to a knob
+   * that has nothing to do with the failure. */
+  allowlistLabel?: string;
 }
+
+const DEFAULT_HOST_ALLOWLIST_LABEL = 'SANDBOX_NET_ALLOWED_HOSTS';
+const DEFAULT_PORT_ALLOWLIST_LABEL = 'SANDBOX_NET_ALLOWED_PORTS';
 
 export type PolicyVerdict = { allowed: true } | { allowed: false; reason: string };
 
@@ -129,7 +138,8 @@ export function checkHost(host: string, policy: NetPolicy): PolicyVerdict {
   for (const suffix of DENIED_HOST_SUFFIXES) {
     if (host.endsWith(suffix)) return deny(`host suffix '${suffix}' is denied by policy`);
   }
-  if (policy.denyAllHosts) return deny('SANDBOX_NET_ALLOWED_HOSTS contained no usable entries');
+  const label = policy.allowlistLabel ?? DEFAULT_HOST_ALLOWLIST_LABEL;
+  if (policy.denyAllHosts) return deny(`${label} contained no usable entries`);
   if (policy.allowedHosts.length === 0) return ALLOW;
   for (const entry of policy.allowedHosts) {
     if (entry.startsWith('*.')) {
@@ -139,13 +149,16 @@ export function checkHost(host: string, policy: NetPolicy): PolicyVerdict {
       return ALLOW;
     }
   }
-  return deny('host is not in SANDBOX_NET_ALLOWED_HOSTS');
+  return deny(`host is not in ${label}`);
 }
 
 export function checkPort(port: number, policy: NetPolicy): PolicyVerdict {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return deny('invalid port');
-  if (policy.denyAllPorts) return deny('SANDBOX_NET_ALLOWED_PORTS contained no usable entries');
-  if (!policy.allowedPorts.includes(port)) return deny(`port ${port} is not in SANDBOX_NET_ALLOWED_PORTS`);
+  const label = policy.allowlistLabel === undefined
+    ? DEFAULT_PORT_ALLOWLIST_LABEL
+    : `${policy.allowlistLabel} (ports)`;
+  if (policy.denyAllPorts) return deny(`${label} contained no usable entries`);
+  if (!policy.allowedPorts.includes(port)) return deny(`port ${port} is not in ${label}`);
   return ALLOW;
 }
 
@@ -201,31 +214,46 @@ function readUint24(buf: Buffer, offset: number): number {
  * SNI extension, which is legitimate for an IP-literal target).
  */
 export function inspectClientHelloSni(data: Buffer): ClientHelloVerdict {
+  // A handshake record always starts 0x16 0x03; reject early rather than
+  // buffering an unbounded non-TLS stream waiting for a header.
+  if (data.length >= 1 && data[0] !== 0x16) return { status: 'not-tls' };
+  if (data.length >= 2 && data[1] !== 0x03) return { status: 'not-tls' };
   // record: type(1) legacy_version(2) length(2)
-  if (data.length < 5) {
-    // A handshake record always starts 0x16 0x03; reject early rather than
-    // buffering an unbounded non-TLS stream waiting for a header.
-    if (data.length >= 1 && data[0] !== 0x16) return { status: 'not-tls' };
-    if (data.length >= 2 && data[1] !== 0x03) return { status: 'not-tls' };
-    return { status: 'need-more' };
+  if (data.length < 5) return { status: 'need-more' };
+
+  /* A ClientHello may legally be split across several handshake records, and
+   * the handshake message is reassembled from their payloads. Real clients
+   * send one record, but treating more than one as unparseable was a way past
+   * the SNI gate: the caller's fallback for an unreadable tunnel is looser
+   * than the gate itself, so a fragmented hello carrying a denied name got
+   * exactly the pass a whole one would have been refused. */
+  let offset = 0;
+  let handshake = Buffer.alloc(0);
+  let handshakeLength = -1;
+  while (handshakeLength < 0 || handshake.length < 4 + handshakeLength) {
+    if (data.length - offset < 5) return { status: 'need-more' };
+    // Only the first record decides "is this TLS at all"; once a handshake
+    // record has been accepted, anything else in the stream is malformed.
+    if (data[offset] !== 0x16 || data[offset + 1] !== 0x03) return { status: 'malformed' };
+    const recordLength = data.readUInt16BE(offset + 3);
+    if (recordLength === 0 || recordLength > MAX_CLIENT_HELLO_BYTES) return { status: 'malformed' };
+    if (data.length - offset < 5 + recordLength) return { status: 'need-more' };
+
+    // Copied rather than aliased even for a single record: the buffer is a
+    // handshake message, not a slice of the stream, and at most 16 KiB.
+    handshake = Buffer.concat([handshake, data.subarray(offset + 5, offset + 5 + recordLength)]);
+    offset += 5 + recordLength;
+    if (handshake.length > MAX_CLIENT_HELLO_BYTES) return { status: 'malformed' };
+
+    // handshake: msg_type(1) length(3)
+    if (handshake.length < 4) continue;
+    if (handshake[0] !== 0x01) return { status: 'malformed' };
+    handshakeLength = readUint24(handshake, 1);
+    if (4 + handshakeLength > MAX_CLIENT_HELLO_BYTES) return { status: 'malformed' };
   }
-  if (data[0] !== 0x16 || data[1] !== 0x03) return { status: 'not-tls' };
-
-  const recordLength = data.readUInt16BE(3);
-  if (recordLength === 0 || recordLength > MAX_CLIENT_HELLO_BYTES) return { status: 'malformed' };
-  if (data.length < 5 + recordLength) return { status: 'need-more' };
-
-  const body = data.subarray(5, 5 + recordLength);
-  // handshake: msg_type(1) length(3)
-  if (body.length < 4 || body[0] !== 0x01) return { status: 'malformed' };
-  const handshakeLength = readUint24(body, 1);
-  /* A ClientHello split across several records is legal but never produced by
-   * a real client, and following it would mean reassembling handshake messages
-   * here. Refuse rather than guess. */
-  if (body.length < 4 + handshakeLength) return { status: 'malformed' };
 
   let p = 4;
-  const hello = body.subarray(0, 4 + handshakeLength);
+  const hello = handshake.subarray(0, 4 + handshakeLength);
   const need = (n: number): boolean => p + n <= hello.length;
 
   if (!need(2 + 32)) return { status: 'malformed' };
