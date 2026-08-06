@@ -497,31 +497,50 @@ export async function createNetEgressProxy(opts: NetEgressProxyOptions): Promise
       }
     }
 
-    let pinned: { address: string; family: number };
+    let candidates: { address: string; family: number }[];
     try {
-      pinned = await resolveAndScreen(head.host, lookupAddresses, dnsTimeoutMs, addressScreen);
+      candidates = await resolveAndScreen(head.host, lookupAddresses, dnsTimeoutMs, addressScreen);
     } catch (error) {
       fail(error instanceof RequestRejected ? error.status : 502, describe(error));
       return;
     }
     if (torn) return;
 
-    let socket: net.Socket;
-    try {
-      socket = await openUpstream(
-        connectUpstream,
-        { host: pinned.address, port: head.port, family: pinned.family },
-        timers,
-        connectTimeoutMs,
-        // Publish the socket before it finishes connecting so a teardown during
-        // the dial destroys it now rather than at the connect timeout.
-        pending => {
-          upstream = pending;
-          if (torn) pending.destroy();
-        },
-      );
-    } catch (error) {
-      fail(502, describe(error));
+    /* Every candidate already passed the address gate as part of the whole
+     * answer set, so trying the next one after a failed dial widens nothing.
+     * Keeping only the first meant a dual-stack name whose AAAA sorts ahead of
+     * its A was a 502 on an IPv4-only runner, with a usable address sitting
+     * unused. Bounded by one shared connect deadline, not one per attempt, so
+     * a name answering with many dead addresses cannot stretch the phase. */
+    let socket: net.Socket | undefined;
+    let lastError: unknown;
+    let pinned = candidates[0];
+    const dialDeadline = Date.now() + connectTimeoutMs;
+    for (const candidate of candidates) {
+      const remainingMs = dialDeadline - Date.now();
+      if (remainingMs <= 0) break;
+      try {
+        socket = await openUpstream(
+          connectUpstream,
+          { host: candidate.address, port: head.port, family: candidate.family },
+          timers,
+          remainingMs,
+          // Publish the socket before it finishes connecting so a teardown during
+          // the dial destroys it now rather than at the connect timeout.
+          pending => {
+            upstream = pending;
+            if (torn) pending.destroy();
+          },
+        );
+        pinned = candidate;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (torn) break;
+      }
+    }
+    if (socket === undefined) {
+      fail(502, lastError === undefined ? 'upstream connect timed out' : describe(lastError));
       return;
     }
     upstream = socket;
@@ -927,24 +946,26 @@ async function defaultLookup(host: string): Promise<{ address: string; family: n
 }
 
 /**
- * Resolve a host and screen every answer. Returns the address the connection
- * must be pinned to.
+ * Resolve a host and screen every answer. Returns the screened addresses, in
+ * the resolver's order, that the connection may be pinned to.
  *
  * Every returned address must pass the gate, not just the one we intend to
  * use: a name that answers with a public AND a private address is a
  * split-horizon or rebinding setup, and serving the public half would still
- * let the sandbox use timing to map the private half.
+ * let the sandbox use timing to map the private half. Which also means the
+ * caller may fall back to a later entry without re-deciding anything: the
+ * whole set was approved or none of it was.
  */
 async function resolveAndScreen(
   host: string,
   lookup: (host: string) => Promise<{ address: string; family: number }[]>,
   timeoutMs: number,
   screen: (ip: string) => string | null,
-): Promise<{ address: string; family: number }> {
+): Promise<{ address: string; family: number }[]> {
   if (isIpLiteral(host)) {
     const blocked = screen(host);
     if (blocked !== null) throw new RequestRejected(403, `address is not publicly routable: ${blocked}`);
-    return { address: host, family: host.includes(':') ? 6 : 4 };
+    return [{ address: host, family: host.includes(':') ? 6 : 4 }];
   }
 
   let results: { address: string; family: number }[];
@@ -973,7 +994,7 @@ async function resolveAndScreen(
       throw new RequestRejected(403, `host resolves to a non-public address: ${blocked}`);
     }
   }
-  return results[0];
+  return results;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {

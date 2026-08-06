@@ -174,6 +174,16 @@ describe('blockedAddressReason', () => {
     expect(blockedAddressReason('::ffff:8.8.8.8')).toBeNull();
   });
 
+  test('reads only the two real NAT64 prefixes as carrying a v4 address', () => {
+    /* 64:ff9b::/96 and 64:ff9b:1::/48 embed one. The rest of 64:ff9b::/32 does
+     * not, and reading its low 32 bits as a destination let an address outside
+     * global unicast pass on a public-looking tail. */
+    expect(blockedAddressReason('64:ff9b::8.8.8.8')).toBeNull();
+    expect(blockedAddressReason('64:ff9b:1::8.8.8.8')).toBeNull();
+    expect(blockedAddressReason('64:ff9b:1::10.0.0.1')).not.toBeNull();
+    expect(blockedAddressReason('64:ff9b:2::93.184.216.34')).not.toBeNull();
+  });
+
   test('rejects anything it cannot parse', () => {
     expect(blockedAddressReason('not-an-ip')).toBe('unparseable address');
     expect(blockedAddressReason('')).toBe('unparseable address');

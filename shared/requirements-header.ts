@@ -143,12 +143,23 @@ function maskMultiLineStrings(source: string): string {
       continue;
     }
 
-    // Single-line string: ends at its quote or at the newline.
+    /* Single-line string: ends at its quote, or at a newline the string did not
+     * escape. Masked like the multi-line forms, because a backslash-continued
+     * string DOES carry on to the next physical line, and that line can begin
+     * with `# requirements:` — text inside a string either way. */
     if (source[i] === "'" || source[i] === '"') {
       const quote = source[i];
       i++;
-      while (i < source.length && source[i] !== quote && source[i] !== '\n') {
-        i += source[i] === '\\' ? 2 : 1;
+      while (i < source.length && source[i] !== quote) {
+        if (source[i] === '\\') {
+          if (source[i + 1] !== undefined && source[i + 1] !== '\n') out[i + 1] = ' ';
+          out[i] = ' ';
+          i += 2;
+          continue;
+        }
+        if (source[i] === '\n') break;
+        out[i] = ' ';
+        i++;
       }
       i++;
       continue;

@@ -103,6 +103,14 @@ describe('createPayload requirements extraction', () => {
       .toEqual({ pip: ['cowsay==6.1'] });
   });
 
+  test('ignores a declaration on the continued line of a string', () => {
+    /* A backslash before the newline keeps the string open, so the next
+     * physical line is still inside it — and it would otherwise be read as a
+     * declaration whose spec carries the closing quote. */
+    expect(build('usage = "start \\\n# requirements: cowsay==6.1\\\nend"\nprint(usage)').dependencies)
+      .toBeUndefined();
+  });
+
   test('a quote inside a comment does not swallow the rest of the file', () => {
     expect(build("# it's a comment\n# requirements: cowsay==6.1\nimport cowsay").dependencies)
       .toEqual({ pip: ['cowsay==6.1'] });

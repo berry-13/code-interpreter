@@ -692,6 +692,41 @@ describe('createNetEgressProxy', () => {
     expect(origin.received().length).toBe(0);
   });
 
+  test('falls back to the next screened address when the first will not connect', async () => {
+    /* Every answer passed the gate as a set, so the later ones are as approved
+     * as the first. Keeping only the first turned a dual-stack name whose AAAA
+     * sorts ahead of its A into a 502 on an IPv4-only runner. */
+    const origin = await startOrigin((_req, res) => {
+      res.writeHead(200);
+      res.end('reached');
+    });
+    closers.push(origin.close);
+
+    const dialed: string[] = [];
+    const sock = await startProxy(origin.port, {
+      addressScreen: () => null,
+      lookup: async () => [
+        { address: '2606:4700:4700::1111', family: 6 },
+        { address: '127.0.0.1', family: 4 },
+      ],
+      connect: (opts: { host: string; port: number }) => {
+        dialed.push(opts.host);
+        // The v6 answer is unreachable here, exactly as on a v4-only runner.
+        if (opts.host.includes(':')) return net.connect({ host: '127.0.0.1', port: 1 });
+        return net.connect({ host: '127.0.0.1', port: origin.port });
+      },
+    });
+
+    const response = await proxyRequest(
+      sock,
+      'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n',
+    );
+
+    expect(dialed).toEqual(['2606:4700:4700::1111', '127.0.0.1']);
+    expect(response).toContain('200');
+    expect(response).toContain('reached');
+  });
+
   test('a denied SNI split across records is refused with no allowlist configured', async () => {
     /* Same bypass as above, dressed as a legal fragmented handshake. It used to
      * parse as 'malformed', and an unreadable tunnel with no allowlist was

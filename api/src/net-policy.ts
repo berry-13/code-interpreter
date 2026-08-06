@@ -555,8 +555,18 @@ function embeddedIpv4(h: number[]): number | null {
   if (zeroPrefix && h[4] === 0 && h[5] === 0 && !(h[6] === 0 && h[7] <= 1)) {
     return ((h[6] << 16) | h[7]) >>> 0;
   }
-  // 64:ff9b::/96 and 64:ff9b:1::/48 — NAT64
-  if (h[0] === 0x64 && h[1] === 0xff9b) return ((h[6] << 16) | h[7]) >>> 0;
+  /* NAT64, and only the two prefixes that actually carry a v4 address:
+   * 64:ff9b::/96 (RFC 6052) and 64:ff9b:1::/48 (RFC 8215). Treating the whole
+   * 64:ff9b::/32 as NAT64 read the low 32 bits of any address in it as a v4
+   * destination, so `64:ff9b:2::93.184.216.34` was judged on that public-looking
+   * v4 and skipped the IPv6 gate entirely — while the address itself is outside
+   * global unicast and has no business being dialed. Anything else in the /32
+   * now falls through to blockedIpv6Reason, which refuses it. */
+  if (h[0] === 0x64 && h[1] === 0xff9b) {
+    const wellKnown = h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0;
+    const localUse = h[2] === 0x0001;
+    if (wellKnown || localUse) return ((h[6] << 16) | h[7]) >>> 0;
+  }
   return null;
 }
 
